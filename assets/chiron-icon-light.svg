@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 180 160" width="180" height="160">
+  <defs>
+    <linearGradient id="arrowPulseIconLight" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#CD7F32" stop-opacity="0.8" />
+      <stop offset="40%" stop-color="#CD7F32" stop-opacity="0.9" />
+      <stop offset="85%" stop-color="#CD7F32" stop-opacity="0.9" />
+      <stop offset="100%" stop-color="#CD7F32" stop-opacity="1" />
+    </linearGradient>
+    <mask id="precisionCutIconLight">
+      <rect x="0" y="0" width="180" height="160" fill="white" />
+      <line x1="5" y1="80" x2="180" y2="80" stroke="black" stroke-width="15" stroke-linecap="round" />
+    </mask>
+  </defs>
+
+  <!--
+    Light variant of the Chiron Systems mark, intended for use on dark
+    backgrounds (the Dokimos: Performance Report SPA header).
+    No background rectangle. The icon floats over whatever the header
+    chrome paints behind it.
+  -->
+  <g transform="rotate(-30 90 80)">
+    <path
+      d="M 58 18 C 115 20, 150 45, 150 80 C 150 115, 115 140, 58 142 C 105 135, 128 110, 128 80 C 128 50, 105 25, 58 18 Z"
+      fill="#F7FAFC"
+      mask="url(#precisionCutIconLight)"
+    />
+    <path
+      d="M 10 80 L 165 77.5 L 175 80 L 165 82.5 Z"
+      fill="url(#arrowPulseIconLight)"
+    />
+  </g>
+</svg>

@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name            = "rp_perf_report"
+version         = "0.1.0"
+description     = "Report Portal performance analysis & comparison server with AES-256-GCM encrypted HTML output."
+readme          = "README.md"
+requires-python = ">=3.9"
+
+# Runtime deps. Everything else is stdlib.
+dependencies = [
+    # AES-256-GCM + PBKDF2-HMAC-SHA256 for the encrypted HTML password gate.
+    # 38.x is the version shipped with the ad-apps-test-automation venv;
+    # any 38+ release should work.
+    "cryptography>=38",
+]
+
+[project.urls]
+# Standalone workspace under ~/work. Originally lived alongside the
+# ad-apps-test-automation test suite, moved out when it stopped being
+# IFP-specific.
+"Local location" = "~/work/rp_perf_report"
+
+[project.scripts]
+# After `pip install -e .` the CLI is available as `rp-perf-report`.
+rp-perf-report = "rp_perf_report.analyzer:main"
+
+[tool.setuptools]
+packages = ["rp_perf_report"]
+# The flat layout puts the package at the project root, not under src/.
+package-dir = {"rp_perf_report" = "."}
+
+# Ship static SPA assets (logos, etc.) inside the wheel so editable and
+# non-editable installs both serve them through /assets/<file>.
+[tool.setuptools.package-data]
+rp_perf_report = ["assets/*"]

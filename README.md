@@ -20,6 +20,105 @@ The package bundles three things into one CLI:
 
 ---
 
+## Run the project (agent-friendly cheat sheet)
+
+> Copy-pasteable commands for an AI agent or a human picking up the project
+> cold. Everything assumes the package lives at its canonical location
+> `~/work/rp_perf_report/`. If you moved it, swap that path everywhere
+> below.
+
+### 1. Sanity check before starting
+
+```bash
+# Is the package where we expect?
+test -f ~/work/rp_perf_report/spa.py && echo "package present" || echo "MISSING"
+
+# Is the default port already taken?
+lsof -nP -iTCP:9999 -sTCP:LISTEN 2>/dev/null || echo "port 9999 free"
+```
+
+If the port is busy, an `rp_perf_report` instance is **already running**.
+Either re-use it (`open http://localhost:9999`) or stop it (see step 4).
+
+### 2. Start the Dokimos: Performance Report SPA
+
+```bash
+# Required env for Report Portal access (RP_TOKEN, REPORT_PORTAL, etc.).
+# Sourced from the IFP test repo; nothing else in this package needs it.
+source ~/work/disney/ad-apps-test-automation/NAS_components/InventoryForecasting/tests/.envrc
+
+# Launch -- the SPA blocks the terminal until Ctrl+C. Run it in its own
+# terminal tab, or background it with ``nohup ... &`` if running headless.
+cd ~/work && python3 -m rp_perf_report
+```
+
+Expected startup line within ~3 seconds:
+
+```
+Dokimos: Performance Report available at: http://localhost:9999
+```
+
+### 3. Verify it's serving (from another terminal)
+
+```bash
+# HTML shell + a static asset; both should return 200.
+curl -s -o /dev/null -w "/        HTTP %{http_code}\n"      http://localhost:9999/
+curl -s -o /dev/null -w "/assets  HTTP %{http_code}  %{content_type}\n" \
+     http://localhost:9999/assets/chiron-icon-light.svg
+curl -s -o /dev/null -w "/api/reports HTTP %{http_code}  %{content_type}\n" \
+     http://localhost:9999/api/reports
+```
+
+All three should return `200` and the asset should be `image/svg+xml`. If
+not, the SPA didn't start cleanly — read the terminal where you launched
+it for the traceback.
+
+### 4. Stop a running SPA
+
+```bash
+lsof -nP -iTCP:9999 -sTCP:LISTEN 2>/dev/null \
+    | awk 'NR>1 {print $2}' | xargs -r kill
+```
+
+Send `SIGTERM` only. The SPA persists nothing in memory that needs a
+clean shutdown.
+
+### 5. Generate a report without the UI (CLI mode)
+
+```bash
+cd ~/work && python3 -m rp_perf_report \
+  "https://ads-report-portal.staging.hulu.com/ui/#ad-apps-automation/launches/all/1687913,\
+https://ads-report-portal.staging.hulu.com/ui/#ad-apps-automation/launches/all/1687938"
+```
+
+This will also start `localhost:9999` and serve the rendered comparison
+HTML directly — same UI primitives, no sidebar.
+
+### Common failure modes
+
+| Symptom                                  | Likely cause                                   | Fix                                                       |
+| ---------------------------------------- | ---------------------------------------------- | --------------------------------------------------------- |
+| `ModuleNotFoundError: rp_perf_report`    | `cwd` is not `~/work` (or pkg parent)          | `cd ~/work` before `python3 -m rp_perf_report`            |
+| `ModuleNotFoundError: cryptography`      | venv missing `cryptography>=38`                | `source` the IFP `.envrc` first, or `pip install cryptography` |
+| `OSError: [Errno 48] Address already in use` | Another `rp_perf_report` instance running   | Stop it (step 4) or pass a different port (`serve_spa(port=NNNN)` programmatically) |
+| Logo shows broken-image icon             | Stale browser cache for `/assets/*` (24h)      | Hard-refresh `Cmd+Shift+R`                                |
+| Empty Reports tab                        | First-time run; nothing generated yet           | Generate something via the **New** tab                    |
+| `RP_TOKEN` not set / 401 from RP         | `.envrc` not sourced                            | Re-run the `source ...` line in step 2                    |
+
+### Where things live
+
+| Path                                  | Purpose                                       |
+| ------------------------------------- | --------------------------------------------- |
+| `~/work/rp_perf_report/spa.py`        | SPA shell HTML + ThreadingHTTPServer + sprint logic |
+| `~/work/rp_perf_report/analyzer.py`   | Comparison engine + HTML renderer + AES-GCM gate |
+| `~/work/rp_perf_report/assets/`       | Logo SVGs served at `/assets/<file>`          |
+| `~/work/rp_perf_report/reports/`      | Persisted user reports, grouped by sprint (gitignored) |
+| `~/work/rp_perf_report/logs/`         | RP + Datadog response cache (gitignored, safe to delete) |
+| `~/work/rp_perf_report/README.md`     | This file                                     |
+| `~/work/rp_perf_report/pyproject.toml`| `cryptography>=38` is the only third-party dep |
+
+---
+
 ## Quick start
 
 ### SPA mode (recommended)
