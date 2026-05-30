@@ -1,0 +1,16 @@
+README.md
+pyproject.toml
+./__init__.py
+./__main__.py
+./analyze_rp_timings.py
+./analyze_rp_timings_with_dd.py
+./analyzer.py
+./spa.py
+./assets/chiron-icon-dark.svg
+./assets/chiron-icon-light.svg
+rp_perf_report.egg-info/PKG-INFO
+rp_perf_report.egg-info/SOURCES.txt
+rp_perf_report.egg-info/dependency_links.txt
+rp_perf_report.egg-info/entry_points.txt
+rp_perf_report.egg-info/requires.txt
+rp_perf_report.egg-info/top_level.txt

@@ -473,9 +473,22 @@ def _list_reports() -> dict:
                     meta = json.load(fp)
             except (OSError, ValueError):
                 continue
+            # Lazy backfill: older reports (generated before share-hash
+            # was a thing) don't have one yet. Generate + persist now
+            # so future requests are stable.
+            if not meta.get("share_hash"):
+                meta["share_hash"] = _generate_share_hash()
+                try:
+                    with open(meta_path, "w") as fp:
+                        json.dump(meta, fp, indent=2)
+                except OSError:
+                    pass
+            share_hash = meta["share_hash"]
             sprints_by_dir.setdefault(sprint_dirname, []).append({
                 "id":           report_dirname,
                 "sprint":       sprint_dirname,
+                "share_hash":   share_hash,
+                "share_url":    f"/r/{share_hash}",
                 "title":        meta.get("title", report_dirname),
                 "generated_at": meta.get("generated_at"),
                 "num_launches": meta.get("num_launches"),
@@ -502,6 +515,16 @@ def _list_reports() -> dict:
     return {"sprints": out_sprints}
 
 
+def _generate_share_hash() -> str:
+    """Short random URL-safe ID for shareable report links (~64 bits).
+
+    11 url-safe base64 chars. Birthday-paradox collisions are negligible
+    at any realistic report count, and the hash is opaque so it leaks no
+    metadata about the report (unlike the timestamp-derived ``report_id``).
+    """
+    return secrets.token_urlsafe(8)
+
+
 def _save_report(html: str, urls: list, analyzer_meta: dict, report_password: str) -> dict:
     """Persist a generated report to disk and return the public list entry.
 
@@ -520,6 +543,7 @@ def _save_report(html: str, urls: list, analyzer_meta: dict, report_password: st
 
     num_launches = int(analyzer_meta.get("num_launches", len(urls)))
     report_id = _new_report_id(now_la, num_launches)
+    share_hash = _generate_share_hash()
     report_path = os.path.join(sprint_path, report_id)
     os.makedirs(report_path, exist_ok=True)
 
@@ -530,6 +554,7 @@ def _save_report(html: str, urls: list, analyzer_meta: dict, report_password: st
     metadata = {
         "id":           report_id,
         "sprint":       sprint_dirname,
+        "share_hash":   share_hash,
         "title":        title,
         "generated_at": now_la.isoformat(timespec="seconds"),
         "num_launches": num_launches,
@@ -542,6 +567,8 @@ def _save_report(html: str, urls: list, analyzer_meta: dict, report_password: st
     return {
         "id":             report_id,
         "sprint":         sprint_dirname,
+        "share_hash":     share_hash,
+        "share_url":      f"/r/{share_hash}",
         "title":          title,
         "generated_at":   metadata["generated_at"],
         "num_launches":   num_launches,
@@ -1121,6 +1148,38 @@ html, body {
     color: var(--gray-dark);
     font-size: 12px;
 }
+.viewer-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 10px 14px;
+    background: var(--bg-card);
+    border-bottom: 1px solid var(--divider);
+    font-family: var(--font-mono);
+    font-size: 12px;
+}
+.viewer-title {
+    color: var(--gray-dark);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.viewer-copy-btn {
+    background: transparent;
+    color: var(--bronze);
+    border: 1px solid var(--bronze);
+    padding: 4px 12px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    cursor: pointer;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    flex-shrink: 0;
+    transition: background 0.15s, color 0.15s;
+}
+.viewer-copy-btn:hover,
+.viewer-copy-btn.copied { background: var(--bronze); color: #000; }
 
 /* ----- Busy overlay ----- */
 body.busy .app { filter: blur(8px); pointer-events: none; user-select: none; }
@@ -1537,6 +1596,7 @@ SPA_HTML = f"""<!DOCTYPE html>
                         rep.generated_at, rep.num_launches, rep.title);
                     html += '<div class="report-item' + sel + '" data-id="' + escapeHtml(rep.id)
                         + '" data-url="' + escapeHtml(rep.url) + '"'
+                        + ' data-share-url="' + escapeHtml(rep.share_url || '') + '"'
                         + ' onclick="openReportFromClick(this)">'
                         + '<span class="report-title" title="' + escapeHtml(localTitle) + '">'
                         + escapeHtml(localTitle) + '</span>'
@@ -1632,15 +1692,52 @@ SPA_HTML = f"""<!DOCTYPE html>
             }}
         }}
 
+        const PUBLIC_REPORT_ORIGIN = 'https://dokimos-perf.chiron.systems';
+
         function openReportFromClick(el) {{
-            openReport({{id: el.getAttribute('data-id'), url: el.getAttribute('data-url')}});
+            const titleEl = el.querySelector('.report-title');
+            openReport({{
+                id:        el.getAttribute('data-id'),
+                url:       el.getAttribute('data-url'),
+                share_url: el.getAttribute('data-share-url') || '',
+                title:     titleEl ? titleEl.textContent : ''
+            }});
         }}
 
         function openReport(rep) {{
             _selectedId = rep.id;
             renderReports();
             const viewer = document.getElementById('reportViewer');
-            viewer.innerHTML = '<iframe src="' + rep.url + '"></iframe>';
+            const iframeUrl = rep.share_url || rep.url;
+            const fullUrl   = PUBLIC_REPORT_ORIGIN + iframeUrl;
+            const titleText = rep.title || rep.id || 'Report';
+            viewer.innerHTML = ''
+                + '<div class="viewer-header">'
+                +   '<div class="viewer-title" title="' + escapeHtml(fullUrl) + '">'
+                +     escapeHtml(titleText)
+                +   '</div>'
+                +   '<button class="viewer-copy-btn" type="button"'
+                +     ' data-url="' + escapeHtml(fullUrl) + '"'
+                +     ' onclick="copyReportLink(this)">Copy link</button>'
+                + '</div>'
+                + '<iframe src="' + escapeHtml(iframeUrl) + '"></iframe>';
+        }}
+
+        async function copyReportLink(btn) {{
+            const url = btn.getAttribute('data-url');
+            if (!url) return;
+            try {{
+                await navigator.clipboard.writeText(url);
+            }} catch (_e) {{
+                try {{ window.prompt('Copy this link:', url); return; }} catch (_e2) {{ return; }}
+            }}
+            const orig = btn.textContent;
+            btn.textContent = 'Copied!';
+            btn.classList.add('copied');
+            setTimeout(function() {{
+                btn.textContent = orig;
+                btn.classList.remove('copied');
+            }}, 1500);
         }}
 
         renderInboxes(['']);
@@ -1706,10 +1803,65 @@ class _SpaHandler(http.server.BaseHTTPRequestHandler):
         if path.startswith("/reports/"):
             self._serve_report_file(path)
             return
+        if path.startswith("/r/"):
+            self._redirect_by_share_hash(path[len("/r/"):])
+            return
         if path.startswith("/assets/"):
             self._serve_static_asset(path)
             return
 
+        self._send(404, "text/plain; charset=utf-8", b"Not found")
+
+    def _redirect_by_share_hash(self, share_hash: str):
+        """Resolve a /r/<hash> URL and serve the report's index.html in-place.
+
+        We deliberately do NOT 302 to the canonical /reports/<...>/ URL --
+        that would flip the browser address bar back to the long path and
+        defeat the point of a short shareable link. Instead we look the
+        hash up, read the file, and send its bytes verbatim under the
+        original /r/<hash> URL.
+
+        SECURITY-REVIEW: the hash itself is just a lookup key (~64 bits of
+        entropy, no per-report secret); knowing it does NOT unlock the
+        report -- the per-report AES-GCM password is still required.
+        """
+        if not share_hash or not all(c.isalnum() or c in "-_" for c in share_hash):
+            self._send(404, "text/plain; charset=utf-8", b"Not found")
+            return
+        if not os.path.isdir(REPORTS_DIR):
+            self._send(404, "text/plain; charset=utf-8", b"Not found")
+            return
+        for sprint_dirname in os.listdir(REPORTS_DIR):
+            sprint_path = os.path.join(REPORTS_DIR, sprint_dirname)
+            if not os.path.isdir(sprint_path):
+                continue
+            for report_dirname in os.listdir(sprint_path):
+                meta_path = os.path.join(sprint_path, report_dirname, "metadata.json")
+                if not os.path.isfile(meta_path):
+                    continue
+                try:
+                    with open(meta_path) as fp:
+                        meta = json.load(fp)
+                except (OSError, ValueError):
+                    continue
+                if meta.get("share_hash") == share_hash:
+                    abs_path = os.path.realpath(
+                        os.path.join(sprint_path, report_dirname, "index.html"))
+                    if not abs_path.startswith(os.path.realpath(REPORTS_DIR) + os.sep):
+                        self._send(403, "text/plain; charset=utf-8", b"Forbidden")
+                        return
+                    if not os.path.isfile(abs_path):
+                        self._send(404, "text/plain; charset=utf-8", b"Not found")
+                        return
+                    try:
+                        with open(abs_path, "rb") as fp:
+                            body = fp.read()
+                    except OSError as e:
+                        self._server_error(f"could not read report: {e}")
+                        return
+                    self._send(200, "text/html; charset=utf-8", body,
+                               cache_control="public, max-age=3600")
+                    return
         self._send(404, "text/plain; charset=utf-8", b"Not found")
 
     def _serve_report_file(self, path):

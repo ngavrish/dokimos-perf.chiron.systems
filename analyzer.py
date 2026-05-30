@@ -40,6 +40,7 @@ import urllib.request
 import http.server
 import socketserver
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone, timedelta
 from statistics import median as _median, quantiles as _quantiles
 from zoneinfo import ZoneInfo
@@ -889,6 +890,31 @@ body.locked .auth-overlay { display: flex; }
     cursor: progress;
     border-color: var(--border-hi);
 }
+.auth-spinner {
+    display: none;
+    width: 40px;
+    height: 40px;
+    border: 2px solid var(--border-hi);
+    border-top-color: var(--bronze);
+    border-radius: 50%;
+    animation: spin 0.9s linear infinite;
+    margin: 14px auto 6px;
+}
+.auth-decrypting-msg {
+    display: none;
+    color: var(--bronze);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    margin-top: 8px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+}
+body.decrypting .auth-input,
+body.decrypting .auth-submit,
+body.decrypting .auth-error,
+body.decrypting .auth-box p { display: none; }
+body.decrypting .auth-spinner,
+body.decrypting .auth-decrypting-msg { display: block; }
 .auth-error {
     min-height: 1.2em;
     margin-top: 8px;
@@ -2046,6 +2072,8 @@ def generate_html(launch_id: str, logs_data: dict, endpoint_timings: dict, paylo
                    placeholder="password" autocomplete="off" autofocus>
             <button type="button" class="auth-submit" id="authSubmit" onclick="checkAuthPassword()">Unlock</button>
             <div class="auth-error" id="authError"></div>
+            <div class="auth-spinner"></div>
+            <div class="auth-decrypting-msg">Decrypting&hellip;</div>
             <div class="auth-meta">AES-256-GCM &middot; PBKDF2-HMAC-SHA256 (300k iter)</div>
         </div>
     </div>
@@ -2170,32 +2198,25 @@ def generate_html(launch_id: str, logs_data: dict, endpoint_timings: dict, paylo
 
             err.textContent = '';
             if (submit) {{ submit.textContent = 'Decrypting…'; submit.disabled = true; }}
+            document.body.classList.add('decrypting');
+            // Force one paint cycle so the spinner appears before the
+            // CPU-bound JSON.parse / innerHTML hits the main thread.
+            await new Promise(function(r) {{ requestAnimationFrame(r); }});
             try {{
                 const json = await _decryptPayload(value);
                 _applyDecryptedPayload(json);
-                try {{
-                    if (_AUTH_PAYLOAD_KEY) sessionStorage.setItem(_AUTH_PAYLOAD_KEY, json);
-                }} catch (e) {{}}
                 document.body.classList.remove('locked');
                 input.value = '';
             }} catch (e) {{
                 err.textContent = 'Wrong password.';
                 input.select();
             }} finally {{
+                document.body.classList.remove('decrypting');
                 if (submit) {{ submit.textContent = 'Unlock'; submit.disabled = false; }}
             }}
         }}
 
         window.addEventListener('DOMContentLoaded', function() {{
-            try {{
-                if (_AUTH_PAYLOAD_KEY) {{
-                    const cached = sessionStorage.getItem(_AUTH_PAYLOAD_KEY);
-                    if (cached) {{
-                        _applyDecryptedPayload(cached);
-                        document.body.classList.remove('locked');
-                    }}
-                }}
-            }} catch (e) {{}}
             // Localize any <time> markers in the static chrome (the meta
             // line outside the encrypted payload).
             _localizeReportTimes(document);
@@ -2999,6 +3020,7 @@ def generate_multi_comparison_html(launch_labels: list, logs_list: list, timings
         # let the user expand to see the full JSON. This points the reader
         # at the specific request bodies that caused the worst run.
         tab1_slow_payloads_html = ""
+        slow_ep_id = f"slow-{ep_idx_t}"
         if detailed_timings_list:
             slow_idx = slowest['launch_idx']
             if 0 <= slow_idx < len(detailed_timings_list):
@@ -3051,14 +3073,13 @@ def generate_multi_comparison_html(launch_labels: list, logs_list: list, timings
                             </div>
                         ''')
                     if payload_rows:
-                        slow_ep_id = f"slow-{ep_idx_t}"
-                        # ``expanded`` -- the section's parent (the
-                        # endpoint card in tab 1) has no toggle, so we
-                        # open it by default; the per-payload JSON is
-                        # still individually collapsed/expanded via the
+                        # Collapsed by default. The endpoint card is wired
+                        # to toggleDetails(slow_ep_id) below so clicking
+                        # the endpoint expands this list. Per-payload JSON
+                        # inside stays individually collapsible via the
                         # row click + "Expand all" toggle.
                         tab1_slow_payloads_html = f'''
-                            <div class="payload-details expanded" id="details-{slow_ep_id}" onclick="event.stopPropagation();">
+                            <div class="payload-details" id="details-{slow_ep_id}" onclick="event.stopPropagation();">
                                 <div class="payload-section-header">
                                     <span>Slowest-run payloads ({len(payload_rows)} variant{'s' if len(payload_rows) != 1 else ''} &middot; iter {slow_idx + 1})</span>
                                     <label class="toggle-switch" onclick="event.stopPropagation();">
@@ -3071,9 +3092,20 @@ def generate_multi_comparison_html(launch_labels: list, logs_list: list, timings
                             </div>
                         '''
 
+        # Endpoint card is only clickable-to-expand when it actually has
+        # slowest-run payload variants to show. The caret in the header
+        # rotates via toggleDetails() to indicate state.
+        if tab1_slow_payloads_html:
+            card_click_attrs   = f' onclick="toggleDetails(\'{slow_ep_id}\')" style="cursor: pointer;"'
+            header_caret_html  = f'<span class="payload-expand-icon" id="icon-{slow_ep_id}">▶</span>'
+        else:
+            card_click_attrs   = ''
+            header_caret_html  = ''
+
         tab1_cards.append(f'''
-            <div class="endpoint-card simple-card">
+            <div class="endpoint-card simple-card"{card_click_attrs}>
                 <div class="endpoint-header">
+                    {header_caret_html}
                     <span class="method {method_class_t}">{method_t}</span>
                     <span class="endpoint-url">{url_t}</span>
                 </div>
@@ -3163,13 +3195,15 @@ def generate_multi_comparison_html(launch_labels: list, logs_list: list, timings
     )
 
     if show_tabs:
-        body_main = f'''
+        tabs_nav_html = f'''
         <div class="tabs-nav">
             <button class="tab-btn active" data-tab="0" onclick="switchTab(0)">Median vs Slowest</button>
             <button class="tab-btn"        data-tab="1" onclick="switchTab(1)">Fastest vs Slowest</button>
             <button class="tab-btn"        data-tab="2" onclick="switchTab(2)">Per-endpoint Trend</button>
             <button class="tab-btn"        data-tab="3" onclick="switchTab(3)">All {n} Launches</button>
         </div>
+        '''
+        tab_panes_html = f'''
         <div class="tab-pane active" data-tab-pane="0">
             <div class="tab-intro">Median across all {n} runs vs the single slowest run (slowest = launch with highest per-endpoint median).</div>
             {''.join(tab1_cards)}
@@ -3188,7 +3222,8 @@ def generate_multi_comparison_html(launch_labels: list, logs_list: list, timings
         </div>
         '''
     else:
-        body_main = _endpoint_cards_joined
+        tabs_nav_html  = ""
+        tab_panes_html = _endpoint_cards_joined
 
     # ----- Bundle all sensitive content so it can be encrypted as a unit -----
     # Anything that reveals timings, payloads, URLs, or even iteration counts
@@ -3204,7 +3239,7 @@ def generate_multi_comparison_html(launch_labels: list, logs_list: list, timings
                 Comparing {len(all_endpoints)} unique endpoints across {n} launches
             </div>
 
-            {body_main}
+            {tabs_nav_html}
 
             <div class="meta">{n} Launches | Generated: <time datetime="{generated_at_iso}" data-localize="datetime">{generated_at}</time></div>
 
@@ -3225,6 +3260,8 @@ def generate_multi_comparison_html(launch_labels: list, logs_list: list, timings
                 <div class="legend-item"><span class="legend-dot worse"></span> Slower than the oldest run</div>
                 <div class="legend-note">(Baseline = leftmost / oldest run. Newest = rightmost.)</div>
             </div>
+
+            {tab_panes_html}
     '''
 
     # ----- AES-GCM gate -----
@@ -3266,6 +3303,8 @@ def generate_multi_comparison_html(launch_labels: list, logs_list: list, timings
                    placeholder="password" autocomplete="off" autofocus>
             <button type="button" class="auth-submit" id="authSubmit" onclick="checkAuthPassword()">Unlock</button>
             <div class="auth-error" id="authError"></div>
+            <div class="auth-spinner"></div>
+            <div class="auth-decrypting-msg">Decrypting&hellip;</div>
             <div class="auth-meta">AES-256-GCM &middot; PBKDF2-HMAC-SHA256 (300k iter)</div>
         </div>
     </div>
@@ -3421,12 +3460,13 @@ def generate_multi_comparison_html(launch_labels: list, logs_list: list, timings
 
             err.textContent = '';
             if (submit) {{ submit.textContent = 'Decrypting…'; submit.disabled = true; }}
+            document.body.classList.add('decrypting');
+            // Force one paint cycle so the spinner appears before the
+            // CPU-bound JSON.parse / innerHTML hits the main thread.
+            await new Promise(function(r) {{ requestAnimationFrame(r); }});
             try {{
                 const json = await _decryptPayload(value);
                 _applyDecryptedPayload(json);
-                try {{
-                    if (_AUTH_PAYLOAD_KEY) sessionStorage.setItem(_AUTH_PAYLOAD_KEY, json);
-                }} catch (e) {{}}
                 document.body.classList.remove('locked');
                 input.value = '';
             }} catch (e) {{
@@ -3436,24 +3476,12 @@ def generate_multi_comparison_html(launch_labels: list, logs_list: list, timings
                 err.textContent = 'Wrong password.';
                 input.select();
             }} finally {{
+                document.body.classList.remove('decrypting');
                 if (submit) {{ submit.textContent = 'Unlock'; submit.disabled = false; }}
             }}
         }}
 
         window.addEventListener('DOMContentLoaded', function() {{
-            // Restore from this-tab cache (sessionStorage) if available so a
-            // page refresh doesn't force the user to retype the password.
-            // sessionStorage is per-tab and cleared when the tab closes.
-            try {{
-                if (_AUTH_PAYLOAD_KEY) {{
-                    const cached = sessionStorage.getItem(_AUTH_PAYLOAD_KEY);
-                    if (cached) {{
-                        _applyDecryptedPayload(cached);
-                        document.body.classList.remove('locked');
-                    }}
-                }}
-            }} catch (e) {{}}
-
             // If no encryption is configured, the protected slot already has
             // the rendered HTML; we still need to wire up the search input.
             if (!_AUTH_ENCRYPTED_PAYLOAD) {{
@@ -3569,10 +3597,10 @@ def generate_multi_comparison_html(launch_labels: list, logs_list: list, timings
         function toggleDetails(idx) {{
             const details = document.getElementById('details-' + idx);
             const icon = document.getElementById('icon-' + idx);
-            
+
             if (details) {{
                 details.classList.toggle('expanded');
-                icon.classList.toggle('expanded');
+                if (icon) icon.classList.toggle('expanded');
             }}
         }}
         
@@ -3894,30 +3922,38 @@ def generate_report_for_urls(urls, payload_key=None, log=print, report_password=
         }
         return html, meta
 
-    launches = []
-    for i, url in enumerate(urls):
+    def _resolve(i_url):
+        i, url = i_url
         launch_id = extract_launch_id(url)
         log(f"Fetching info for launch {i+1} (ID: {launch_id})...")
         launch_info = resolve_launch_id(launch_id)
-        launches.append({
+        return {
             'url': url,
             'original_id': launch_id,
             'numeric_id': launch_info['numeric_id'],
             'start_time': launch_info['start_time'],
             'start_time_str': launch_info['start_time_str'],
-        })
+        }
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        launches = list(executor.map(_resolve, enumerate(urls)))
     launches.sort(key=lambda x: x['start_time'])
 
-    launch_labels, logs_list, timings_list, detailed_timings_list = [], [], [], []
-    for launch in launches:
-        launch_labels.append(launch['start_time_str'])
+    launch_labels = [launch['start_time_str'] for launch in launches]
+
+    def _fetch_and_analyze(launch):
         log(f"Fetching logs for {launch['start_time_str']} (ID: {launch['numeric_id']})...")
         logs    = fetch_logs_with_cache(launch['numeric_id'], with_responses=bool(payload_key))
         timings = analyze_timings(logs, payload_key=payload_key)
         detail  = analyze_timings_detailed(logs)
-        logs_list.append(logs)
-        timings_list.append(timings)
-        detailed_timings_list.append(detail)
+        return logs, timings, detail
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        results = list(executor.map(_fetch_and_analyze, launches))
+
+    logs_list             = [r[0] for r in results]
+    timings_list          = [r[1] for r in results]
+    detailed_timings_list = [r[2] for r in results]
 
     launch_ids = [launch['numeric_id'] for launch in launches]
     html = generate_multi_comparison_html(

@@ -1,0 +1,58 @@
+{
+  "id": "20260529-112130-13launches",
+  "sprint": "2026-05-27_2026-06-10",
+  "title": "2026-05-29 11:21  (13 launches)",
+  "generated_at": "2026-05-29T11:21:30-07:00",
+  "num_launches": 13,
+  "urls": [
+    "https://ads-report-portal.staging.hulu.com/ui/#ad-apps-automation/launches/all/1687913",
+    "https://ads-report-portal.staging.hulu.com/ui/#ad-apps-automation/launches/all/1687938",
+    "https://ads-report-portal.staging.hulu.com/ui/#ad-apps-automation/launches/all/1687964",
+    "https://ads-report-portal.staging.hulu.com/ui/#ad-apps-automation/launches/all/1687992",
+    "https://ads-report-portal.staging.hulu.com/ui/#ad-apps-automation/launches/all/1688035",
+    "https://ads-report-portal.staging.hulu.com/ui/#ad-apps-automation/launches/all/1688184",
+    "https://ads-report-portal.staging.hulu.com/ui/#ad-apps-automation/launches/all/1688220",
+    "https://ads-report-portal.staging.hulu.com/ui/#ad-apps-automation/launches/all/1688273",
+    "https://ads-report-portal.staging.hulu.com/ui/#ad-apps-automation/launches/all/1688328",
+    "https://ads-report-portal.staging.hulu.com/ui/#ad-apps-automation/launches/all/1688385",
+    "https://ads-report-portal.staging.hulu.com/ui/#ad-apps-automation/launches/all/1688406",
+    "https://ads-report-portal.staging.hulu.com/ui/#ad-apps-automation/launches/all/1688421",
+    "https://ads-report-portal.staging.hulu.com/ui/#ad-apps-automation/launches/all/1688467"
+  ],
+  "analyzer": {
+    "mode": "multi",
+    "num_launches": 13,
+    "launch_ids": [
+      "1687913",
+      "1687938",
+      "1687964",
+      "1687992",
+      "1688035",
+      "1688184",
+      "1688220",
+      "1688273",
+      "1688328",
+      "1688385",
+      "1688406",
+      "1688421",
+      "1688467"
+    ],
+    "labels": [
+      "05/28 02:21",
+      "05/28 02:46",
+      "05/28 03:10",
+      "05/28 03:34",
+      "05/28 03:57",
+      "05/28 04:21",
+      "05/28 04:47",
+      "05/28 05:12",
+      "05/28 05:38",
+      "05/28 06:04",
+      "05/28 06:32",
+      "05/28 06:57",
+      "05/28 07:20"
+    ],
+    "endpoints": 3
+  },
+  "share_hash": "9dGMKxaMcV0"
+}
