@@ -1,0 +1,16 @@
+[2026-05-28T14:07:23.984+0000][18018.717s][info][gc] GC(23) Pause Young (System.gc()) 6761M->868M(97757M) 16.084ms
+[2026-05-28T14:07:24.414+0000][18019.147s][info][gc] GC(24) Pause Full (System.gc()) 868M->810M(97757M) 430.217ms
+OPTIMIZE TABLE line_item_capacity_tmp completed in 3003s
+[IFP Info]: Found 1 backup tables: line_item_capacity_2026_05_09
+Executing SQL query from DbAccessor.upDateRecordState:
+
+UPDATE offline_reservation_running_record
+SET offline_reservation_state = 'OLAP_FINISH'
+WHERE id = 1248
+
+Executing SQL query from JdbcManager.executeUpdate:
+
+UPDATE offline_reservation_running_record
+SET offline_reservation_state = 'OLAP_FINISH'
+WHERE id = 1248
+

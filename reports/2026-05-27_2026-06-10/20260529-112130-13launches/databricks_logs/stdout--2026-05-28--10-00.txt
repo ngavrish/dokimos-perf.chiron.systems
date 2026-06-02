@@ -1,0 +1,2824 @@
+CONF_DRIVER_JAVA_OPTS = -Djava.io.tmpdir=/local_disk0/tmp -XX:-OmitStackTraceInFastThrow -Djava.security.properties=/databricks/spark/dbconf/java/extra.security -XX:-UseContainerSupport -XX:+PrintFlagsFinal -Xlog:gc:stdout:time,uptime,level,tags -Xss4m -Djava.library.path=/usr/java/packages/lib/aarch64:/lib:/usr/lib:/usr/lib64:/lib64:/usr/lib/aarch64-linux-gnu/jni:/lib/aarch64-linux-gnu:/usr/lib/aarch64-linux-gnu:/usr/lib/jni -Djavax.xml.datatype.DatatypeFactory=com.sun.org.apache.xerces.internal.jaxp.datatype.DatatypeFactoryImpl -Djavax.xml.parsers.DocumentBuilderFactory=com.sun.org.apache.xerces.internal.jaxp.DocumentBuilderFactoryImpl -Djavax.xml.parsers.SAXParserFactory=com.sun.org.apache.xerces.internal.jaxp.SAXParserFactoryImpl -Djavax.xml.validation.SchemaFactory:http://www.w3.org/2001/XMLSchema=com.sun.org.apache.xerces.internal.jaxp.validation.XMLSchemaFactory -Dorg.xml.sax.driver=com.sun.org.apache.xerces.internal.parsers.SAXParser -Dorg.w3c.dom.DOMImplementationSourceList=com.sun.org.apache.xerces.internal.dom.DOMXSImplementationSourceImpl -Djavax.net.ssl.sessionCacheSize=10000 -Dscala.reflect.runtime.disable.typetag.cache=true -Dcom.google.cloud.spark.bigquery.repackaged.io.netty.tryReflectionSetAccessible=true -Dio.netty.tryReflectionSetAccessible=true -Dlog4j2.formatMsgNoLookups=true  -XX:+UseBiasedLocking -Denv=uat -XX:+IgnoreUnrecognizedVMOptions --add-opens=java.base/java.lang=ALL-UNNAMED --add-opens=java.base/java.lang.invoke=ALL-UNNAMED --add-opens=java.base/java.lang.reflect=ALL-UNNAMED --add-opens=java.base/java.io=ALL-UNNAMED --add-opens=java.base/java.net=ALL-UNNAMED --add-opens=java.base/java.nio=ALL-UNNAMED --add-opens=java.base/java.util=ALL-UNNAMED --add-opens=java.base/java.util.concurrent=ALL-UNNAMED --add-opens=java.base/java.util.concurrent.atomic=ALL-UNNAMED --add-opens=java.base/jdk.internal.ref=ALL-UNNAMED --add-opens=java.base/sun.nio.ch=ALL-UNNAMED --add-opens=java.base/sun.nio.cs=ALL-UNNAMED --add-opens=java.base/sun.security.action=ALL-UNNAMED --add-opens=java.base/sun.util.calendar=ALL-UNNAMED --add-opens=java.security.jgss/sun.security.krb5=ALL-UNNAMED --add-opens=jdk.jfr/jdk.jfr.internal.consumer=ALL-UNNAMED --add-opens=jdk.jfr/jdk.jfr.internal=ALL-UNNAMED --add-opens=java.management/sun.management=ALL-UNNAMED --add-opens=java.base/jdk.internal.loader=ALL-UNNAMED --add-opens=jdk.naming.dns/com.sun.jndi.dns=java.naming -Djdk.reflect.useDirectMethodHandle=false -XX:+UseParallelGC  -Ddatabricks.serviceName=driver-1 -Xms98304m -Xmx98304m -Dspark.ui.port=40001 -Dspark.driver.extraJavaOptions="-Denv=uat"
+CONF_EXECUTOR_JAVA_OPTS = -Dspark.executor.extraJavaOptions="-Djava.io.tmpdir=/local_disk0/tmp -XX:ReservedCodeCacheSize=512m -XX:+UseCodeCacheFlushing -XX:PerMethodRecompilationCutoff=-1 -XX:PerBytecodeRecompilationCutoff=-1 -Djava.security.properties=/databricks/spark/dbconf/java/extra.security -XX:-UseContainerSupport -XX:+PrintFlagsFinal -Xlog:gc:stdout:time,uptime,level,tags -Xss4m -Djava.library.path=/usr/java/packages/lib/aarch64:/lib:/usr/lib:/usr/lib64:/lib64:/usr/lib/aarch64-linux-gnu/jni:/lib/aarch64-linux-gnu:/usr/lib/aarch64-linux-gnu:/usr/lib/jni -Djavax.xml.datatype.DatatypeFactory=com.sun.org.apache.xerces.internal.jaxp.datatype.DatatypeFactoryImpl -Djavax.xml.parsers.DocumentBuilderFactory=com.sun.org.apache.xerces.internal.jaxp.DocumentBuilderFactoryImpl -Djavax.xml.parsers.SAXParserFactory=com.sun.org.apache.xerces.internal.jaxp.SAXParserFactoryImpl -Djavax.xml.validation.SchemaFactory:http://www.w3.org/2001/XMLSchema=com.sun.org.apache.xerces.internal.jaxp.validation.XMLSchemaFactory -Dorg.xml.sax.driver=com.sun.org.apache.xerces.internal.parsers.SAXParser -Dorg.w3c.dom.DOMImplementationSourceList=com.sun.org.apache.xerces.internal.dom.DOMXSImplementationSourceImpl -Djavax.net.ssl.sessionCacheSize=10000 -Dscala.reflect.runtime.disable.typetag.cache=true -Dcom.google.cloud.spark.bigquery.repackaged.io.netty.tryReflectionSetAccessible=true -Dio.netty.tryReflectionSetAccessible=true -Dlog4j2.formatMsgNoLookups=true  -XX:+UseBiasedLocking  -Denv=uat -XX:+IgnoreUnrecognizedVMOptions --add-opens=java.base/java.lang=ALL-UNNAMED --add-opens=java.base/java.lang.invoke=ALL-UNNAMED --add-opens=java.base/java.lang.reflect=ALL-UNNAMED --add-opens=java.base/java.io=ALL-UNNAMED --add-opens=java.base/java.net=ALL-UNNAMED --add-opens=java.base/java.nio=ALL-UNNAMED --add-opens=java.base/java.util=ALL-UNNAMED --add-opens=java.base/java.util.concurrent=ALL-UNNAMED --add-opens=java.base/java.util.concurrent.atomic=ALL-UNNAMED --add-opens=java.base/jdk.internal.ref=ALL-UNNAMED --add-opens=java.base/sun.nio.ch=ALL-UNNAMED --add-opens=java.base/sun.nio.cs=ALL-UNNAMED --add-opens=java.base/sun.security.action=ALL-UNNAMED --add-opens=java.base/sun.util.calendar=ALL-UNNAMED --add-opens=java.security.jgss/sun.security.krb5=ALL-UNNAMED --add-opens=jdk.jfr/jdk.jfr.internal.consumer=ALL-UNNAMED --add-opens=jdk.jfr/jdk.jfr.internal=ALL-UNNAMED --add-opens=java.management/sun.management=ALL-UNNAMED --add-opens=java.base/jdk.internal.loader=ALL-UNNAMED --add-opens=jdk.naming.dns/com.sun.jndi.dns=java.naming -Djdk.reflect.useDirectMethodHandle=false -XX:+UseParallelGC  -Ddatabricks.serviceName=spark-executor-1" -Dspark.executor.memory=20480m
+JAVA_OPTS =   -Djava.io.tmpdir=/local_disk0/tmp -XX:-OmitStackTraceInFastThrow -Djava.security.properties=/databricks/spark/dbconf/java/extra.security -XX:-UseContainerSupport -XX:+PrintFlagsFinal -Xlog:gc:stdout:time,uptime,level,tags -Xss4m -Djava.library.path=/usr/java/packages/lib/aarch64:/lib:/usr/lib:/usr/lib64:/lib64:/usr/lib/aarch64-linux-gnu/jni:/lib/aarch64-linux-gnu:/usr/lib/aarch64-linux-gnu:/usr/lib/jni -Djavax.xml.datatype.DatatypeFactory=com.sun.org.apache.xerces.internal.jaxp.datatype.DatatypeFactoryImpl -Djavax.xml.parsers.DocumentBuilderFactory=com.sun.org.apache.xerces.internal.jaxp.DocumentBuilderFactoryImpl -Djavax.xml.parsers.SAXParserFactory=com.sun.org.apache.xerces.internal.jaxp.SAXParserFactoryImpl -Djavax.xml.validation.SchemaFactory:http://www.w3.org/2001/XMLSchema=com.sun.org.apache.xerces.internal.jaxp.validation.XMLSchemaFactory -Dorg.xml.sax.driver=com.sun.org.apache.xerces.internal.parsers.SAXParser -Dorg.w3c.dom.DOMImplementationSourceList=com.sun.org.apache.xerces.internal.dom.DOMXSImplementationSourceImpl -Djavax.net.ssl.sessionCacheSize=10000 -Dscala.reflect.runtime.disable.typetag.cache=true -Dcom.google.cloud.spark.bigquery.repackaged.io.netty.tryReflectionSetAccessible=true -Dio.netty.tryReflectionSetAccessible=true -Dlog4j2.formatMsgNoLookups=true  -XX:+UseBiasedLocking -Denv=uat -XX:+IgnoreUnrecognizedVMOptions --add-opens=java.base/java.lang=ALL-UNNAMED --add-opens=java.base/java.lang.invoke=ALL-UNNAMED --add-opens=java.base/java.lang.reflect=ALL-UNNAMED --add-opens=java.base/java.io=ALL-UNNAMED --add-opens=java.base/java.net=ALL-UNNAMED --add-opens=java.base/java.nio=ALL-UNNAMED --add-opens=java.base/java.util=ALL-UNNAMED --add-opens=java.base/java.util.concurrent=ALL-UNNAMED --add-opens=java.base/java.util.concurrent.atomic=ALL-UNNAMED --add-opens=java.base/jdk.internal.ref=ALL-UNNAMED --add-opens=java.base/sun.nio.ch=ALL-UNNAMED --add-opens=java.base/sun.nio.cs=ALL-UNNAMED --add-opens=java.base/sun.security.action=ALL-UNNAMED --add-opens=java.base/sun.util.calendar=ALL-UNNAMED --add-opens=java.security.jgss/sun.security.krb5=ALL-UNNAMED --add-opens=jdk.jfr/jdk.jfr.internal.consumer=ALL-UNNAMED --add-opens=jdk.jfr/jdk.jfr.internal=ALL-UNNAMED --add-opens=java.management/sun.management=ALL-UNNAMED --add-opens=java.base/jdk.internal.loader=ALL-UNNAMED --add-opens=jdk.naming.dns/com.sun.jndi.dns=java.naming -Djdk.reflect.useDirectMethodHandle=false -XX:+UseParallelGC  -Ddatabricks.serviceName=driver-1 -Xms98304m -Xmx98304m -Dspark.ui.port=40001 -Dspark.driver.extraJavaOptions="-Denv=uat" -Dspark.executor.extraJavaOptions="-Djava.io.tmpdir=/local_disk0/tmp -XX:ReservedCodeCacheSize=512m -XX:+UseCodeCacheFlushing -XX:PerMethodRecompilationCutoff=-1 -XX:PerBytecodeRecompilationCutoff=-1 -Djava.security.properties=/databricks/spark/dbconf/java/extra.security -XX:-UseContainerSupport -XX:+PrintFlagsFinal -Xlog:gc:stdout:time,uptime,level,tags -Xss4m -Djava.library.path=/usr/java/packages/lib/aarch64:/lib:/usr/lib:/usr/lib64:/lib64:/usr/lib/aarch64-linux-gnu/jni:/lib/aarch64-linux-gnu:/usr/lib/aarch64-linux-gnu:/usr/lib/jni -Djavax.xml.datatype.DatatypeFactory=com.sun.org.apache.xerces.internal.jaxp.datatype.DatatypeFactoryImpl -Djavax.xml.parsers.DocumentBuilderFactory=com.sun.org.apache.xerces.internal.jaxp.DocumentBuilderFactoryImpl -Djavax.xml.parsers.SAXParserFactory=com.sun.org.apache.xerces.internal.jaxp.SAXParserFactoryImpl -Djavax.xml.validation.SchemaFactory:http://www.w3.org/2001/XMLSchema=com.sun.org.apache.xerces.internal.jaxp.validation.XMLSchemaFactory -Dorg.xml.sax.driver=com.sun.org.apache.xerces.internal.parsers.SAXParser -Dorg.w3c.dom.DOMImplementationSourceList=com.sun.org.apache.xerces.internal.dom.DOMXSImplementationSourceImpl -Djavax.net.ssl.sessionCacheSize=10000 -Dscala.reflect.runtime.disable.typetag.cache=true -Dcom.google.cloud.spark.bigquery.repackaged.io.netty.tryReflectionSetAccessible=true -Dio.netty.tryReflectionSetAccessible=true -Dlog4j2.formatMsgNoLookups=true  -XX:+UseBiasedLocking  -Denv=uat -XX:+IgnoreUnrecognizedVMOptions --add-opens=java.base/java.lang=ALL-UNNAMED --add-opens=java.base/java.lang.invoke=ALL-UNNAMED --add-opens=java.base/java.lang.reflect=ALL-UNNAMED --add-opens=java.base/java.io=ALL-UNNAMED --add-opens=java.base/java.net=ALL-UNNAMED --add-opens=java.base/java.nio=ALL-UNNAMED --add-opens=java.base/java.util=ALL-UNNAMED --add-opens=java.base/java.util.concurrent=ALL-UNNAMED --add-opens=java.base/java.util.concurrent.atomic=ALL-UNNAMED --add-opens=java.base/jdk.internal.ref=ALL-UNNAMED --add-opens=java.base/sun.nio.ch=ALL-UNNAMED --add-opens=java.base/sun.nio.cs=ALL-UNNAMED --add-opens=java.base/sun.security.action=ALL-UNNAMED --add-opens=java.base/sun.util.calendar=ALL-UNNAMED --add-opens=java.security.jgss/sun.security.krb5=ALL-UNNAMED --add-opens=jdk.jfr/jdk.jfr.internal.consumer=ALL-UNNAMED --add-opens=jdk.jfr/jdk.jfr.internal=ALL-UNNAMED --add-opens=java.management/sun.management=ALL-UNNAMED --add-opens=java.base/jdk.internal.loader=ALL-UNNAMED --add-opens=jdk.naming.dns/com.sun.jndi.dns=java.naming -Djdk.reflect.useDirectMethodHandle=false -XX:+UseParallelGC  -Ddatabricks.serviceName=spark-executor-1" -Dspark.executor.memory=20480m -Dspark.executor.extraClassPath=/databricks/hadoop-safety-jars/*:/databricks/spark/dbconf/log4j/executor:/databricks/spark/dbconf/jets3t/:/databricks/spark/dbconf/hadoop:/databricks/hive/conf:/databricks/jars/*
+Using Spark master spark://10.255.74.54:7077
+AppCDS disabled: See Chauffeur logs for details.
+Thu May 28 09:07:05 UTC 2026
+Starting driver
+Driver command is /usr/lib/jvm/zulu17-ca-arm64//bin/java   -Djava.io.tmpdir=/local_disk0/tmp -XX:-OmitStackTraceInFastThrow -Djava.security.properties=/databricks/spark/dbconf/java/extra.security -XX:-UseContainerSupport -XX:+PrintFlagsFinal -Xlog:gc:stdout:time,uptime,level,tags -Xss4m -Djava.library.path=/usr/java/packages/lib/aarch64:/lib:/usr/lib:/usr/lib64:/lib64:/usr/lib/aarch64-linux-gnu/jni:/lib/aarch64-linux-gnu:/usr/lib/aarch64-linux-gnu:/usr/lib/jni -Djavax.xml.datatype.DatatypeFactory=com.sun.org.apache.xerces.internal.jaxp.datatype.DatatypeFactoryImpl -Djavax.xml.parsers.DocumentBuilderFactory=com.sun.org.apache.xerces.internal.jaxp.DocumentBuilderFactoryImpl -Djavax.xml.parsers.SAXParserFactory=com.sun.org.apache.xerces.internal.jaxp.SAXParserFactoryImpl -Djavax.xml.validation.SchemaFactory:http://www.w3.org/2001/XMLSchema=com.sun.org.apache.xerces.internal.jaxp.validation.XMLSchemaFactory -Dorg.xml.sax.driver=com.sun.org.apache.xerces.internal.parsers.SAXParser -Dorg.w3c.dom.DOMImplementationSourceList=com.sun.org.apache.xerces.internal.dom.DOMXSImplementationSourceImpl -Djavax.net.ssl.sessionCacheSize=10000 -Dscala.reflect.runtime.disable.typetag.cache=true -Dcom.google.cloud.spark.bigquery.repackaged.io.netty.tryReflectionSetAccessible=true -Dio.netty.tryReflectionSetAccessible=true -Dlog4j2.formatMsgNoLookups=true  -XX:+UseBiasedLocking -Denv=uat -XX:+IgnoreUnrecognizedVMOptions --add-opens=java.base/java.lang=ALL-UNNAMED --add-opens=java.base/java.lang.invoke=ALL-UNNAMED --add-opens=java.base/java.lang.reflect=ALL-UNNAMED --add-opens=java.base/java.io=ALL-UNNAMED --add-opens=java.base/java.net=ALL-UNNAMED --add-opens=java.base/java.nio=ALL-UNNAMED --add-opens=java.base/java.util=ALL-UNNAMED --add-opens=java.base/java.util.concurrent=ALL-UNNAMED --add-opens=java.base/java.util.concurrent.atomic=ALL-UNNAMED --add-opens=java.base/jdk.internal.ref=ALL-UNNAMED --add-opens=java.base/sun.nio.ch=ALL-UNNAMED --add-opens=java.base/sun.nio.cs=ALL-UNNAMED --add-opens=java.base/sun.security.action=ALL-UNNAMED --add-opens=java.base/sun.util.calendar=ALL-UNNAMED --add-opens=java.security.jgss/sun.security.krb5=ALL-UNNAMED --add-opens=jdk.jfr/jdk.jfr.internal.consumer=ALL-UNNAMED --add-opens=jdk.jfr/jdk.jfr.internal=ALL-UNNAMED --add-opens=java.management/sun.management=ALL-UNNAMED --add-opens=java.base/jdk.internal.loader=ALL-UNNAMED --add-opens=jdk.naming.dns/com.sun.jndi.dns=java.naming -Djdk.reflect.useDirectMethodHandle=false -XX:+UseParallelGC  -Ddatabricks.serviceName=driver-1 -Xms98304m -Xmx98304m -Dspark.ui.port=40001 -Dspark.driver.extraJavaOptions="-Denv=uat" -Dspark.executor.extraJavaOptions="-Djava.io.tmpdir=/local_disk0/tmp -XX:ReservedCodeCacheSize=512m -XX:+UseCodeCacheFlushing -XX:PerMethodRecompilationCutoff=-1 -XX:PerBytecodeRecompilationCutoff=-1 -Djava.security.properties=/databricks/spark/dbconf/java/extra.security -XX:-UseContainerSupport -XX:+PrintFlagsFinal -Xlog:gc:stdout:time,uptime,level,tags -Xss4m -Djava.library.path=/usr/java/packages/lib/aarch64:/lib:/usr/lib:/usr/lib64:/lib64:/usr/lib/aarch64-linux-gnu/jni:/lib/aarch64-linux-gnu:/usr/lib/aarch64-linux-gnu:/usr/lib/jni -Djavax.xml.datatype.DatatypeFactory=com.sun.org.apache.xerces.internal.jaxp.datatype.DatatypeFactoryImpl -Djavax.xml.parsers.DocumentBuilderFactory=com.sun.org.apache.xerces.internal.jaxp.DocumentBuilderFactoryImpl -Djavax.xml.parsers.SAXParserFactory=com.sun.org.apache.xerces.internal.jaxp.SAXParserFactoryImpl -Djavax.xml.validation.SchemaFactory:http://www.w3.org/2001/XMLSchema=com.sun.org.apache.xerces.internal.jaxp.validation.XMLSchemaFactory -Dorg.xml.sax.driver=com.sun.org.apache.xerces.internal.parsers.SAXParser -Dorg.w3c.dom.DOMImplementationSourceList=com.sun.org.apache.xerces.internal.dom.DOMXSImplementationSourceImpl -Djavax.net.ssl.sessionCacheSize=10000 -Dscala.reflect.runtime.disable.typetag.cache=true -Dcom.google.cloud.spark.bigquery.repackaged.io.netty.tryReflectionSetAccessible=true -Dio.netty.tryReflectionSetAccessible=true -Dlog4j2.formatMsgNoLookups=true  -XX:+UseBiasedLocking  -Denv=uat -XX:+IgnoreUnrecognizedVMOptions --add-opens=java.base/java.lang=ALL-UNNAMED --add-opens=java.base/java.lang.invoke=ALL-UNNAMED --add-opens=java.base/java.lang.reflect=ALL-UNNAMED --add-opens=java.base/java.io=ALL-UNNAMED --add-opens=java.base/java.net=ALL-UNNAMED --add-opens=java.base/java.nio=ALL-UNNAMED --add-opens=java.base/java.util=ALL-UNNAMED --add-opens=java.base/java.util.concurrent=ALL-UNNAMED --add-opens=java.base/java.util.concurrent.atomic=ALL-UNNAMED --add-opens=java.base/jdk.internal.ref=ALL-UNNAMED --add-opens=java.base/sun.nio.ch=ALL-UNNAMED --add-opens=java.base/sun.nio.cs=ALL-UNNAMED --add-opens=java.base/sun.security.action=ALL-UNNAMED --add-opens=java.base/sun.util.calendar=ALL-UNNAMED --add-opens=java.security.jgss/sun.security.krb5=ALL-UNNAMED --add-opens=jdk.jfr/jdk.jfr.internal.consumer=ALL-UNNAMED --add-opens=jdk.jfr/jdk.jfr.internal=ALL-UNNAMED --add-opens=java.management/sun.management=ALL-UNNAMED --add-opens=java.base/jdk.internal.loader=ALL-UNNAMED --add-opens=jdk.naming.dns/com.sun.jndi.dns=java.naming -Djdk.reflect.useDirectMethodHandle=false -XX:+UseParallelGC  -Ddatabricks.serviceName=spark-executor-1" -Dspark.executor.memory=20480m -Dspark.executor.extraClassPath=/databricks/hadoop-safety-jars/*:/databricks/spark/dbconf/log4j/executor:/databricks/spark/dbconf/jets3t/:/databricks/spark/dbconf/hadoop:/databricks/hive/conf:/databricks/jars/*  -cp /databricks/hadoop-safety-jars/*:/databricks/spark/dbconf/jets3t/:/databricks/spark/dbconf/log4j/driver:/databricks/hive/conf:/databricks/spark/dbconf/hadoop:/databricks/jars/* com.databricks.backend.daemon.driver.DriverDaemon &
+Working directory is /databricks/driver
+[2026-05-28T09:07:05.270+0000][0.003s][info][gc] Using Parallel
+[Global flags]
+      int ActiveProcessorCount                     = -1                                        {product} {default}
+    uintx AdaptiveSizeDecrementScaleFactor         = 4                                         {product} {default}
+    uintx AdaptiveSizeMajorGCDecayTimeScale        = 10                                        {product} {default}
+    uintx AdaptiveSizePolicyCollectionCostMargin   = 50                                        {product} {default}
+    uintx AdaptiveSizePolicyInitializingSteps      = 20                                        {product} {default}
+    uintx AdaptiveSizePolicyOutputInterval         = 0                                         {product} {default}
+    uintx AdaptiveSizePolicyWeight                 = 10                                        {product} {default}
+    uintx AdaptiveSizeThroughPutPolicy             = 0                                         {product} {default}
+    uintx AdaptiveTimeWeight                       = 25                                        {product} {default}
+     bool AdjustStackSizeForTLS                    = false                                     {product} {default}
+     bool AggressiveHeap                           = false                                     {product} {default}
+     intx AliasLevel                               = 3                                      {C2 product} {default}
+     bool AlignVector                              = false                                  {C2 product} {default}
+    ccstr AllocateHeapAt                           =                                           {product} {default}
+     intx AllocateInstancePrefetchLines            = 1                                         {product} {default}
+     intx AllocatePrefetchDistance                 = 192                                       {product} {default}
+     intx AllocatePrefetchInstr                    = 0                                         {product} {default}
+     intx AllocatePrefetchLines                    = 3                                         {product} {default}
+     intx AllocatePrefetchStepSize                 = 64                                        {product} {default}
+     intx AllocatePrefetchStyle                    = 1                                         {product} {default}
+     bool AllowParallelDefineClass                 = false                                     {product} {default}
+     bool AllowRedefinitionToAddDeleteMethods      = false                                     {product} {default}
+     bool AllowUserSignalHandlers                  = false                                     {product} {default}
+     bool AllowVectorizeOnDemand                   = true                                   {C2 product} {default}
+     bool AlwaysActAsServerClassMachine            = false                                     {product} {default}
+     bool AlwaysCompileLoopMethods                 = false                                     {product} {default}
+     bool AlwaysLockClassLoader                    = false                                     {product} {default}
+     bool AlwaysPreTouch                           = false                                     {product} {default}
+     bool AlwaysRestoreFPU                         = false                                     {product} {default}
+     bool AlwaysTenure                             = false                                     {product} {default}
+    ccstr ArchiveClassesAtExit                     =                                           {product} {default}
+     intx ArrayCopyLoadStoreMaxElem                = 8                                      {C2 product} {default}
+   size_t AsyncLogBufferSize                       = 2097152                                   {product} {default}
+     intx AutoBoxCacheMax                          = 128                                    {C2 product} {default}
+     bool AvoidUnalignedAccesses                   = false                                {ARCH product} {default}
+    ccstr AzCRSArguments                           =                                           {product} {default}
+    ccstr AzCRSMode                                = off                                       {product} {default}
+     intx BCEATraceLevel                           = 0                                         {product} {default}
+     bool BackgroundCompilation                    = true                                   {pd product} {default}
+   size_t BaseFootPrintEstimate                    = 268435456                                 {product} {default}
+     intx BiasedLockingBulkRebiasThreshold         = 20                                        {product} {default}
+     intx BiasedLockingBulkRevokeThreshold         = 40                                        {product} {default}
+     intx BiasedLockingDecayTime                   = 25000                                     {product} {default}
+     intx BiasedLockingStartupDelay                = 0                                         {product} {default}
+     bool BlockLayoutByFrequency                   = true                                   {C2 product} {default}
+     intx BlockLayoutMinDiamondPercentage          = 20                                     {C2 product} {default}
+     bool BlockLayoutRotateLoops                   = true                                   {C2 product} {default}
+     intx BlockZeroingLowLimit                     = 256                                  {ARCH product} {default}
+     intx C1InlineStackLimit                       = 5                                      {C1 product} {default}
+     intx C1MaxInlineLevel                         = 9                                      {C1 product} {default}
+     intx C1MaxInlineSize                          = 35                                     {C1 product} {default}
+     intx C1MaxRecursiveInlineLevel                = 1                                      {C1 product} {default}
+     intx C1MaxTrivialSize                         = 6                                      {C1 product} {default}
+     bool C1OptimizeVirtualCallProfiling           = true                                   {C1 product} {default}
+     bool C1ProfileBranches                        = true                                   {C1 product} {default}
+     bool C1ProfileCalls                           = true                                   {C1 product} {default}
+     bool C1ProfileCheckcasts                      = true                                   {C1 product} {default}
+     bool C1ProfileInlinedCalls                    = true                                   {C1 product} {default}
+     bool C1ProfileVirtualCalls                    = true                                   {C1 product} {default}
+     bool C1UpdateMethodData                       = true                                   {C1 product} {default}
+     intx CICompilerCount                          = 12                                        {product} {ergonomic}
+     bool CICompilerCountPerCPU                    = true                                      {product} {default}
+     bool CITime                                   = false                                     {product} {default}
+     bool CheckJNICalls                            = false                                     {product} {default}
+     bool ClassUnloading                           = true                                      {product} {default}
+     bool ClassUnloadingWithConcurrentMark         = true                                      {product} {default}
+     bool ClipInlining                             = true                                      {product} {default}
+    uintx CodeCacheExpansionSize                   = 65536                                  {pd product} {default}
+     bool CompactStrings                           = true                                   {pd product} {default}
+    ccstr CompilationMode                          = default                                   {product} {default}
+ccstrlist CompileCommand                           =                                           {product} {default}
+    ccstr CompileCommandFile                       =                                           {product} {default}
+ccstrlist CompileOnly                              =                                           {product} {default}
+     intx CompileThreshold                         = 10000                                  {pd product} {default}
+   double CompileThresholdScaling                  = 1.000000                                  {product} {default}
+     intx CompilerThreadPriority                   = -1                                        {product} {default}
+     intx CompilerThreadStackSize                  = 2040                                   {pd product} {default}
+   size_t CompressedClassSpaceSize                 = 1073741824                                {product} {default}
+     uint ConcGCThreads                            = 0                                         {product} {default}
+     intx ConditionalMoveLimit                     = 3                                   {C2 pd product} {default}
+     intx ContendedPaddingWidth                    = 128                                       {product} {default}
+     bool CrashOnOutOfMemoryError                  = false                                     {product} {default}
+     bool CreateCoredumpOnCrash                    = true                                      {product} {default}
+     bool CriticalJNINatives                       = false                                     {product} {default}
+     bool DTraceAllocProbes                        = false                                     {product} {default}
+     bool DTraceMethodProbes                       = false                                     {product} {default}
+     bool DTraceMonitorProbes                      = false                                     {product} {default}
+     bool DisableAttachMechanism                   = false                                     {product} {default}
+     bool DisableExplicitGC                        = false                                     {product} {default}
+     bool DisplayVMOutputToStderr                  = false                                     {product} {default}
+     bool DisplayVMOutputToStdout                  = false                                     {product} {default}
+     bool DoEscapeAnalysis                         = true                                   {C2 product} {default}
+     bool DoReserveCopyInSuperWord                 = true                                   {C2 product} {default}
+     bool DontCompileHugeMethods                   = true                                      {product} {default}
+     bool DontYieldALot                            = false                                  {pd product} {default}
+    ccstr DumpLoadedClassList                      =                                           {product} {default}
+     bool DumpReplayDataOnError                    = true                                      {product} {default}
+     bool DumpSharedSpaces                         = false                                     {product} {default}
+     bool DynamicDumpSharedSpaces                  = false                                     {product} {default}
+     bool EagerXrunInit                            = false                                     {product} {default}
+     intx EliminateAllocationArraySizeLimit        = 64                                     {C2 product} {default}
+     bool EliminateAllocations                     = true                                   {C2 product} {default}
+     bool EliminateAutoBox                         = true                                   {C2 product} {default}
+     bool EliminateLocks                           = true                                   {C2 product} {default}
+     bool EliminateNestedLocks                     = true                                   {C2 product} {default}
+     bool EnableContended                          = true                                      {product} {default}
+     bool EnableDynamicAgentLoading                = true                                      {product} {default}
+   size_t ErgoHeapSizeLimit                        = 0                                         {product} {default}
+    ccstr ErrorFile                                = /tmp/datadog/java/hs_err_pid_%p.log            {product} {environment}
+     bool ErrorFileToStderr                        = false                                     {product} {default}
+     bool ErrorFileToStdout                        = false                                     {product} {default}
+ uint64_t ErrorLogTimeout                          = 120                                       {product} {default}
+   double EscapeAnalysisTimeout                    = 20.000000                              {C2 product} {default}
+     bool EstimateArgEscape                        = true                                      {product} {default}
+     bool ExecutingUnitTests                       = false                                     {product} {default}
+     bool ExitOnOutOfMemoryError                   = false                                     {product} {default}
+     bool ExplicitGCInvokesConcurrent              = false                                     {product} {default}
+     bool ExtendedDTraceProbes                     = false                                     {product} {default}
+     bool ExtensiveErrorReports                    = false                                     {product} {default}
+    ccstr ExtraSharedClassListFile                 =                                           {product} {default}
+     bool FilterSpuriousWakeups                    = true                                      {product} {default}
+     bool FlightRecorder                           = false                                     {product} {default}
+    ccstr FlightRecorderOptions                    =                                           {product} {default}
+     bool ForceTimeHighResolution                  = false                                     {product} {default}
+     intx FreqInlineSize                           = 325                                 {C2 pd product} {default}
+   double G1ConcMarkStepDurationMillis             = 10.000000                                 {product} {default}
+    uintx G1ConcRSHotCardLimit                     = 4                                         {product} {default}
+   size_t G1ConcRSLogCacheSize                     = 10                                        {product} {default}
+   size_t G1ConcRefinementGreenZone                = 0                                         {product} {default}
+   size_t G1ConcRefinementRedZone                  = 0                                         {product} {default}
+    uintx G1ConcRefinementServiceIntervalMillis    = 300                                       {product} {default}
+     uint G1ConcRefinementThreads                  = 0                                         {product} {default}
+   size_t G1ConcRefinementThresholdStep            = 2                                         {product} {default}
+   size_t G1ConcRefinementYellowZone               = 0                                         {product} {default}
+    uintx G1ConfidencePercent                      = 50                                        {product} {default}
+   size_t G1HeapRegionSize                         = 0                                         {product} {default}
+    uintx G1HeapWastePercent                       = 5                                         {product} {default}
+    uintx G1MixedGCCountTarget                     = 8                                         {product} {default}
+    uintx G1PeriodicGCInterval                     = 0                                      {manageable} {default}
+     bool G1PeriodicGCInvokesConcurrent            = true                                      {product} {default}
+   double G1PeriodicGCSystemLoadThreshold          = 0.000000                               {manageable} {default}
+     intx G1RSetRegionEntries                      = 0                                         {product} {default}
+     intx G1RSetSparseRegionEntries                = 0                                         {product} {default}
+     intx G1RSetUpdatingPauseTimePercent           = 10                                        {product} {default}
+     uint G1RefProcDrainInterval                   = 1000                                      {product} {default}
+    uintx G1ReservePercent                         = 10                                        {product} {default}
+    uintx G1SATBBufferEnqueueingThresholdPercent   = 60                                        {product} {default}
+   size_t G1SATBBufferSize                         = 1024                                      {product} {default}
+   size_t G1UpdateBufferSize                       = 256                                       {product} {default}
+     bool G1UseAdaptiveConcRefinement              = true                                      {product} {default}
+     bool G1UseAdaptiveIHOP                        = true                                      {product} {default}
+    uintx GCDrainStackTargetSize                   = 64                                        {product} {default}
+    uintx GCHeapFreeLimit                          = 2                                         {product} {default}
+    uintx GCLockerEdenExpansionPercent             = 5                                         {product} {default}
+    uintx GCPauseIntervalMillis                    = 0                                         {product} {default}
+    uintx GCTimeLimit                              = 98                                        {product} {default}
+    uintx GCTimeRatio                              = 99                                        {product} {default}
+   size_t HeapBaseMinAddress                       = 2147483648                             {pd product} {default}
+     bool HeapDumpAfterFullGC                      = false                                  {manageable} {default}
+     bool HeapDumpBeforeFullGC                     = false                                  {manageable} {default}
+     intx HeapDumpGzipLevel                        = 0                                      {manageable} {default}
+     bool HeapDumpOnOutOfMemoryError               = false                                  {manageable} {default}
+    ccstr HeapDumpPath                             =                                        {manageable} {default}
+    uintx HeapFirstMaximumCompactionCount          = 3                                         {product} {default}
+    uintx HeapMaximumCompactionInterval            = 20                                        {product} {default}
+    uintx HeapSearchSteps                          = 3                                         {product} {default}
+   size_t HeapSizePerGCThread                      = 43620760                                  {product} {default}
+     bool IgnoreEmptyClassPaths                    = false                                     {product} {default}
+     bool IgnoreUnrecognizedVMOptions              = true                                      {product} {command line}
+    uintx IncreaseFirstTierCompileThresholdAt      = 50                                        {product} {default}
+     bool IncrementalInline                        = true                                   {C2 product} {default}
+    uintx InitialCodeCacheSize                     = 2555904                                {pd product} {default}
+   size_t InitialHeapSize                          = 103079215104                              {product} {command line}
+    uintx InitialRAMFraction                       = 64                                        {product} {default}
+   double InitialRAMPercentage                     = 1.562500                                  {product} {default}
+    uintx InitialSurvivorRatio                     = 8                                         {product} {default}
+    uintx InitialTenuringThreshold                 = 7                                         {product} {default}
+    uintx InitiatingHeapOccupancyPercent           = 45                                        {product} {default}
+     bool Inline                                   = true                                      {product} {default}
+    ccstr InlineDataFile                           =                                           {product} {default}
+     intx InlineSmallCode                          = 2500                                {C2 pd product} {default}
+     bool InlineSynchronizedMethods                = true                                   {C1 product} {default}
+     intx InteriorEntryAlignment                   = 16                                  {C2 pd product} {default}
+     intx InterpreterProfilePercentage             = 33                                        {product} {default}
+     bool JavaMonitorsInStackTrace                 = true                                      {product} {default}
+     intx JavaPriority10_To_OSPriority             = -1                                        {product} {default}
+     intx JavaPriority1_To_OSPriority              = -1                                        {product} {default}
+     intx JavaPriority2_To_OSPriority              = -1                                        {product} {default}
+     intx JavaPriority3_To_OSPriority              = -1                                        {product} {default}
+     intx JavaPriority4_To_OSPriority              = -1                                        {product} {default}
+     intx JavaPriority5_To_OSPriority              = -1                                        {product} {default}
+     intx JavaPriority6_To_OSPriority              = -1                                        {product} {default}
+     intx JavaPriority7_To_OSPriority              = -1                                        {product} {default}
+     intx JavaPriority8_To_OSPriority              = -1                                        {product} {default}
+     intx JavaPriority9_To_OSPriority              = -1                                        {product} {default}
+   size_t LargePageHeapSizeThreshold               = 134217728                                 {product} {default}
+   size_t LargePageSizeInBytes                     = 0                                         {product} {default}
+     intx LiveNodeCountInliningCutoff              = 40000                                  {C2 product} {default}
+     bool LoadExecStackDllInVMThread               = true                                      {product} {default}
+     intx LoopMaxUnroll                            = 16                                     {C2 product} {default}
+     intx LoopOptsCount                            = 43                                     {C2 product} {default}
+     intx LoopPercentProfileLimit                  = 10                                  {C2 pd product} {default}
+    uintx LoopStripMiningIter                      = 0                                      {C2 product} {default}
+    uintx LoopStripMiningIterShortLoop             = 0                                      {C2 product} {default}
+     intx LoopUnrollLimit                          = 60                                  {C2 pd product} {default}
+     intx LoopUnrollMin                            = 4                                      {C2 product} {default}
+     bool LoopUnswitching                          = true                                   {C2 product} {default}
+     bool ManagementServer                         = false                                     {product} {default}
+   size_t MarkStackSize                            = 4194304                                   {product} {default}
+   size_t MarkStackSizeMax                         = 536870912                                 {product} {default}
+     uint MarkSweepAlwaysCompactCount              = 4                                         {product} {default}
+    uintx MarkSweepDeadRatio                       = 1                                         {product} {default}
+     intx MaxBCEAEstimateLevel                     = 5                                         {product} {default}
+     intx MaxBCEAEstimateSize                      = 150                                       {product} {default}
+ uint64_t MaxDirectMemorySize                      = 0                                         {product} {default}
+     bool MaxFDLimit                               = true                                      {product} {default}
+    uintx MaxGCMinorPauseMillis                    = 18446744073709551615                      {product} {default}
+    uintx MaxGCPauseMillis                         = 18446744073709551614                      {product} {default}
+    uintx MaxHeapFreeRatio                         = 100                                    {manageable} {default}
+   size_t MaxHeapSize                              = 103079215104                              {product} {command line}
+     intx MaxInlineLevel                           = 15                                     {C2 product} {default}
+     intx MaxInlineSize                            = 35                                     {C2 product} {default}
+     intx MaxJNILocalCapacity                      = 65536                                     {product} {default}
+     intx MaxJavaStackTraceDepth                   = 1024                                      {product} {default}
+     intx MaxJumpTableSize                         = 65000                                  {C2 product} {default}
+     intx MaxJumpTableSparseness                   = 5                                      {C2 product} {default}
+     intx MaxLabelRootDepth                        = 1100                                   {C2 product} {default}
+     intx MaxLoopPad                               = 15                                     {C2 product} {default}
+   size_t MaxMetaspaceExpansion                    = 5439488                                   {product} {default}
+    uintx MaxMetaspaceFreeRatio                    = 70                                        {product} {default}
+   size_t MaxMetaspaceSize                         = 18446744073709551615                      {product} {default}
+   size_t MaxNewSize                               = 34359738368                               {product} {ergonomic}
+     intx MaxNodeLimit                             = 80000                                  {C2 product} {default}
+ uint64_t MaxRAM                                   = 137438953472                           {pd product} {default}
+    uintx MaxRAMFraction                           = 4                                         {product} {default}
+   double MaxRAMPercentage                         = 25.000000                                 {product} {default}
+     intx MaxRecursiveInlineLevel                  = 1                                      {C2 product} {default}
+    uintx MaxTenuringThreshold                     = 15                                        {product} {default}
+     intx MaxTrivialSize                           = 6                                      {C2 product} {default}
+     intx MaxVectorSize                            = 16                                     {C2 product} {default}
+    ccstr MetaspaceReclaimPolicy                   = balanced                                  {product} {default}
+   size_t MetaspaceSize                            = 22020096                                  {product} {default}
+     bool MethodFlushing                           = true                                      {product} {default}
+   size_t MinHeapDeltaBytes                        = 524288                                    {product} {ergonomic}
+    uintx MinHeapFreeRatio                         = 0                                      {manageable} {default}
+   size_t MinHeapSize                              = 103079215104                              {product} {command line}
+     intx MinInliningThreshold                     = 250                                       {product} {default}
+     intx MinJumpTableSize                         = 10                                  {C2 pd product} {default}
+   size_t MinMetaspaceExpansion                    = 327680                                    {product} {default}
+    uintx MinMetaspaceFreeRatio                    = 40                                        {product} {default}
+    uintx MinRAMFraction                           = 2                                         {product} {default}
+   double MinRAMPercentage                         = 50.000000                                 {product} {default}
+    uintx MinSurvivorRatio                         = 3                                         {product} {default}
+   size_t MinTLABSize                              = 2048                                      {product} {default}
+     intx MultiArrayExpandLimit                    = 6                                      {C2 product} {default}
+    uintx NUMAChunkResizeWeight                    = 20                                        {product} {default}
+   size_t NUMAInterleaveGranularity                = 2097152                                   {product} {default}
+    uintx NUMAPageScanRate                         = 256                                       {product} {default}
+   size_t NUMASpaceResizeRate                      = 1073741824                                {product} {default}
+     bool NUMAStats                                = false                                     {product} {default}
+    ccstr NativeMemoryTracking                     = off                                       {product} {default}
+     bool NearCpool                                = true                                 {ARCH product} {default}
+     bool NeverActAsServerClassMachine             = false                                  {pd product} {default}
+     bool NeverTenure                              = false                                     {product} {default}
+    uintx NewRatio                                 = 2                                         {product} {default}
+   size_t NewSize                                  = 34359738368                               {product} {ergonomic}
+   size_t NewSizeThreadIncrease                    = 5320                                   {pd product} {default}
+     intx NmethodSweepActivity                     = 10                                        {product} {default}
+     intx NodeLimitFudgeFactor                     = 2000                                   {C2 product} {default}
+    uintx NonNMethodCodeHeapSize                   = 7602992                                {pd product} {ergonomic}
+    uintx NonProfiledCodeHeapSize                  = 122027624                              {pd product} {ergonomic}
+     intx NumberOfLoopInstrToAlign                 = 4                                      {C2 product} {default}
+     intx ObjectAlignmentInBytes                   = 8                              {product lp64_product} {default}
+   size_t OldPLABSize                              = 1024                                      {product} {default}
+   size_t OldSize                                  = 68719476736                               {product} {ergonomic}
+     bool OmitStackTraceInFastThrow                = false                                     {product} {command line}
+ccstrlist OnError                                  = /tmp/datadog/java/dd_crash_uploader.sh %p            {product} {environment}
+ccstrlist OnOutOfMemoryError                       = /tmp/datadog/java/dd_oome_notifier.sh %p            {product} {environment}
+     intx OnStackReplacePercentage                 = 140                                    {pd product} {default}
+     bool OptimizeFill                             = true                                   {C2 product} {default}
+     bool OptimizePtrCompare                       = true                                   {C2 product} {default}
+     bool OptimizeStringConcat                     = true                                   {C2 product} {default}
+     bool OptoBundling                             = false                               {C2 pd product} {default}
+     intx OptoLoopAlignment                        = 16                                     {pd product} {default}
+     bool OptoRegScheduling                        = false                               {C2 pd product} {default}
+     bool OptoScheduling                           = true                                {C2 pd product} {default}
+     bool OverrideVMProperties                     = false                                     {product} {default}
+    uintx PLABWeight                               = 75                                        {product} {default}
+     bool PSChunkLargeArrays                       = true                                      {product} {default}
+      int ParGCArrayScanChunk                      = 50                                        {product} {default}
+    uintx ParallelGCBufferWastePct                 = 10                                        {product} {default}
+     uint ParallelGCThreads                        = 13                                        {product} {default}
+   size_t ParallelOldDeadWoodLimiterMean           = 50                                        {product} {default}
+   size_t ParallelOldDeadWoodLimiterStdDev         = 80                                        {product} {default}
+     bool ParallelRefProcBalancingEnabled          = true                                      {product} {default}
+     bool ParallelRefProcEnabled                   = true                                      {product} {default}
+     bool PartialPeelAtUnsignedTests               = true                                   {C2 product} {default}
+     bool PartialPeelLoop                          = true                                   {C2 product} {default}
+     intx PartialPeelNewPhiDelta                   = 0                                      {C2 product} {default}
+    uintx PausePadding                             = 1                                         {product} {default}
+     intx PerBytecodeRecompilationCutoff           = 200                                       {product} {default}
+     intx PerBytecodeTrapLimit                     = 4                                         {product} {default}
+     intx PerMethodRecompilationCutoff             = 400                                       {product} {default}
+     intx PerMethodTrapLimit                       = 100                                       {product} {default}
+     bool PerfAllowAtExitRegistration              = false                                     {product} {default}
+     bool PerfBypassFileSystemCheck                = false                                     {product} {default}
+     intx PerfDataMemorySize                       = 32768                                     {product} {default}
+     intx PerfDataSamplingInterval                 = 50                                        {product} {default}
+    ccstr PerfDataSaveFile                         =                                           {product} {default}
+     bool PerfDataSaveToFile                       = false                                     {product} {default}
+     bool PerfDisableSharedMem                     = false                                     {product} {default}
+     intx PerfMaxStringConstLength                 = 1024                                      {product} {default}
+   size_t PreTouchParallelChunkSize                = 4194304                                {pd product} {default}
+     bool PreferContainerQuotaForCPUCount          = true                                      {product} {default}
+     bool PreferInterpreterNativeStubs             = false                                  {pd product} {default}
+     intx PrefetchCopyIntervalInBytes              = 192                                       {product} {default}
+     intx PrefetchFieldsAhead                      = -1                                        {product} {default}
+     intx PrefetchScanIntervalInBytes              = 192                                       {product} {default}
+     bool PreserveAllAnnotations                   = false                                     {product} {default}
+     bool PreserveFramePointer                     = false                                  {pd product} {default}
+   size_t PretenureSizeThreshold                   = 0                                         {product} {default}
+     bool PrintClassHistogram                      = false                                  {manageable} {default}
+     bool PrintCodeCache                           = false                                     {product} {default}
+     bool PrintCodeCacheOnCompilation              = false                                     {product} {default}
+     bool PrintCommandLineFlags                    = false                                     {product} {default}
+     bool PrintCompilation                         = false                                     {product} {default}
+     bool PrintConcurrentLocks                     = false                                  {manageable} {default}
+     bool PrintExtendedThreadInfo                  = false                                     {product} {default}
+     bool PrintFlagsFinal                          = true                                      {product} {command line}
+     bool PrintFlagsInitial                        = false                                     {product} {default}
+     bool PrintFlagsRanges                         = false                                     {product} {default}
+     bool PrintGC                                  = false                                     {product} {default}
+     bool PrintGCDetails                           = false                                     {product} {default}
+     bool PrintHeapAtSIGBREAK                      = true                                      {product} {default}
+     bool PrintSharedArchiveAndExit                = false                                     {product} {default}
+     bool PrintSharedDictionary                    = false                                     {product} {default}
+     bool PrintStringTableStatistics               = false                                     {product} {default}
+     bool PrintTieredEvents                        = false                                     {product} {default}
+     bool PrintVMOptions                           = false                                     {product} {default}
+     bool PrintWarnings                            = true                                      {product} {default}
+    uintx ProcessDistributionStride                = 4                                         {product} {default}
+     bool ProfileInterpreter                       = true                                   {pd product} {default}
+     intx ProfileMaturityPercentage                = 20                                        {product} {default}
+    uintx ProfiledCodeHeapSize                     = 122027624                              {pd product} {ergonomic}
+    uintx PromotedPadding                          = 3                                         {product} {default}
+    uintx QueuedAllocationWarningCount             = 0                                         {product} {default}
+     bool RangeCheckElimination                    = true                                      {product} {default}
+     bool ReassociateInvariants                    = true                                   {C2 product} {default}
+     bool RecordDynamicDumpInfo                    = false                                     {product} {default}
+     bool ReduceBulkZeroing                        = true                                   {C2 product} {default}
+     bool ReduceFieldZeroing                       = true                                   {C2 product} {default}
+     bool ReduceInitialCardMarks                   = true                                   {C2 product} {default}
+     bool ReduceSignalUsage                        = false                                     {product} {default}
+     intx RefDiscoveryPolicy                       = 0                                         {product} {default}
+     bool RegisterFinalizersAtInit                 = true                                      {product} {default}
+     bool RelaxAccessControlCheck                  = false                                     {product} {default}
+    ccstr ReplayDataFile                           =                                           {product} {default}
+     bool RequireSharedSpaces                      = false                                     {product} {default}
+    uintx ReservedCodeCacheSize                    = 251658240                              {pd product} {ergonomic}
+     bool ResizePLAB                               = true                                      {product} {default}
+     bool ResizeTLAB                               = true                                      {product} {default}
+     bool RestoreMXCSROnJNICalls                   = false                                     {product} {default}
+     bool RestrictContended                        = true                                      {product} {default}
+     bool RestrictReservedStack                    = true                                      {product} {default}
+     bool RewriteBytecodes                         = true                                   {pd product} {default}
+     bool RewriteFrequentPairs                     = true                                   {pd product} {default}
+     bool SafepointTimeout                         = false                                     {product} {default}
+     intx SafepointTimeoutDelay                    = 10000                                     {product} {default}
+     bool ScavengeBeforeFullGC                     = true                                      {product} {default}
+     bool SegmentedCodeCache                       = true                                      {product} {ergonomic}
+     intx SelfDestructTimer                        = 0                                         {product} {default}
+    ccstr SharedArchiveConfigFile                  =                                           {product} {default}
+    ccstr SharedArchiveFile                        =                                           {product} {default}
+   size_t SharedBaseAddress                        = 21474836480                               {product} {default}
+    ccstr SharedClassListFile                      =                                           {product} {default}
+    uintx SharedSymbolTableBucketSize              = 4                                         {product} {default}
+    ccstr ShenandoahGCHeuristics                   = adaptive                                  {product} {default}
+    ccstr ShenandoahGCMode                         = satb                                      {product} {default}
+     bool ShowCodeDetailsInExceptionMessages       = true                                   {manageable} {default}
+     bool ShowMessageBoxOnError                    = false                                     {product} {default}
+     bool ShrinkHeapInSteps                        = true                                      {product} {default}
+   size_t SoftMaxHeapSize                          = 103079215104                           {manageable} {ergonomic}
+     intx SoftRefLRUPolicyMSPerMB                  = 1000                                      {product} {default}
+      int SoftwarePrefetchHintDistance             = 192                                  {ARCH product} {default}
+     bool SplitIfBlocks                            = true                                   {C2 product} {default}
+     intx StackRedPages                            = 1                                      {pd product} {default}
+     intx StackReservedPages                       = 1                                      {pd product} {default}
+     intx StackShadowPages                         = 20                                     {pd product} {default}
+     bool StackTraceInThrowable                    = true                                      {product} {default}
+     intx StackYellowPages                         = 2                                      {pd product} {default}
+    uintx StartAggressiveSweepingAt                = 10                                        {product} {default}
+     bool StartAttachListener                      = false                                     {product} {default}
+    ccstr StartFlightRecording                     =                                           {product} {default}
+     uint StringDeduplicationAgeThreshold          = 3                                         {product} {default}
+    uintx StringTableSize                          = 65536                                     {product} {default}
+     bool SuperWordLoopUnrollAnalysis              = true                                {C2 pd product} {default}
+     bool SuperWordReductions                      = true                                   {C2 product} {default}
+     bool SuppressFatalErrorMessage                = false                                     {product} {default}
+    uintx SurvivorPadding                          = 3                                         {product} {default}
+    uintx SurvivorRatio                            = 8                                         {product} {default}
+   double SweeperThreshold                         = 0.500000                                  {product} {default}
+    uintx TLABAllocationWeight                     = 35                                        {product} {default}
+    uintx TLABRefillWasteFraction                  = 64                                        {product} {default}
+   size_t TLABSize                                 = 0                                         {product} {default}
+     bool TLABStats                                = true                                      {product} {default}
+    uintx TLABWasteIncrement                       = 4                                         {product} {default}
+    uintx TLABWasteTargetPercent                   = 1                                         {product} {default}
+    uintx TargetPLABWastePct                       = 10                                        {product} {default}
+    uintx TargetSurvivorRatio                      = 50                                        {product} {default}
+    uintx TenuredGenerationSizeIncrement           = 20                                        {product} {default}
+    uintx TenuredGenerationSizeSupplement          = 80                                        {product} {default}
+    uintx TenuredGenerationSizeSupplementDecay     = 2                                         {product} {default}
+     intx ThreadPriorityPolicy                     = 0                                         {product} {default}
+     bool ThreadPriorityVerbose                    = false                                     {product} {default}
+     intx ThreadStackSize                          = 4096                                   {pd product} {command line}
+    uintx ThresholdTolerance                       = 10                                        {product} {default}
+     intx Tier0BackedgeNotifyFreqLog               = 10                                        {product} {default}
+     intx Tier0InvokeNotifyFreqLog                 = 7                                         {product} {default}
+     intx Tier0ProfilingStartPercentage            = 200                                       {product} {default}
+     intx Tier23InlineeNotifyFreqLog               = 20                                        {product} {default}
+     intx Tier2BackEdgeThreshold                   = 0                                         {product} {default}
+     intx Tier2BackedgeNotifyFreqLog               = 14                                        {product} {default}
+     intx Tier2CompileThreshold                    = 0                                         {product} {default}
+     intx Tier2InvokeNotifyFreqLog                 = 11                                        {product} {default}
+     intx Tier3BackEdgeThreshold                   = 60000                                     {product} {default}
+     intx Tier3BackedgeNotifyFreqLog               = 13                                        {product} {default}
+     intx Tier3CompileThreshold                    = 2000                                      {product} {default}
+     intx Tier3DelayOff                            = 2                                         {product} {default}
+     intx Tier3DelayOn                             = 5                                         {product} {default}
+     intx Tier3InvocationThreshold                 = 200                                       {product} {default}
+     intx Tier3InvokeNotifyFreqLog                 = 10                                        {product} {default}
+     intx Tier3LoadFeedback                        = 5                                         {product} {default}
+     intx Tier3MinInvocationThreshold              = 100                                       {product} {default}
+     intx Tier4BackEdgeThreshold                   = 40000                                     {product} {default}
+     intx Tier4CompileThreshold                    = 15000                                     {product} {default}
+     intx Tier4InvocationThreshold                 = 5000                                      {product} {default}
+     intx Tier4LoadFeedback                        = 3                                         {product} {default}
+     intx Tier4MinInvocationThreshold              = 600                                       {product} {default}
+     bool TieredCompilation                        = true                                   {pd product} {default}
+     intx TieredCompileTaskTimeout                 = 50                                        {product} {default}
+     intx TieredRateUpdateMaxTime                  = 25                                        {product} {default}
+     intx TieredRateUpdateMinTime                  = 1                                         {product} {default}
+     intx TieredStopAtLevel                        = 4                                         {product} {default}
+     bool TimeLinearScan                           = false                                  {C1 product} {default}
+    ccstr TraceJVMTI                               =                                           {product} {default}
+     bool TraceTraps                               = false                                {ARCH product} {default}
+     intx TrackedInitializationLimit               = 50                                     {C2 product} {default}
+     bool TrapBasedNullChecks                      = false                                  {pd product} {default}
+     bool TrapBasedRangeChecks                     = false                               {C2 pd product} {default}
+     uint TrimNativeHeapInterval                   = 0                                         {product} {default}
+     intx TypeProfileArgsLimit                     = 2                                         {product} {default}
+    uintx TypeProfileLevel                         = 111                                    {pd product} {default}
+     intx TypeProfileMajorReceiverPercent          = 90                                     {C2 product} {default}
+     intx TypeProfileParmsLimit                    = 2                                         {product} {default}
+     intx TypeProfileWidth                         = 2                                         {product} {default}
+     intx UnguardOnExecutionViolation              = 0                                         {product} {default}
+     bool UseAES                                   = true                                      {product} {default}
+     bool UseAdaptiveGenerationSizePolicyAtMajorCollection  = true                             {product} {default}
+     bool UseAdaptiveGenerationSizePolicyAtMinorCollection  = true                             {product} {default}
+     bool UseAdaptiveNUMAChunkSizing               = true                                      {product} {default}
+     bool UseAdaptiveSizeDecayMajorGCCost          = true                                      {product} {default}
+     bool UseAdaptiveSizePolicy                    = true                                      {product} {default}
+     bool UseAdaptiveSizePolicyFootprintGoal       = true                                      {product} {default}
+     bool UseAdaptiveSizePolicyWithSystemGC        = false                                     {product} {default}
+     bool UseBASE64Intrinsics                      = true                                      {product} {default}
+     bool UseBiasedLocking                         = true                                      {product} {command line}
+     bool UseBimorphicInlining                     = true                                   {C2 product} {default}
+     bool UseBlockZeroing                          = true                                 {ARCH product} {default}
+     bool UseCMoveUnconditionally                  = false                                  {C2 product} {default}
+     bool UseCRC32                                 = true                                 {ARCH product} {default}
+     bool UseCodeAging                             = true                                      {product} {default}
+     bool UseCodeCacheFlushing                     = true                                      {product} {default}
+     bool UseCompiler                              = true                                      {product} {default}
+     bool UseCompressedClassPointers               = true                           {product lp64_product} {ergonomic}
+     bool UseCompressedOops                        = false                          {product lp64_product} {default}
+     bool UseCondCardMark                          = false                                     {product} {default}
+     bool UseContainerCpuShares                    = false                                     {product} {default}
+     bool UseContainerSupport                      = false                                     {product} {command line}
+     bool UseCountedLoopSafepoints                 = false                                  {C2 product} {default}
+     bool UseCounterDecay                          = true                                      {product} {default}
+     bool UseDivMod                                = true                                   {C2 product} {default}
+     bool UseDynamicNumberOfCompilerThreads        = true                                      {product} {default}
+     bool UseDynamicNumberOfGCThreads              = true                                      {product} {default}
+     bool UseEmptySlotsInSupers                    = true                                      {product} {default}
+     bool UseFMA                                   = true                                      {product} {default}
+     bool UseFPUForSpilling                        = false                                  {C2 product} {default}
+     bool UseFastJNIAccessors                      = true                                      {product} {default}
+     bool UseG1GC                                  = false                                     {product} {default}
+     bool UseGCOverheadLimit                       = true                                      {product} {default}
+     bool UseHeavyMonitors                         = false                                     {product} {default}
+     bool UseHugeTLBFS                             = false                                     {product} {default}
+     bool UseInlineCaches                          = true                                      {product} {default}
+     bool UseInterpreter                           = true                                      {product} {default}
+     bool UseJumpTables                            = true                                   {C2 product} {default}
+     bool UseLSE                                   = true                                 {ARCH product} {default}
+     bool UseLargePages                            = false                                  {pd product} {default}
+     bool UseLargePagesIndividualAllocation        = false                                  {pd product} {default}
+     bool UseLinuxPosixThreadCPUClocks             = true                                      {product} {default}
+     bool UseLoopCounter                           = true                                      {product} {default}
+     bool UseLoopInvariantCodeMotion               = true                                   {C1 product} {default}
+     bool UseLoopPredicate                         = true                                   {C2 product} {default}
+     bool UseMaximumCompactionOnSystemGC           = true                                      {product} {default}
+     bool UseNUMA                                  = false                                     {product} {default}
+     bool UseNUMAInterleaving                      = false                                     {product} {default}
+     bool UseNeon                                  = false                                {ARCH product} {default}
+     bool UseNotificationThread                    = true                                      {product} {default}
+     bool UseOnStackReplacement                    = true                                   {pd product} {default}
+     bool UseOnlyInlinedBimorphic                  = true                                   {C2 product} {default}
+     bool UseOprofile                              = false                                     {product} {default}
+     bool UseOptoBiasInlining                      = true                                   {C2 product} {default}
+     bool UsePSAdaptiveSurvivorSizePolicy          = true                                      {product} {default}
+     bool UseParallelGC                            = true                                      {product} {command line}
+     bool UsePerfData                              = true                                      {product} {default}
+     bool UsePopCountInstruction                   = true                                      {product} {default}
+     bool UseProfiledLoopPredicate                 = true                                   {C2 product} {default}
+     bool UseSHA                                   = true                                      {product} {default}
+     bool UseSHM                                   = false                                     {product} {default}
+     bool UseSIMDForArrayEquals                    = true                                 {ARCH product} {default}
+     bool UseSIMDForBigIntegerShiftIntrinsics      = true                                 {ARCH product} {default}
+     bool UseSIMDForMemoryOps                      = true                                 {ARCH product} {default}
+     uint UseSVE                                   = 0                                    {ARCH product} {default}
+     bool UseSerialGC                              = false                                     {product} {default}
+     bool UseSharedSpaces                          = true                                      {product} {default}
+     bool UseShenandoahGC                          = false                                     {product} {default}
+     bool UseSignalChaining                        = true                                      {product} {default}
+     bool UseSimpleArrayEquals                     = false                                {ARCH product} {default}
+     bool UseStringDeduplication                   = false                                     {product} {default}
+     bool UseSubwordForMaxVector                   = true                                   {C2 product} {default}
+     bool UseSuperWord                             = true                                   {C2 product} {default}
+     bool UseTLAB                                  = true                                      {product} {default}
+     bool UseThreadPriorities                      = true                                   {pd product} {default}
+     bool UseTransparentHugePages                  = false                                     {product} {default}
+     bool UseTypeProfile                           = true                                      {product} {default}
+     bool UseTypeSpeculation                       = true                                   {C2 product} {default}
+     bool UseVectorCmov                            = false                                  {C2 product} {default}
+     bool UseXMMForArrayCopy                       = false                                     {product} {default}
+     bool UseZGC                                   = false                                     {product} {default}
+     intx VMThreadPriority                         = -1                                        {product} {default}
+     intx VMThreadStackSize                        = 2040                                   {pd product} {default}
+     intx ValueMapInitialSize                      = 11                                     {C1 product} {default}
+     intx ValueMapMaxLoopSize                      = 8                                      {C1 product} {default}
+     intx ValueSearchLimit                         = 1000                                   {C2 product} {default}
+     bool VerifySharedSpaces                       = false                                     {product} {default}
+    uintx YoungGenerationSizeIncrement             = 20                                        {product} {default}
+    uintx YoungGenerationSizeSupplement            = 80                                        {product} {default}
+    uintx YoungGenerationSizeSupplementDecay       = 8                                         {product} {default}
+   size_t YoungPLABSize                            = 4096                                      {product} {default}
+   double ZAllocationSpikeTolerance                = 2.000000                                  {product} {default}
+   double ZCollectionInterval                      = 0.000000                                  {product} {default}
+   double ZFragmentationLimit                      = 25.000000                                 {product} {default}
+   size_t ZMarkStackSpaceLimit                     = 8589934592                                {product} {default}
+     bool ZProactive                               = true                                      {product} {default}
+     bool ZUncommit                                = true                                      {product} {default}
+    uintx ZUncommitDelay                           = 300                                       {product} {default}
+     bool ZeroTLAB                                 = false                                     {product} {default}
+[2026-05-28T09:07:07.677+0000][2.410s][info][gc] GC(0) Pause Young (Metadata GC Threshold) 4915M->135M(94208M) 14.876ms
+[2026-05-28T09:07:07.721+0000][2.454s][info][gc] GC(1) Pause Full (Metadata GC Threshold) 135M->132M(94208M) 43.797ms
+[2026-05-28T09:07:08.356+0000][3.089s][info][gc] GC(2) Pause Young (Metadata GC Threshold) 4310M->143M(94208M) 2.290ms
+[2026-05-28T09:07:08.393+0000][3.127s][info][gc] GC(3) Pause Full (Metadata GC Threshold) 143M->140M(94208M) 37.540ms
+WARN StatusConsoleListener The use of package scanning to locate plugins is deprecated and will be removed in a future release
+WARN StatusConsoleListener The use of package scanning to locate plugins is deprecated and will be removed in a future release
+WARN StatusConsoleListener The use of package scanning to locate plugins is deprecated and will be removed in a future release
+WARN StatusConsoleListener The use of package scanning to locate plugins is deprecated and will be removed in a future release
+WARN StatusConsoleListener RollingFileAppender 'publicFile.rolling': The bufferSize is set to 8192 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'privateFile.rolling': The bufferSize is set to 8192 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.UsageLogging.appender': The bufferSize is set to 8192 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.EventLoggingStats.appender': The bufferSize is set to 8192 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.ProductLogging.appender': The bufferSize is set to 8192 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.LineageLogging.appender': The bufferSize is set to 8192 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.MetricsLogging.appender': The bufferSize is set to 8192 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.StacktraceLogging.appender': The bufferSize is set to 8192 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.StacktraceLogging.appender': The bufferSize is set to 8192 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'dltExecution.rolling': The bufferSize is set to 8192 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.ObjectStorageLibraryLog.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.ServiceRequestLogShadowVector.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.CmvOneEventDetailLaMigration.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.Span.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.IntegrationTestLogLaMigration.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.ObjectStorageLibraryLogLaMigration.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.ServiceRequestLogLaMigration.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.AwsStorageInventoryManifestLaMigration.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.RatelimitClientStructuredLogLaMigration.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.DbfsClientRequestLog.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.AzureStorageResourceLogLaMigration.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.QueryProfileLogShadowVectorLaMigration.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.IngestionEvent.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.ServiceHealthEventLaMigration.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.AzureStorageResourceLog.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.SettingsLog.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.VectorEventLogLaMigration.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.ProductEventLogLaMigration.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.CleanRoomActivityLog.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.SettingsLogLaMigration.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.DbrLogLaMigration.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.KubernetesEventLog.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.DpHmrNonQueryEvent.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.LumberjackLineageEvent.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.EventplatformTimeseriesLog.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.QueryProfileLog.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.SparkConnectRpcMetricsLogLaMigration.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.BrickindexUsageLogLaMigration.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.EncryptionEventLog.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.DatabaseClientQueryLog.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.VectorEventLog.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.RatelimitClientStructuredLog.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.AwsStorageAccessLogLaMigration.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.WafTransactionLog.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.BouncerClientLogLaMigration.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.AzureStorageInventoryManifest.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.MoneySettingsLog.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.MetricToLog.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.SparkConnectRpcMetricsLog.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.RequestActivityLogLaMigration.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.FrontendLogLaMigration.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.KubernetesAuditLog.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.LakeflowConnectCdcEventLaMigration.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.KubernetesObjectLog.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.FrontendLog.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.DbfsClientRequestLogLaMigration.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.CleanRoomActivityLogLaMigration.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.PrometheusMetricsSnapshotLaMigration.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.CleanRoomBillingLog.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.EncryptionEventLogLaMigration.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.DetailedReplicationPlanEvent.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.MetricToLogLaMigration.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.AppComputeUsageLog.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.AwsStorageInventoryManifest.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.SpanLaMigration.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.AppComputeUsageLogLaMigration.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.DatabaseClientQueryLogLaMigration.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.PipelineEventLaMigration.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.ServiceRequestLog.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.AwsStorageAccessLog.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.IntegrationTestLog.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.DbrActivityLog.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.RequestActivityLog.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.HttpAccessLogShadowAgent.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.CleanRoomBillingLogLaMigration.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.DpHmrNonQueryEventLaMigration.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.PipelineEvent.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.ReplicationPlanEventLaMigration.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.ReplicationPlanEvent.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.CmvOneEventLog.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.DbrLog.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.CmvOneEventLogLaMigration.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.LakeflowConnectCdcEvent.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.ApplicationMetaLog.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.WafTransactionLogLaMigration.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.DbrActivityLogLaMigration.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.HttpAccessLogLaMigration.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.ServiceHealthEvent.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.ServiceRequestLogShadowVectorLaMigration.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.KubernetesObjectLogLaMigration.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.ServerlessSlotBasedBillingLog.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.PrometheusMetricsSnapshot.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.QueryProfileLogShadowVector.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.QueryProfileLogLaMigration.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.ShadowedServiceRequestLogPipelinedExecution.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.ProductEventLog.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.ShadowedServiceRequestLogPipelinedExecutionLaMigration.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.DetailedReplicationPlanEventLaMigration.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.AppStateLog.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.BouncerClientLog.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.AzureStorageInventoryManifestLaMigration.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.KubernetesAuditLogLaMigration.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.MoneySettingsLogLaMigration.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.IngestionEventLaMigration.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.AppStateLogLaMigration.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.BackgroundActivityLogLaMigration.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.BrickindexUsageLog.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.KubernetesEventLogLaMigration.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.CmvOneEventDetail.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.HttpAccessLogShadowAgentLaMigration.appender': The bufferSize is set to 128000 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.logging.structured.BackgroundActivityLog.appender': The bufferSize is set to 128000 but bufferedIO is not true
+DB_HOME: /databricks
+[2026-05-28T09:07:11.358+0000][6.091s][info][gc] GC(4) Pause Young (Metadata GC Threshold) 4143M->151M(94208M) 3.224ms
+[2026-05-28T09:07:11.395+0000][6.128s][info][gc] GC(5) Pause Full (Metadata GC Threshold) 151M->145M(94208M) 36.216ms
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.UsageLogging.appender': The bufferSize is set to 128000 but bufferedIO is not true
+[2026-05-28T09:07:14.960+0000][9.693s][info][gc] GC(6) Pause Young (Metadata GC Threshold) 4521M->175M(94208M) 6.043ms
+[2026-05-28T09:07:15.009+0000][9.742s][info][gc] GC(7) Pause Full (Metadata GC Threshold) 175M->172M(94208M) 48.651ms
+WARN StatusConsoleListener RollingFileAppender 'spark_usage': The bufferSize is set to 128000 but bufferedIO is not true
+[2026-05-28T09:07:19.828+0000][14.561s][info][gc] GC(8) Pause Young (Metadata GC Threshold) 5923M->208M(94208M) 7.145ms
+[2026-05-28T09:07:19.903+0000][14.637s][info][gc] GC(9) Pause Full (Metadata GC Threshold) 208M->203M(94208M) 75.676ms
+[2026-05-28T09:07:32.041+0000][26.775s][info][gc] GC(10) Pause Young (Metadata GC Threshold) 10263M->545M(97871M) 99.075ms
+[2026-05-28T09:07:32.230+0000][26.963s][info][gc] GC(11) Pause Full (Metadata GC Threshold) 545M->534M(97871M) 188.143ms
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.StacktraceLogging.appender': The bufferSize is set to 128000 but bufferedIO is not true
+Thu May 28 09:07:56 UTC 2026 Starting R processing from BASH
+Thu May 28 09:07:56 UTC 2026 R script: /local_disk0/tmp/_rServeScript.r4599249258461722220resource.r
+Thu May 28 09:07:56 UTC 2026 Port number: 1100
+Thu May 28 09:07:56 UTC 2026 cgroup: None
+2026-05-28 09:07:57.014577 R process started with pid 7132 
+-- running Rserve in this R session (pid=7132), 1 server(s) --
+(This session will block until Rserve is shut down)
+Spark package found in SPARK_HOME: /databricks/spark
+DATABRICKS_STDOUT_END-80fbc32f-9628-4f63-bfa6-3c0b173f7f58-1779959279099
+WARN StatusConsoleListener The use of package scanning to locate plugins is deprecated and will be removed in a future release
+WARN StatusConsoleListener The use of package scanning to locate plugins is deprecated and will be removed in a future release
+WARN StatusConsoleListener The use of package scanning to locate plugins is deprecated and will be removed in a future release
+WARN StatusConsoleListener The use of package scanning to locate plugins is deprecated and will be removed in a future release
+WARN StatusConsoleListener RollingFileAppender 'publicFile.rolling': The bufferSize is set to 8192 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'privateFile.rolling': The bufferSize is set to 8192 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.UsageLogging.appender': The bufferSize is set to 8192 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.EventLoggingStats.appender': The bufferSize is set to 8192 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.ProductLogging.appender': The bufferSize is set to 8192 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.LineageLogging.appender': The bufferSize is set to 8192 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.MetricsLogging.appender': The bufferSize is set to 8192 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.StacktraceLogging.appender': The bufferSize is set to 8192 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'com.databricks.StacktraceLogging.appender': The bufferSize is set to 8192 but bufferedIO is not true
+WARN StatusConsoleListener RollingFileAppender 'dltExecution.rolling': The bufferSize is set to 8192 but bufferedIO is not true
+Executing command, time = 1779959309867.
+--------------------------------
+userSecretPath: uat/secret, passwdSecretPath: uat/secret
+vaultEndpoint: https://secrets.prod.hulu.com
+vaultNamespace: 6887f38d618c12ff921441fb
+yellowPagesServiceId: 62184f6a3f3d388c3dc80cf5
+serviceCredentials: ads-databricks-vault-forecasting-gen-uat-uw2
+userPath: uat/secret, userKey: olap-db-username
+passwdPath: uat/secret, passwdKey: olap-db-password
+--------------------------------
+Configured SingleStore connection: host=vpce-0284fe796ef0df94e-wsrej4zd.vpce-svc-02a77236464dbab10.us-west-2.vpce.amazonaws.com, user=svc_ifp_dm, database=ifp_dm_test
+Executing SQL query from DbAccessor.newerRunDateExists:
+
+SELECT MIN(CASE WHEN realdate_est = '2026-05-09' THEN realdate_est END)
+AS current_batch_min_date,
+MIN(realdate_est) AS olap_min_date
+FROM inventory_reservation
+        
+[2026-05-28T09:10:27.611+0000][202.344s][info][gc] GC(12) Pause Young (Metadata GC Threshold) 18709M->998M(98026M) 108.416ms
+[2026-05-28T09:10:27.931+0000][202.664s][info][gc] GC(13) Pause Full (Metadata GC Threshold) 998M->700M(98026M) 319.934ms
+Current Batch Minimum Date:: null.
+Minimum Date from Olap database:: 2026-05-14.
+Proceeding with the Olap Ingestion.
+Executing SQL query from OlapIngestTaskDatabricks.clearTempTables:
+DROP TABLE IF EXISTS line_item_capacity_tmp;
+--------------------------------
+userSecretPath: secret/metadata-db-username, passwdSecretPath: secret/metadata-db-password
+vaultEndpoint: https://secrets.prod.hulu.com
+vaultNamespace: 6887f38d618c12ff921441fb
+yellowPagesServiceId: 62184f6a3f3d388c3dc80cf5
+serviceCredentials: ads-databricks-vault-forecasting-gen-uat-uw2
+userPath: secret, userKey: metadata-db-username
+passwdPath: secret, passwdKey: metadata-db-password
+--------------------------------
+Executing SQL query from DbAccessor.getReservationRecordId:
+
+SELECT COALESCE(MAX(id), -1) AS id
+FROM offline_reservation_running_record
+WHERE offline_reservation_state IN ('RESERVATION_FINISH')
+AND reservable_lineitems_realdate = '2026-05-09'
+
+Executing SQL query from JdbcManager.executeQuery:
+
+SELECT COALESCE(MAX(id), -1) AS id
+FROM offline_reservation_running_record
+WHERE offline_reservation_state IN ('RESERVATION_FINISH')
+AND reservable_lineitems_realdate = '2026-05-09'
+
+Executing SQL query from DbAccessor.getRunIdFromRundateRecord:
+
+SELECT forecast_runner_id AS run_id_disney_plus, forecast_runner_id_abc AS run_id_abc, forecast_runner_id_abc_news AS run_id_abc_news, forecast_runner_id_abc_news_bay_area AS run_id_abc_news_bay_area, forecast_runner_id_abc_news_central_california AS run_id_abc_news_central_california, forecast_runner_id_abc_news_chicago AS run_id_abc_news_chicago, forecast_runner_id_abc_news_houston AS run_id_abc_news_houston, forecast_runner_id_abc_news_los_angeles AS run_id_abc_news_los_angeles, forecast_runner_id_abc_news_new_york AS run_id_abc_news_new_york, forecast_runner_id_abc_news_north_carolina AS run_id_abc_news_north_carolina, forecast_runner_id_abc_news_philadelphia AS run_id_abc_news_philadelphia, forecast_runner_id_espn AS run_id_espn, forecast_runner_id_freeform AS run_id_freeform, forecast_runner_id_fubo_tv AS run_id_fubo_tv, forecast_runner_id_fx AS run_id_fx, forecast_runner_id_hulu AS run_id_hulu, forecast_runner_id_national_geographic AS run_id_national_geographic
+FROM offline_reservation_running_record
+WHERE id = 1248
+
+Executing SQL query from JdbcManager.executeQuery:
+
+SELECT forecast_runner_id AS run_id_disney_plus, forecast_runner_id_abc AS run_id_abc, forecast_runner_id_abc_news AS run_id_abc_news, forecast_runner_id_abc_news_bay_area AS run_id_abc_news_bay_area, forecast_runner_id_abc_news_central_california AS run_id_abc_news_central_california, forecast_runner_id_abc_news_chicago AS run_id_abc_news_chicago, forecast_runner_id_abc_news_houston AS run_id_abc_news_houston, forecast_runner_id_abc_news_los_angeles AS run_id_abc_news_los_angeles, forecast_runner_id_abc_news_new_york AS run_id_abc_news_new_york, forecast_runner_id_abc_news_north_carolina AS run_id_abc_news_north_carolina, forecast_runner_id_abc_news_philadelphia AS run_id_abc_news_philadelphia, forecast_runner_id_espn AS run_id_espn, forecast_runner_id_freeform AS run_id_freeform, forecast_runner_id_fubo_tv AS run_id_fubo_tv, forecast_runner_id_fx AS run_id_fx, forecast_runner_id_hulu AS run_id_hulu, forecast_runner_id_national_geographic AS run_id_national_geographic
+FROM offline_reservation_running_record
+WHERE id = 1248
+
+runnerIdMap: disney_plus=3575, fx=3750, abc_news_chicago=3761, abc_news_north_carolina=3756, hulu=3766, national_geographic=3760, abc_news_los_angeles=3758, abc_news_houston=3762, espn=3765, abc_news_bay_area=3753, abc_news=3759, abc=3757, fubo_tv=3754, abc_news_philadelphia=3752, abc_news_new_york=3751, freeform=3755, abc_news_central_california=3763
+Executing SQL query from DatabricksAccessor.readForecasts:
+
+SELECT *
+FROM ap_addr_ifp_gen_uat.forecasting.ifp_adj_slot_forecast
+WHERE runner_id = 3575  
+
+Executing SQL query from DatabricksAccessor.readForecasts:
+
+SELECT *
+FROM ap_addr_ifp_gen_uat.forecasting.ifp_adj_slot_forecast
+WHERE runner_id = 3750  
+
+Executing SQL query from DatabricksAccessor.readForecasts:
+
+SELECT *
+FROM ap_addr_ifp_gen_uat.forecasting.ifp_adj_slot_forecast
+WHERE runner_id = 3761  
+
+Executing SQL query from DatabricksAccessor.readForecasts:
+
+SELECT *
+FROM ap_addr_ifp_gen_uat.forecasting.ifp_adj_slot_forecast
+WHERE runner_id = 3756  
+
+Executing SQL query from DatabricksAccessor.readForecasts:
+
+SELECT *
+FROM ap_addr_ifp_gen_uat.forecasting.ifp_adj_slot_forecast
+WHERE runner_id = 3766  
+
+Executing SQL query from DatabricksAccessor.readForecasts:
+
+SELECT *
+FROM ap_addr_ifp_gen_uat.forecasting.ifp_adj_slot_forecast
+WHERE runner_id = 3760  
+
+Executing SQL query from DatabricksAccessor.readForecasts:
+
+SELECT *
+FROM ap_addr_ifp_gen_uat.forecasting.ifp_adj_slot_forecast
+WHERE runner_id = 3758  
+
+Executing SQL query from DatabricksAccessor.readForecasts:
+
+SELECT *
+FROM ap_addr_ifp_gen_uat.forecasting.ifp_adj_slot_forecast
+WHERE runner_id = 3762  
+
+Executing SQL query from DatabricksAccessor.readForecasts:
+
+SELECT *
+FROM ap_addr_ifp_gen_uat.forecasting.ifp_adj_slot_forecast
+WHERE runner_id = 3765  
+
+Executing SQL query from DatabricksAccessor.readForecasts:
+
+SELECT *
+FROM ap_addr_ifp_gen_uat.forecasting.ifp_adj_slot_forecast
+WHERE runner_id = 3753  
+
+Executing SQL query from DatabricksAccessor.readForecasts:
+
+SELECT *
+FROM ap_addr_ifp_gen_uat.forecasting.ifp_adj_slot_forecast
+WHERE runner_id = 3759  
+
+Executing SQL query from DatabricksAccessor.readForecasts:
+
+SELECT *
+FROM ap_addr_ifp_gen_uat.forecasting.ifp_adj_slot_forecast
+WHERE runner_id = 3757  
+
+Executing SQL query from DatabricksAccessor.readForecasts:
+
+SELECT *
+FROM ap_addr_ifp_gen_uat.forecasting.ifp_adj_slot_forecast
+WHERE runner_id = 3754  
+
+Executing SQL query from DatabricksAccessor.readForecasts:
+
+SELECT *
+FROM ap_addr_ifp_gen_uat.forecasting.ifp_adj_slot_forecast
+WHERE runner_id = 3752  
+
+Executing SQL query from DatabricksAccessor.readForecasts:
+
+SELECT *
+FROM ap_addr_ifp_gen_uat.forecasting.ifp_adj_slot_forecast
+WHERE runner_id = 3751  
+
+Executing SQL query from DatabricksAccessor.readForecasts:
+
+SELECT *
+FROM ap_addr_ifp_gen_uat.forecasting.ifp_adj_slot_forecast
+WHERE runner_id = 3755  
+
+Executing SQL query from DatabricksAccessor.readForecasts:
+
+SELECT *
+FROM ap_addr_ifp_gen_uat.forecasting.ifp_adj_slot_forecast
+WHERE runner_id = 3763  
+
+Executing SQL query from DataIngestDatabricks.createOlapTable:
+CREATE TABLE line_item_capacity_tmp (
+    `inventory_id` VARCHAR(64) DEFAULT '',
+    `uuid` VARCHAR(64) DEFAULT '',
+    `user_id` VARCHAR(64) DEFAULT '',
+    `pod` VARCHAR(64) DEFAULT '',
+    `slot` VARCHAR(64) DEFAULT '',
+    `age` INT DEFAULT '-1',
+    `device_category` VARCHAR(64) DEFAULT '',
+    `entity_type` VARCHAR(64) DEFAULT '',
+    `movies` VARCHAR(64) DEFAULT '',
+    `series_id` VARCHAR(64) DEFAULT '',
+    `season_number` VARCHAR(64) DEFAULT '',
+    `duration_ms` BIGINT DEFAULT '-1',
+    `country` VARCHAR(64) DEFAULT '',
+    `state` VARCHAR(64) DEFAULT '',
+    `city` VARCHAR(64) DEFAULT '',
+    `dma_code` VARCHAR(64) DEFAULT '',
+    `postal_code` VARCHAR(64) DEFAULT '',
+    `storefront` VARCHAR(64) DEFAULT '',
+    `content_partner` VARCHAR(64) DEFAULT '',
+    `distributor` VARCHAR(64) DEFAULT '',
+    `device_form_factor` VARCHAR(64) DEFAULT '',
+    `device_brand` VARCHAR(64) DEFAULT '',
+    `device_name` VARCHAR(64) DEFAULT '',
+    `episode` VARCHAR(64) DEFAULT '',
+    `extra` VARCHAR(64) DEFAULT '',
+    `network` VARCHAR(64) DEFAULT '',
+    `playback_type` VARCHAR(64) DEFAULT '',
+    `sports_event` VARCHAR(64) DEFAULT '',
+    `sports_league` VARCHAR(64) DEFAULT '',
+    `sport` VARCHAR(64) DEFAULT '',
+    `target_language` VARCHAR(64) DEFAULT '',
+    `season` VARCHAR(64) DEFAULT '',
+    `is_nielsen_eligible` VARCHAR(64) DEFAULT '',
+    `event` VARCHAR(64) DEFAULT '',
+    `genre_e22f9368-056c-4337-ae2d-5e77894109a6` BOOL,
+`genre_caf8f12c-bc95-4f38-87f8-e99d9549ddd7` BOOL,
+`genre_3e453dd2-1629-4312-ae0b-6802d9c232e5` BOOL,
+`genre_ecbae285-c116-48c4-ac59-358eee2d5e31` BOOL,
+`genre_31c06d97-6e48-4ae8-b3b2-3d20a00c5d16` BOOL,
+`genre_45f09698-dcfc-414e-88c9-65f853f4d420` BOOL,
+`genre_b0a0de1a-6623-4236-99e3-ee33f7ae4458` BOOL,
+`genre_1452e84b-4a75-4173-9404-3f31a3dc4265` BOOL,
+`genre_cf421390-f6fb-402d-bf06-079ba39d7281` BOOL,
+`genre_a5035159-c4a8-4eb8-b03d-c8eb8f088541` BOOL,
+`genre_d4433f7e-0f90-4b0c-b082-cead820225f6` BOOL,
+`genre_a8767e06-4b88-4ea3-b688-33f864a5c424` BOOL,
+`genre_c19acf1a-03b2-4f65-95c3-f118455284f5` BOOL,
+`genre_513057bc-82ed-4951-a30a-310206a67aae` BOOL,
+`genre_a1051b42-62e0-4da1-b0d3-aa7847942338` BOOL,
+`genre_81fed937-389d-4319-90c6-bd1868179ec3` BOOL,
+`genre_724a36f6-b824-40c1-b022-b42699309acc` BOOL,
+`genre_34a0ee6d-8d07-4b50-86bc-e318e810a618` BOOL,
+`genre_73e309fa-f7d2-4d9c-b79b-31daaba54320` BOOL,
+`genre_da23ec1b-501b-4344-a573-b2250c6f79ac` BOOL,
+`genre_9bef3656-0e30-4af0-8909-b435e65e45fa` BOOL,
+`genre_9567682e-9c8f-4993-a289-8731e295472b` BOOL,
+`genre_9f1a5146-d14c-4c4d-b460-74f9cbe24688` BOOL,
+`genre_1c7151be-8b13-497a-bf9e-8b7850164d9e` BOOL,
+`genre_f1c92953-841b-465f-9e87-4e8e9a17c9f2` BOOL,
+`genre_770195c6-fbcf-4c52-86ff-67f805ccb44a` BOOL,
+`genre_e79f1b6c-ed0c-461b-ba6d-b4e0f90dd965` BOOL,
+`genre_def20ca9-f29e-406d-bb74-c96bbf77c50f` BOOL,
+`genre_5e7f00ac-0685-4dbc-91a8-422dcd9dfcf2` BOOL,
+`genre_e9e04b0b-75c5-403d-acf8-e137d82d061e` BOOL,
+`genre_787a5ccd-9439-42cc-b481-c235a1db60a4` BOOL,
+`genre_83e46624-24d1-45e8-a5f8-1ae91536ad5b` BOOL,
+`genre_e0813b13-c578-4f05-b46d-51f8f517dbc8` BOOL,
+`genre_5b42f406-7b40-49da-a35e-83b2fcc03b04` BOOL,
+`genre_8692e68e-42eb-4447-a777-49e63c294c5a` BOOL,
+`genre_04ea0691-53ea-4483-aea0-bb2a8e129bc6` BOOL,
+`genre_c578e548-5db0-44f9-9fa8-fec63da28ba6` BOOL,
+`genre_59377883-8dd7-4e7f-bf5b-86be0016c312` BOOL,
+`genre_e5d11e05-0a4f-4c76-af44-d6a0e593fe1b` BOOL,
+`genre_8768b19a-a19c-4b20-9308-0908df3c7450` BOOL,
+`genre_de284589-ecc5-40fa-89ff-639509ec98d0` BOOL,
+`genre_915cbde7-6a2a-42b3-9951-5a635393c462` BOOL,
+`genre_3fa717e2-e7e4-4c5c-bc7b-d81ee15e676d` BOOL,
+`genre_81d2896f-3efb-47f0-a277-6c2f2418c225` BOOL,
+`genre_6b9310e2-2e1b-4b30-905b-99993e2d2433` BOOL,
+`genre_7d00a83e-556b-4f3c-b894-7c20f4360a1c` BOOL,
+`genre_544ee4cb-e95f-44ef-852c-7c929e5c7bbe` BOOL,
+`genre_114a3757-478c-43e6-84a3-d51a482d0e98` BOOL,
+`genre_196cf989-c517-46c1-bfba-a6010d3bb644` BOOL,
+`genre_fb01a259-0859-44d5-b62e-9a3cd2e41dae` BOOL,
+`genre_5818bcdf-1ed3-4009-8476-d3732a577a8e` BOOL,
+`genre_f515cdad-7bfe-4829-acca-3dc8223e1a8d` BOOL,
+`genre_2ced6ec8-eea5-4492-a96a-661be4963c96` BOOL,
+`genre_fe6de09e-8f51-4fa3-a447-38c6f7106177` BOOL,
+`genre_5ef6f34e-e2a6-4520-a877-1db91774a8cf` BOOL,
+`genre_b8528656-9510-40e6-98e3-abee0bef2147` BOOL,
+`genre_2d116c43-05a5-4d07-91dc-9746b7febf27` BOOL,
+`genre_2d32e25d-0639-4845-a6cf-8f72cf979e01` BOOL,
+`genre_3534e080-51fe-4572-89cc-fb7119c6e2b7` BOOL,
+`genre_24a242ab-6083-418d-911b-157960a1e1a1` BOOL,
+`genre_712b57b9-c339-4cd6-8b94-b1af253975b6` BOOL,
+`genre_967087c6-bc97-4b65-999b-a89f37867198` BOOL,
+`genre_447b5cc2-d83a-4385-9fbb-c470fe55de17` BOOL,
+`genre_e45be874-9326-4aff-b4c8-c08051deadec` BOOL,
+`genre_1c3071f6-1314-41b4-9c18-e60aa4bd8b0f` BOOL,
+`genre_d960db1f-3e6b-4a63-b583-4909a5d93d77` BOOL,
+`genre_b829519f-e631-43dc-acc6-bbf7e87a7ef6` BOOL,
+`genre_b41c2988-b008-4a8d-9571-8ff456b7158c` BOOL,
+`genre_6af63517-24ca-4391-9c3e-cbd413e1e15f` BOOL,
+`genre_02604e06-3bd8-472d-be45-ce9a8e22b74d` BOOL,
+`genre_e567fb3c-850e-48a1-8dfb-cecd02737bd7` BOOL,
+`genre_db5372fe-bd20-47a2-9aee-716620c95d66` BOOL,
+`genre_cb0e4289-9e42-45fd-b9a5-3c61d1f50cf2` BOOL,
+`genre_209be388-6241-48fc-8a9d-8b83a800e81c` BOOL,
+`genre_051d264f-9c26-49e8-a0f6-b35dd93b19c5` BOOL,
+`genre_c4df44a3-4140-4ebe-9ba2-753b8fb03603` BOOL,
+`genre_b0b89137-55b3-4a8d-8397-ff0556c6c732` BOOL,
+`genre_4d36d7dc-fb63-4b39-aef7-f8afa91141b4` BOOL,
+`genre_013cf595-2f35-4691-ab81-72abad28b580` BOOL,
+`genre_6d9f5544-f143-4fae-bfc3-a62ead9988a3` BOOL,
+`genre_836892fa-650b-4284-b971-89e9e8a0dfd5` BOOL,
+`genre_66e38a56-4474-4c0b-8c90-d528eff069ef` BOOL,
+`genre_89b994a8-46f4-439d-ac37-36f2f65efea1` BOOL,
+`genre_c26ac173-e7b1-4c84-8221-0d5843e16ed9` BOOL,
+`genre_b722c198-37c9-4e1d-b677-6f45f7873a15` BOOL,
+`genre_68ac7d99-f0b0-4825-b83a-77f5f0b58bdc` BOOL,
+`genre_95254947-56c2-4b9c-a8cb-bfd825a691a4` BOOL,
+`genre_fdd50160-27bf-4fc4-a7ac-9040be5a5e35` BOOL,
+`genre_9e25da87-9407-45f8-90bb-e7f8492bc14f` BOOL,
+`genre_5ab180e7-74a3-4503-8e07-22e782ac57e3` BOOL,
+`genre_72fef399-3e18-42b5-9790-0b366e51ef1b` BOOL,
+`genre_cd0399d6-66b4-42b5-b9e4-1cde90cbc36e` BOOL,
+`genre_0a399920-943d-4717-8f2a-db7358266897` BOOL,
+`genre_aa52e9ee-d306-4d6d-8d5f-650e11ed7678` BOOL,
+`genre_70983b07-3191-40d2-97e1-5d7aa7c68371` BOOL,
+`genre_dd8a2b16-7ace-4ed7-b5fa-3f06a7a2ca1c` BOOL,
+`genre_82017c13-72cc-4b51-896a-a17f31842b5e` BOOL,
+`genre_c972ea14-3ff4-49f7-9d05-9b7e00002640` BOOL,
+`genre_199528a3-0f7b-4fe5-87ae-79d3be92cbb7` BOOL,
+`genre_c7a0d288-a0e1-4372-8e52-3bf55e8b66ed` BOOL,
+`genre_d7674619-3f73-42db-ad08-5d88987bc7a8` BOOL,
+`genre_c2770a96-93a0-4b6c-8aae-0e7045051c80` BOOL,
+`genre_41d42690-1761-46b5-8d94-fcf38447d24b` BOOL,
+`genre_53d92cc4-a5e2-4ea2-a5cb-fa6be6dcaf83` BOOL,
+`genre_0ad5098f-58aa-41ae-baf3-1292970bf8c8` BOOL,
+`genre_8257ff22-f776-41e0-b991-17df0a3bc227` BOOL,
+`genre_dc7038c0-b062-40d2-aa4e-8315426c5ab7` BOOL,
+`genre_7efca816-fa35-4790-a219-210eebf37c1d` BOOL,
+`genre_c97f990d-b247-435f-9147-4ce363a766ca` BOOL,
+`genre_54698461-897e-473f-ba13-bc64b4183b3e` BOOL,
+`genre_54a097d6-15d6-4d8a-85ff-e223a723e278` BOOL,
+`genre_71f512cb-d922-431b-be6e-58c60dd50f83` BOOL,
+`genre_72da5fe4-bc6d-456a-811f-73b59b238c92` BOOL,
+`genre_dfe91e5f-9f47-44ce-afbb-8b39bed21220` BOOL,
+`genre_94414a7a-4cbd-4092-a99e-36003544cd8b` BOOL,
+`genre_bfae27e6-ce38-47e1-81f9-ad6cd0b9ea34` BOOL,
+`genre_0ce28e65-61cb-44fd-a8f1-a3fba507f9ee` BOOL,
+`genre_01a28d0c-6104-4f91-b3de-833ed40763fd` BOOL,
+`genre_4f4f8644-61dc-419d-9924-744cf9ffb9ec` BOOL,
+`genre_4f397aa9-12d1-4264-95aa-313a95a7c65d` BOOL,
+`genre_4b25e5d8-9d86-44ac-aadd-1a7c83338dfe` BOOL,
+`genre_18e1b79f-6526-49a8-9f56-b1502a336972` BOOL,
+`genre_cee1a3a5-ce9e-4b46-8f11-245f1572a406` BOOL,
+`genre_d176d780-e64a-4f6f-a2d7-2e033fa12e7f` BOOL,
+`genre_8b451764-b4be-4047-907f-ea2f35fa43b4` BOOL,
+`genre_22b7208c-5d01-4e72-9e40-7a50113a78ff` BOOL,
+`genre_cdf4b897-94a4-4f0a-b223-d2f65366f3f6` BOOL,
+`genre_779a66bf-64c8-4d53-b5a0-f872875ce738` BOOL,
+`genre_7469072b-94d7-4c49-a302-9a8418b0e2b7` BOOL,
+`genre_71c767d9-1ffb-412d-9a56-22f2bba078b3` BOOL,
+`genre_ded887dd-cbdf-4412-91a3-c3c34f683ed0` BOOL,
+`genre_47340121-81a8-466c-b0df-6d09b25fbda5` BOOL,
+`genre_205ee9f7-651e-48b6-ac9b-5169e3f9dcad` BOOL,
+`genre_936ca1a9-f9dd-4361-9a0e-806178184d56` BOOL,
+`genre_fbf08bcf-675e-439d-a0ac-7551d5ce0931` BOOL,
+`genre_2a8d3d6a-fbcd-48a9-9c0c-578ccb490494` BOOL,
+`genre_d7709503-186f-4c5c-b9c2-46e51c387f7c` BOOL,
+`genre_6c99731f-12ce-4840-a140-c2f11407d21b` BOOL,
+`genre_adf651a6-3871-4841-a715-f10060735f79` BOOL,
+`genre_6613efd2-b8a7-4328-8dc3-e5a04c65b916` BOOL,
+`genre_dc04f324-cec0-4e9e-a764-5ed29cafbe88` BOOL,
+`genre_e1beef51-a831-4a7b-b40d-f60519c45ae7` BOOL,
+`genre_a5585c29-b0e4-4413-97a2-05388ed4adf4` BOOL,
+`genre_5004dba4-78f5-42c6-89a0-a907a5f183f8` BOOL,
+`genre_89526183-734c-4164-9da2-98fa0901b7b0` BOOL,
+`genre_920d79f2-0f54-44ae-82d8-cc4a0cfc3571` BOOL,
+`genre_da56d25b-49e8-462a-b0f6-d09f933d42c5` BOOL,
+`genre_59ce5840-f4b9-45e1-9e5c-6370a4874c99` BOOL,
+`genre_2376e385-8d00-4da4-a2d8-e67bb2973f7f` BOOL,
+`genre_c64fc25e-cd16-4c9f-a4f4-3b9f2ba97945` BOOL,
+`genre_6381c6f4-2314-4c8c-b466-5eaf09a44282` BOOL,
+`genre_b7035a07-f433-4f59-b779-c850532f53a4` BOOL,
+`genre_5fa36aa6-f922-4ce7-8445-35a55b94bcfc` BOOL,
+`genre_fb5ab972-8e6c-4b91-8213-7b66e6807cce` BOOL,
+`genre_8ac838a0-f458-4a1c-83dd-57ad05ae9c15` BOOL,
+`genre_e76c979f-43ca-46ea-9c49-be31dd15e5a6` BOOL,
+`genre_b389f15d-711e-47bd-b6e5-686a0c052ed8` BOOL,
+`genre_5d03ccdc-eb92-4f18-a757-f04734e0dfea` BOOL,
+`genre_b2067ce1-752e-4438-8a92-bdbcff057539` BOOL,
+`genre_7b378557-8b90-434c-a732-c10c02ff3a78` BOOL,
+`genre_2bd949dc-b340-494d-a5c5-bfe2f8a57ff9` BOOL,
+`genre_693a1100-7ccb-4404-b449-38c0b4dbb7de` BOOL,
+`genre_24da6317-365c-4d66-ad4c-ae768110fd86` BOOL,
+`genre_f85888cc-44bc-4c1e-bb35-a8431feae907` BOOL,
+`genre_c3dbf9f8-0cc8-483d-98a8-1a40a543d882` BOOL,
+`genre_69ffcd05-6cb9-4a54-bf71-79d3d607a19b` BOOL,
+`genre_7a5fcee0-2dd9-4522-a470-6570afa2bfeb` BOOL,
+`genre_854e0433-1f46-41c7-977b-718e0a47b19f` BOOL,
+`genre_55e7a600-a30d-4e5d-b4e0-6b46e369c4ca` BOOL,
+`genre_35897c99-0e0a-44f1-908b-d2b079be1ae6` BOOL,
+`genre_99038352-f755-4224-ac00-c1b800df1871` BOOL,
+`genre_e484e56a-e1c7-4e6e-96df-d365c36c2be5` BOOL,
+`genre_16d81fe1-6f5d-4328-8da5-e22e7abc5ec9` BOOL,
+`genre_e7e9fbb3-5809-417f-a7fa-618498c47ad5` BOOL,
+`genre_dd5b8532-d51b-4c64-9e70-0c9f3d352ac9` BOOL,
+`genre_7ec018b8-aa4a-4b84-8403-781551ecdb17` BOOL,
+`genre_c8b37b4a-76ec-42df-bf1c-bcb71b900a7d` BOOL,
+`genre_82fa1d21-1c01-4e23-967a-c2c716f40f8d` BOOL,
+`genre_ee44fc92-26ca-4517-9477-fad32d4e0151` BOOL,
+`genre_31f474f4-a19e-4e0c-8ecc-14fca93dba2c` BOOL,
+`genre_63d866d3-6c85-4700-b4d8-f959971223f8` BOOL,
+`genre_267bb562-b7af-481e-b780-011cf51c7573` BOOL,
+`genre_33b7bbe6-da91-4d54-b86c-000946216634` BOOL,
+`genre_694d3cd8-ce79-4c4d-be81-1cfe03af6e47` BOOL,
+`genre_a3cf3f74-6542-4438-882a-47b82a816f1e` BOOL,
+`genre_f9a54694-5bbc-42cd-bb2d-66b198ef8baf` BOOL,
+`genre_5e96f9b0-402f-43ff-b3aa-4804d09fdae5` BOOL,
+`genre_9d11352c-adbb-480f-b923-03c85fe2b1f6` BOOL,
+`genre_54af64ad-ea34-477b-b2af-2eeb55fe2316` BOOL,
+`genre_f9eb13e3-9780-459c-925c-68ca833006b1` BOOL,
+`genre_688b48a0-c5a3-4991-826d-f9896d321ccf` BOOL,
+`genre_807b46af-e8fb-4734-bcff-e7df9e17a330` BOOL,
+`genre_b7959215-983a-4b43-9002-f7f24c8ce89f` BOOL,
+`genre_bba57bf1-4de3-442b-ad42-f2d2b3b8eb87` BOOL,
+`genre_c301d356-2044-4c86-8382-f15f6dec310c` BOOL,
+`genre_b2b9d480-d7bc-43e5-a1f6-064fb6390f15` BOOL,
+`genre_1c04cc38-23d4-36c3-8172-38679a0fdf52` BOOL,
+`genre_482cbb52-c382-415f-9a49-4212ded83188` BOOL,
+`genre_8ec22805-d873-4493-ac9b-9b3830a67ce6` BOOL,
+`genre_b6d4eee9-3b48-42a8-8492-3336301ce607` BOOL,
+`genre_35091066-4ef4-4ae4-a46b-5a605977a9b2` BOOL,
+`genre_af370460-11eb-4db3-ba23-55d12c773b81` BOOL,
+`genre_c1d0c0db-6cfd-4b43-95bf-c44edbcc9b3c` BOOL,
+`genre_c1f3f40f-b90b-4d17-a798-7f5262e0fba6` BOOL,
+`genre_2491aa46-e771-4f9d-8a08-3d92c29023a9` BOOL,
+`genre_89a1ffb1-b509-4464-97c2-1b713417dc74` BOOL,
+`genre_3d4af7cd-f7de-446d-981a-630cf598586c` BOOL,
+`genre_54bea225-012d-4d38-8df5-6a659ab53910` BOOL,
+`genre_8caddca8-8fde-47c9-97a0-75894043cd22` BOOL,
+`genre_20794881-0f35-4c3d-acda-040fc2f386a5` BOOL,
+    `rating_codes_0` BOOL,
+`rating_codes_0+` BOOL,
+`rating_codes_10` BOOL,
+`rating_codes_10+` BOOL,
+`rating_codes_12` BOOL,
+`rating_codes_12+` BOOL,
+`rating_codes_13` BOOL,
+`rating_codes_13+` BOOL,
+`rating_codes_14` BOOL,
+`rating_codes_14+` BOOL,
+`rating_codes_16` BOOL,
+`rating_codes_16+` BOOL,
+`rating_codes_18` BOOL,
+`rating_codes_18+` BOOL,
+`rating_codes_6` BOOL,
+`rating_codes_7+` BOOL,
+`rating_codes_9` BOOL,
+`rating_codes_a10` BOOL,
+`rating_codes_a12` BOOL,
+`rating_codes_a14` BOOL,
+`rating_codes_a16` BOOL,
+`rating_codes_a18` BOOL,
+`rating_codes_al` BOOL,
+`rating_codes_g` BOOL,
+`rating_codes_ga` BOOL,
+`rating_codes_l` BOOL,
+`rating_codes_m` BOOL,
+`rating_codes_ma 15+` BOOL,
+`rating_codes_ma15` BOOL,
+`rating_codes_ma15+` BOOL,
+`rating_codes_nc` BOOL,
+`rating_codes_nc-17` BOOL,
+`rating_codes_not rated` BOOL,
+`rating_codes_not yet rated` BOOL,
+`rating_codes_nr` BOOL,
+`rating_codes_oaf` BOOL,
+`rating_codes_pg` BOOL,
+`rating_codes_pg-13` BOOL,
+`rating_codes_pgr` BOOL,
+`rating_codes_r` BOOL,
+`rating_codes_r 18+` BOOL,
+`rating_codes_r13` BOOL,
+`rating_codes_r15` BOOL,
+`rating_codes_r16` BOOL,
+`rating_codes_r18` BOOL,
+`rating_codes_r18+` BOOL,
+`rating_codes_rp16` BOOL,
+`rating_codes_tv-14` BOOL,
+`rating_codes_tv-14l` BOOL,
+`rating_codes_tv-g` BOOL,
+`rating_codes_tv-ma` BOOL,
+`rating_codes_tv-pg` BOOL,
+`rating_codes_tv-v7-fv` BOOL,
+`rating_codes_tv-y` BOOL,
+`rating_codes_tv-y7` BOOL,
+`rating_codes_tv-y7-fv` BOOL,
+`rating_codes_tvpg` BOOL,
+`rating_codes_unknown` BOOL,
+`rating_codes_unrated` BOOL,
+`rating_codes_unspecified` BOOL,
+    `franchises_e50f53de-fecb-4904-b162-0335d1d00a95` BOOL,
+`franchises_bc7efa41-e69f-4e7e-a683-523360898c82` BOOL,
+`franchises_6c5f9018-ed0d-478b-ac48-878cc144f8c0` BOOL,
+`franchises_2384f1ec-3439-4948-8d8d-63d905972d1d` BOOL,
+`franchises_ca610932-4737-4781-bc08-acd50e6825ab` BOOL,
+`franchises_9af37c0e-e828-4f07-bbd5-d612cf61b6e2` BOOL,
+`franchises_23f5a7c3-28d6-4100-81c6-9b3a56e65b62` BOOL,
+`franchises_a6beb5b8-bda4-4454-92d9-29abbb505299` BOOL,
+`franchises_67695402-b90b-451a-895f-f667cf72386b` BOOL,
+`franchises_08819525-2c69-48e8-976a-cb546d2d55b1` BOOL,
+`franchises_c79c3c1e-5a1c-4b7f-a5f7-046d6d7e0d60` BOOL,
+`franchises_fe38ef25-c6cf-4e1a-a3f5-81d4bd0c3fd0` BOOL,
+`franchises_9ca88b15-871d-4305-a476-56705915b8c2` BOOL,
+`franchises_d699d9e1-59b6-49d6-a7d7-c871e89b2c8d` BOOL,
+`franchises_21d0c88e-9286-456f-816a-60d4dd043054` BOOL,
+`franchises_9a9caaab-0f37-485f-b048-59c1b1769732` BOOL,
+`franchises_45e21e43-403e-4cb5-ab6c-9662960f7069` BOOL,
+`franchises_980aace3-0909-4733-98e4-7fae8efa9293` BOOL,
+`franchises_03b23e53-cc4d-4c04-85fe-306032ade112` BOOL,
+`franchises_cd4c2a6b-7b07-46a7-b34b-1bab2999f191` BOOL,
+`franchises_638aaccc-5d38-4cd1-b970-b6c7821029a5` BOOL,
+`franchises_575d256a-9e75-4902-aaf6-aed4ccf590f3` BOOL,
+`franchises_2fe20f43-15b8-494c-bea0-a2f7d3ea1ef7` BOOL,
+`franchises_55ba13ee-8a2f-4574-8669-ebe9b9c3c7c7` BOOL,
+`franchises_acbf4758-4502-45f0-b369-d2f7a56a5a82` BOOL,
+`franchises_b566e43b-0e5a-4c11-b1a1-8e21663366cb` BOOL,
+`franchises_0f956e4d-c3d7-4f48-bcdf-a2826e9dde3c` BOOL,
+`franchises_0590910b-6c6d-45aa-8e8a-afe5908b8bec` BOOL,
+`franchises_ab600841-49d7-44d8-95ee-5ebb61dade10` BOOL,
+`franchises_db9442ac-31c7-4c49-9fb8-4b3a1784641c` BOOL,
+`franchises_b04f5bcd-e8c2-4689-af93-dac0604c1fc5` BOOL,
+`franchises_b1fdb7ba-9c6c-4bc2-892d-3a05c1d803ee` BOOL,
+`franchises_78e4f67d-0670-4c2f-a16f-6173fb61570d` BOOL,
+`franchises_9f800d47-4a0a-47f2-96ed-2380a36ed60b` BOOL,
+`franchises_91b447ec-7d3c-4ba6-badb-b042a132b0ef` BOOL,
+`franchises_cbd35cc1-ce69-4b8b-8d50-7ec5982d2d89` BOOL,
+`franchises_3fd877f8-0788-478e-9e2d-0e8a76eff036` BOOL,
+`franchises_89e0f23d-40f4-4167-a6a0-a01717a26f88` BOOL,
+`franchises_eb670fc0-e83c-4f1b-a029-781792e9120a` BOOL,
+`franchises_f76f7079-5f2e-42bb-b8df-63af7ab7d58c` BOOL,
+`franchises_3eb6ca59-1df4-4041-a143-fd3761cc764f` BOOL,
+`franchises_dc1d68a8-fb4b-4b18-9e07-6831423cd02c` BOOL,
+`franchises_2e194ca2-265b-4c8e-857c-c3ebf7b04293` BOOL,
+`franchises_d9f9e792-2455-476e-9ef5-c718a06048aa` BOOL,
+`franchises_9d8a6e10-83f0-47e5-9288-000eca075ba2` BOOL,
+`franchises_a5ea71e8-dea5-4208-aa49-0a6ce2532f3c` BOOL,
+`franchises_6c6a433f-0870-4375-8983-500649285d24` BOOL,
+`franchises_593f2a2b-3ec0-4fd6-aea2-eb48797e865d` BOOL,
+`franchises_f2dc25f4-40a0-41c7-8752-0882680c21d1` BOOL,
+`franchises_b3250747-6ba1-4a22-926d-6e4151753797` BOOL,
+`franchises_450209e5-c9c3-4ef5-af5a-65dc33045192` BOOL,
+`franchises_209801c3-470d-413a-b9b5-64c222fe0e8a` BOOL,
+`franchises_69187977-77ff-4c80-a194-14222f495e42` BOOL,
+`franchises_0706382d-6f47-492b-b06d-4b9110ca301b` BOOL,
+`franchises_afc8f374-30bf-47d5-9beb-555ca7dc6f11` BOOL,
+`franchises_9b15fc6b-7125-4e44-975d-61f32334914f` BOOL,
+`franchises_218af109-d374-41c9-961d-441a1cec3842` BOOL,
+`franchises_b279ae58-a0e1-4e08-9232-96ebcef625b5` BOOL,
+`franchises_a1238768-67b9-4434-9f56-431ce4b3ebc6` BOOL,
+`franchises_001f0988-0252-44d2-a315-6a08636801ce` BOOL,
+`franchises_f70e9fe5-f649-4716-968a-27d516b61b91` BOOL,
+`franchises_3a6adad6-f6a6-4ace-b2dd-5295a14bd18c` BOOL,
+`franchises_56f12ae8-fa93-45a0-804b-de50e2a205f3` BOOL,
+`franchises_68c408b9-6116-46d8-a9af-59c8a976e100` BOOL,
+`franchises_1124a814-c6bd-42c9-85df-343ce7c85a03` BOOL,
+`franchises_80f0a243-7938-4205-b91a-d3a68c02c5d3` BOOL,
+`franchises_729acb12-74ba-4e52-803e-b4595d6e691d` BOOL,
+`franchises_a4cbbc2a-d792-4604-bb6b-fadd60c3f9ad` BOOL,
+`franchises_900fac90-c581-4553-9d5d-731a994c15b7` BOOL,
+`franchises_47c46a92-b921-4763-b3dd-e02799ef30d6` BOOL,
+`franchises_8ddab2a6-a77f-4e65-8241-9136ed32b56a` BOOL,
+`franchises_e2adb26f-58ce-40ed-90f8-e3467a223eca` BOOL,
+`franchises_f1fe40c7-bd19-49a2-ad21-6f07a74f8d6b` BOOL,
+`franchises_bfbea71c-8acc-4407-adf4-16abf85bf868` BOOL,
+`franchises_f639b02f-4c75-48af-977a-7ad748fa9c6e` BOOL,
+`franchises_f77e84f0-beec-4a6a-a2b1-0fc9458f52db` BOOL,
+`franchises_dcff5b79-1b6f-44f1-9f46-122da4fd2df9` BOOL,
+`franchises_1a1f08a0-9fd8-42d9-8fea-0bfba3034a06` BOOL,
+`franchises_7f92b1e1-e2d4-493b-93f8-f7fdfd2d716a` BOOL,
+`franchises_b8f3c39d-656e-44ea-b76a-e06c1636b302` BOOL,
+`franchises_af2200b2-c6b4-4e95-b41a-112b89112358` BOOL,
+`franchises_d10c6093-9103-4210-aa80-1f900d083fb5` BOOL,
+`franchises_198d8d0d-0bc6-4879-9ef2-42f3a20219a3` BOOL,
+`franchises_3a852282-a86c-4438-b407-8a7f241534b9` BOOL,
+`franchises_e2a8f3c2-4b18-44e2-932e-df623e6980a0` BOOL,
+`franchises_df66b337-f885-479f-94d6-bfb045f2830e` BOOL,
+`franchises_9ecf0877-600c-49ba-85c2-440dfc79bd82` BOOL,
+`franchises_a0f4aeb8-8dc4-4100-a83e-6cc1c8f30a3a` BOOL,
+`franchises_ff241cea-79d2-43c5-ade6-e2dbc7494c36` BOOL,
+`franchises_a5e78011-53d8-4c06-8b57-9a141f516ec1` BOOL,
+`franchises_5d72df43-696b-4edd-843c-9396761bd11c` BOOL,
+`franchises_658c23f8-636b-4fa1-a237-57e7dd021c8c` BOOL,
+`franchises_5080d8be-d4c6-4dcb-ac8d-b35504569da9` BOOL,
+`franchises_26148639-f9e5-4b87-b3b6-e730db5fe19d` BOOL,
+`franchises_edb382cc-e553-41a7-8c43-5cca8275c055` BOOL,
+`franchises_178bedbf-73ab-4b03-bce8-23957ba56be4` BOOL,
+`franchises_dfa35309-393d-4b93-95ea-7abe6941cbeb` BOOL,
+`franchises_e90a7a4a-f706-4192-9658-49a4b533e1be` BOOL,
+`franchises_36812815-e031-45f7-8440-090839c5fb6d` BOOL,
+`franchises_fbc0df56-d3bd-4fbd-853b-aee0b9da983e` BOOL,
+`franchises_ff07b7f8-a729-4372-aa9a-2986838f6450` BOOL,
+`franchises_6aef3450-9b40-4198-91ce-ae036569b8a1` BOOL,
+`franchises_8b949731-a348-4e16-949c-448a13d3dc58` BOOL,
+`franchises_7e8c94ea-ca95-4116-afea-487d10e4008c` BOOL,
+`franchises_0574dd54-1bd4-4873-aa1f-09ca60fc3687` BOOL,
+`franchises_c6676998-e824-4895-a1e0-e1b62d19537e` BOOL,
+`franchises_d075074f-1ae8-4761-93d7-84328e9af4e2` BOOL,
+`franchises_fa86346f-4867-4fbb-aa0c-4a9254fbefb9` BOOL,
+`franchises_5650b010-3b45-49c8-8de1-f9c65212e245` BOOL,
+`franchises_072226a1-3aaa-4438-aaa8-0304a4bcbff4` BOOL,
+`franchises_ba4c3214-9743-4bc3-ae04-c2c2adf66f41` BOOL,
+`franchises_add2c664-6d35-4d77-bf68-ac785c8a2484` BOOL,
+`franchises_8999c1fb-ad4b-44aa-9180-a6293faee50f` BOOL,
+`franchises_973df3ed-0521-4dc3-9c83-cc4555d9b914` BOOL,
+`franchises_e4e9f80e-7d71-482d-9eb0-a5f8e6db1013` BOOL,
+`franchises_16720db9-12a7-4b9b-a6f9-8dca489bcf74` BOOL,
+`franchises_d887b8da-4b99-4997-a1f9-e69b963b4fa9` BOOL,
+`franchises_2d5c3447-c13c-41a9-adec-463167feb8ca` BOOL,
+`franchises_5d8fc625-df0f-4e27-b14b-9236bd72e388` BOOL,
+`franchises_94a1ad22-a8ba-41a3-b484-0897da640d4f` BOOL,
+`franchises_c5ca55be-caf6-4ec5-9fa8-feb835dac1ad` BOOL,
+`franchises_817df498-21e4-4ace-91aa-4307e75cc02b` BOOL,
+`franchises_127024eb-3de3-47fe-a939-d01511a7695b` BOOL,
+`franchises_428e869a-763f-4f2a-9e53-9636ac2e62c6` BOOL,
+`franchises_396ce3e3-c371-4190-8e3b-73aea3ccc55d` BOOL,
+`franchises_892dfe71-6c8a-4b48-8757-9b281da16ee6` BOOL,
+`franchises_c0b63363-7de4-438f-9c48-1557a68240eb` BOOL,
+    `products_ad_selector` BOOL,
+`products_ad_selector_slate` BOOL,
+`products_ad_selector_video` BOOL,
+`products_brightline` BOOL,
+`products_choice` BOOL,
+`products_gateway_go` BOOL,
+`products_gateway_shop` BOOL,
+`products_house_video` BOOL,
+`products_innovid` BOOL,
+`products_max_selector` BOOL,
+`products_pause` BOOL,
+`products_pause_plus` BOOL,
+`products_slate` BOOL,
+`products_video` BOOL,
+`products_video_plus` BOOL,
+    `demo_003f989a` BOOL,
+`demo_0041aa68` BOOL,
+`demo_0045b6c0` BOOL,
+`demo_0051246e` BOOL,
+`demo_0106e38e` BOOL,
+`demo_01693d0a` BOOL,
+`demo_01a83690` BOOL,
+`demo_0204f037` BOOL,
+`demo_0220f346` BOOL,
+`demo_02244b88` BOOL,
+`demo_02775c1e` BOOL,
+`demo_02858d3d` BOOL,
+`demo_02a78850` BOOL,
+`demo_03f7bef2` BOOL,
+`demo_042e62ed` BOOL,
+`demo_0430936b` BOOL,
+`demo_043d85df` BOOL,
+`demo_04778d71` BOOL,
+`demo_04aeb2f1` BOOL,
+`demo_04cc7824` BOOL,
+`demo_04cf7c13` BOOL,
+`demo_04fce616` BOOL,
+`demo_051d5b1b` BOOL,
+`demo_05474dca` BOOL,
+`demo_05622a8b` BOOL,
+`demo_056ebd1f` BOOL,
+`demo_05a39088` BOOL,
+`demo_05bdc2b1` BOOL,
+`demo_05e41aa7` BOOL,
+`demo_05f26135` BOOL,
+`demo_06a051aa` BOOL,
+`demo_07ab4f3d` BOOL,
+`demo_07c4492b` BOOL,
+`demo_07cb5db7` BOOL,
+`demo_084acc9c` BOOL,
+`demo_086c97a8` BOOL,
+`demo_086dfa60` BOOL,
+`demo_087ebd0a` BOOL,
+`demo_0891baef` BOOL,
+`demo_08d0d394` BOOL,
+`demo_08d0db9f` BOOL,
+`demo_08e0ea79` BOOL,
+`demo_08e147a8` BOOL,
+`demo_08fe0902` BOOL,
+`demo_091c03e0` BOOL,
+`demo_093df274` BOOL,
+`demo_099f6443` BOOL,
+`demo_09b83c23` BOOL,
+`demo_09c40ca3` BOOL,
+`demo_09e6e84e` BOOL,
+`demo_09f8a3c2` BOOL,
+`demo_0a0e470b` BOOL,
+`demo_0a14e732` BOOL,
+`demo_0a4aa448` BOOL,
+`demo_0a96029d` BOOL,
+`demo_0adc80ca` BOOL,
+`demo_0b19c585` BOOL,
+`demo_0b30e0fa` BOOL,
+`demo_0b35028a` BOOL,
+`demo_0b523cb7` BOOL,
+`demo_0b7e26b0` BOOL,
+`demo_0ba487d3` BOOL,
+`demo_0c0cdf91` BOOL,
+`demo_0c431376` BOOL,
+`demo_0cb97fd5` BOOL,
+`demo_0cee5cf1` BOOL,
+`demo_0cfc2e45` BOOL,
+`demo_0d063c25` BOOL,
+`demo_0d07b7f3` BOOL,
+`demo_0d30019d` BOOL,
+`demo_0d3899ce` BOOL,
+`demo_0d70758f` BOOL,
+`demo_0d7c62fa` BOOL,
+`demo_0d7dd65b` BOOL,
+`demo_0da2b3fc` BOOL,
+`demo_0db3d528` BOOL,
+`demo_0dc1930a` BOOL,
+`demo_0dc92920` BOOL,
+`demo_0e0ebc26` BOOL,
+`demo_0e19b24d` BOOL,
+`demo_0e1ec6e3` BOOL,
+`demo_0e2f658a` BOOL,
+`demo_0e446915` BOOL,
+`demo_0ece5d9d` BOOL,
+`demo_0efed2fe` BOOL,
+`demo_0f04d036` BOOL,
+`demo_0f04fc61` BOOL,
+`demo_0f15751d` BOOL,
+`demo_0f466351` BOOL,
+`demo_0f703c38` BOOL,
+`demo_1029dc8f` BOOL,
+`demo_102d2ebd` BOOL,
+`demo_1076aa8d` BOOL,
+`demo_1078fb29` BOOL,
+`demo_115cc915` BOOL,
+`demo_1193ea31` BOOL,
+`demo_12442422` BOOL,
+`demo_125d41e5` BOOL,
+`demo_128e648f` BOOL,
+`demo_12a611ff` BOOL,
+`demo_12db0c92` BOOL,
+`demo_13013831` BOOL,
+`demo_13579699` BOOL,
+`demo_13b7326d` BOOL,
+`demo_13d45532` BOOL,
+`demo_13f79a2b` BOOL,
+`demo_14544a61` BOOL,
+`demo_14ae7a16` BOOL,
+`demo_14fcba73` BOOL,
+`demo_1502795a` BOOL,
+`demo_150f6f5e` BOOL,
+`demo_152a78dd` BOOL,
+`demo_1572c9bb` BOOL,
+`demo_15af1060` BOOL,
+`demo_15c394b7` BOOL,
+`demo_15e0bcac` BOOL,
+`demo_15eaa1c9` BOOL,
+`demo_15ef325b` BOOL,
+`demo_161f97f2` BOOL,
+`demo_164e43a1` BOOL,
+`demo_1696c77e` BOOL,
+`demo_16a2b2f2` BOOL,
+`demo_16ab9f89` BOOL,
+`demo_16b16eb3` BOOL,
+`demo_16c8ac38` BOOL,
+`demo_170ae566` BOOL,
+`demo_17717d87` BOOL,
+`demo_1803f65f` BOOL,
+`demo_1806a27c` BOOL,
+`demo_18152c24` BOOL,
+`demo_185e4e32` BOOL,
+`demo_18aa1f2d` BOOL,
+`demo_18b0fa5e` BOOL,
+`demo_18c6fd7d` BOOL,
+`demo_18d08c80` BOOL,
+`demo_18e11cfb` BOOL,
+`demo_1922339e` BOOL,
+`demo_1968a5fc` BOOL,
+`demo_19b94b2c` BOOL,
+`demo_19cb5b53` BOOL,
+`demo_19e46425` BOOL,
+`demo_19ec29cd` BOOL,
+`demo_1a0ae5c6` BOOL,
+`demo_1a325b70` BOOL,
+`demo_1a5446e7` BOOL,
+`demo_1a7efed4` BOOL,
+`demo_1a851d48` BOOL,
+`demo_1a9f30d8` BOOL,
+`demo_1aea96ac` BOOL,
+`demo_1b246a2f` BOOL,
+`demo_1b44b2f0` BOOL,
+`demo_1b56460f` BOOL,
+`demo_1b720c52` BOOL,
+`demo_1b8fdef2` BOOL,
+`demo_1b97a239` BOOL,
+`demo_1b9cf0af` BOOL,
+`demo_1be3ad9e` BOOL,
+`demo_1c5112ed` BOOL,
+`demo_1c6d44e7` BOOL,
+`demo_1c76ef8e` BOOL,
+`demo_1c8c71c9` BOOL,
+`demo_1cdf4335` BOOL,
+`demo_1ce3b2f5` BOOL,
+`demo_1cf0ad2f` BOOL,
+`demo_1d1e8269` BOOL,
+`demo_1d51691f` BOOL,
+`demo_1d8678a4` BOOL,
+`demo_1d8b3e29` BOOL,
+`demo_1dcdb510` BOOL,
+`demo_1e18211e` BOOL,
+`demo_1e2f90a6` BOOL,
+`demo_1e3a8cf9` BOOL,
+`demo_1e55a237` BOOL,
+`demo_1e8b988d` BOOL,
+`demo_1e9ccec8` BOOL,
+`demo_1ec7f22e` BOOL,
+`demo_1ee289d5` BOOL,
+`demo_1ef97e93` BOOL,
+`demo_1f21428b` BOOL,
+`demo_1f4232b8` BOOL,
+`demo_1f53d3df` BOOL,
+`demo_1f54064a` BOOL,
+`demo_1fd98e6f` BOOL,
+`demo_1fe29bd0` BOOL,
+`demo_2000c321` BOOL,
+`demo_207c9d3c` BOOL,
+`demo_2091a340` BOOL,
+`demo_20cb8689` BOOL,
+`demo_20cc831c` BOOL,
+`demo_20f73356` BOOL,
+`demo_2107932f` BOOL,
+`demo_2139588c` BOOL,
+`demo_215ee891` BOOL,
+`demo_2160614c` BOOL,
+`demo_2167e4dd` BOOL,
+`demo_2178b7a9` BOOL,
+`demo_218450bf` BOOL,
+`demo_218ab0eb` BOOL,
+`demo_21dfba35` BOOL,
+`demo_21f56910` BOOL,
+`demo_22742257` BOOL,
+`demo_22991487` BOOL,
+`demo_229e806f` BOOL,
+`demo_22cd9755` BOOL,
+`demo_22d07444` BOOL,
+`demo_2316cb7f` BOOL,
+`demo_23956aae` BOOL,
+`demo_23ce3032` BOOL,
+`demo_23d655c4` BOOL,
+`demo_23e1be15` BOOL,
+`demo_2445833d` BOOL,
+`demo_24845aa0` BOOL,
+`demo_24a2b29d` BOOL,
+`demo_2518eed9` BOOL,
+`demo_2525ff60` BOOL,
+`demo_25273202` BOOL,
+`demo_2565e52f` BOOL,
+`demo_25da908f` BOOL,
+`demo_25ee2a9a` BOOL,
+`demo_2612db79` BOOL,
+`demo_264704bb` BOOL,
+`demo_269f69f1` BOOL,
+`demo_26a522cd` BOOL,
+`demo_26aa67fa` BOOL,
+`demo_26b6949e` BOOL,
+`demo_26ed504d` BOOL,
+`demo_2720b352` BOOL,
+`demo_2745359a` BOOL,
+`demo_274dbb85` BOOL,
+`demo_27a3283c` BOOL,
+`demo_27c65440` BOOL,
+`demo_27d00f2c` BOOL,
+`demo_2836e870` BOOL,
+`demo_2881b318` BOOL,
+`demo_289e57f1` BOOL,
+`demo_28bbe595` BOOL,
+`demo_296e2beb` BOOL,
+`demo_2978f983` BOOL,
+`demo_298204f3` BOOL,
+`demo_29b21f6a` BOOL,
+`demo_29bdf165` BOOL,
+`demo_29e27363` BOOL,
+`demo_29fb6f17` BOOL,
+`demo_2a8e501d` BOOL,
+`demo_2a90c1da` BOOL,
+`demo_2ab3f08a` BOOL,
+`demo_2b154c12` BOOL,
+`demo_2b2ea770` BOOL,
+`demo_2b549bd1` BOOL,
+`demo_2b64c673` BOOL,
+`demo_2b98497b` BOOL,
+`demo_2bb7330f` BOOL,
+`demo_2bb9f1b9` BOOL,
+`demo_2c407432` BOOL,
+`demo_2c510fb3` BOOL,
+`demo_2c7b8347` BOOL,
+`demo_2c9a2f12` BOOL,
+`demo_2cacdafa` BOOL,
+`demo_2cd06310` BOOL,
+`demo_2cdca323` BOOL,
+`demo_2ce190ee` BOOL,
+`demo_2d386d3d` BOOL,
+`demo_2d3bd496` BOOL,
+`demo_2d3ede22` BOOL,
+`demo_2d3fc1a6` BOOL,
+`demo_2d63a983` BOOL,
+`demo_2d697259` BOOL,
+`demo_2de2e134` BOOL,
+`demo_2df2124c` BOOL,
+`demo_2e0344f3` BOOL,
+`demo_2ec1d064` BOOL,
+`demo_2ef55dd2` BOOL,
+`demo_2f3bfa7d` BOOL,
+`demo_2fa79731` BOOL,
+`demo_2fc9d402` BOOL,
+`demo_300d5ee9` BOOL,
+`demo_3092902b` BOOL,
+`demo_30b77e5f` BOOL,
+`demo_31393e83` BOOL,
+`demo_31767c04` BOOL,
+`demo_31a50ef9` BOOL,
+`demo_31a85fc5` BOOL,
+`demo_31f93e3f` BOOL,
+`demo_3248a0cd` BOOL,
+`demo_32580070` BOOL,
+`demo_3293fe1c` BOOL,
+`demo_32b08472` BOOL,
+`demo_32c18df8` BOOL,
+`demo_331a25a9` BOOL,
+`demo_33377894` BOOL,
+`demo_334053e1` BOOL,
+`demo_336f91ea` BOOL,
+`demo_33780c35` BOOL,
+`demo_3406e79e` BOOL,
+`demo_344dd0ff` BOOL,
+`demo_34a050f3` BOOL,
+`demo_34c66caa` BOOL,
+`demo_34e08d45` BOOL,
+`demo_34f650cd` BOOL,
+`demo_34fcdb67` BOOL,
+`demo_3523e306` BOOL,
+`demo_353725b2` BOOL,
+`demo_35606f85` BOOL,
+`demo_3587a40e` BOOL,
+`demo_35a0fcd7` BOOL,
+`demo_35f67f6f` BOOL,
+`demo_3692a22b` BOOL,
+`demo_36998421` BOOL,
+`demo_3699d10f` BOOL,
+`demo_36d88791` BOOL,
+`demo_371d81d6` BOOL,
+`demo_3727cf94` BOOL,
+`demo_3755aabf` BOOL,
+`demo_376b0b9f` BOOL,
+`demo_37a1d750` BOOL,
+`demo_37e64c67` BOOL,
+`demo_37f769ca` BOOL,
+`demo_380d8af1` BOOL,
+`demo_383d5c43` BOOL,
+`demo_38401f60` BOOL,
+`demo_38991633` BOOL,
+`demo_389bd469` BOOL,
+`demo_38a93af5` BOOL,
+`demo_38c53b74` BOOL,
+`demo_395aa6c1` BOOL,
+`demo_395c377a` BOOL,
+`demo_395d1519` BOOL,
+`demo_399c694b` BOOL,
+`demo_39a913ff` BOOL,
+`demo_39af37cc` BOOL,
+`demo_3a049790` BOOL,
+`demo_3a2fda66` BOOL,
+`demo_3ab5993e` BOOL,
+`demo_3ac15a3f` BOOL,
+`demo_3ae1f5df` BOOL,
+`demo_3ae93539` BOOL,
+`demo_3ae9fc46` BOOL,
+`demo_3b09b0fa` BOOL,
+`demo_3b1fab4f` BOOL,
+`demo_3b2e892a` BOOL,
+`demo_3b37b9a6` BOOL,
+`demo_3b607f23` BOOL,
+`demo_3bb0bc18` BOOL,
+`demo_3bff0414` BOOL,
+`demo_3c46199b` BOOL,
+`demo_3cab95fa` BOOL,
+`demo_3ceb3e1a` BOOL,
+`demo_3d2ff595` BOOL,
+`demo_3d568240` BOOL,
+`demo_3d571fc2` BOOL,
+`demo_3da1c324` BOOL,
+`demo_3de10bb2` BOOL,
+`demo_3de6123c` BOOL,
+`demo_3e05c834` BOOL,
+`demo_3e24cf35` BOOL,
+`demo_3e61beb0` BOOL,
+`demo_3e70f193` BOOL,
+`demo_3e930f81` BOOL,
+`demo_3f202cb2` BOOL,
+`demo_3f56b449` BOOL,
+`demo_3f636a79` BOOL,
+`demo_3f6bf2c8` BOOL,
+`demo_3f91842b` BOOL,
+`demo_3fb4076b` BOOL,
+`demo_3fc5341a` BOOL,
+`demo_3ffd298d` BOOL,
+`demo_400fbc71` BOOL,
+`demo_401d0c25` BOOL,
+`demo_4053c3d7` BOOL,
+`demo_4099ed41` BOOL,
+`demo_409f4916` BOOL,
+`demo_40b81978` BOOL,
+`demo_40c37f9f` BOOL,
+`demo_40e67cce` BOOL,
+`demo_41ec151d` BOOL,
+`demo_420d3746` BOOL,
+`demo_422a2e90` BOOL,
+`demo_423b8f16` BOOL,
+`demo_423cc28c` BOOL,
+`demo_4262b3e5` BOOL,
+`demo_426e178e` BOOL,
+`demo_4270dad7` BOOL,
+`demo_4278b75b` BOOL,
+`demo_4288e50f` BOOL,
+`demo_429a4ea7` BOOL,
+`demo_42c45058` BOOL,
+`demo_4316d5f0` BOOL,
+`demo_431bc2f9` BOOL,
+`demo_434c182e` BOOL,
+`demo_434e645b` BOOL,
+`demo_438ea45a` BOOL,
+`demo_43ede686` BOOL,
+`demo_43eefe42` BOOL,
+`demo_44502cb4` BOOL,
+`demo_446c4162` BOOL,
+`demo_4481ddc3` BOOL,
+`demo_449ff6cf` BOOL,
+`demo_44a7351b` BOOL,
+`demo_45305a46` BOOL,
+`demo_4534fd5d` BOOL,
+`demo_45363b24` BOOL,
+`demo_455d4b5a` BOOL,
+`demo_45a4c99c` BOOL,
+`demo_45a6b1c2` BOOL,
+`demo_45b50259` BOOL,
+`demo_45c49fc4` BOOL,
+`demo_46d67e6e` BOOL,
+`demo_46f2d00e` BOOL,
+`demo_471e5b89` BOOL,
+`demo_47280c17` BOOL,
+`demo_4788ed11` BOOL,
+`demo_47aa596a` BOOL,
+`demo_47c224a3` BOOL,
+`demo_47e20af6` BOOL,
+`demo_47f808a2` BOOL,
+`demo_47fa1bc7` BOOL,
+`demo_480f712b` BOOL,
+`demo_48426ed7` BOOL,
+`demo_484c716f` BOOL,
+`demo_484e782c` BOOL,
+`demo_4897b7e9` BOOL,
+`demo_48ccafdd` BOOL,
+`demo_49039a42` BOOL,
+`demo_4909e676` BOOL,
+`demo_4918bd1b` BOOL,
+`demo_49419d1c` BOOL,
+`demo_49524f17` BOOL,
+`demo_499d6793` BOOL,
+`demo_499e8c26` BOOL,
+`demo_49d7a6da` BOOL,
+`demo_4a270720` BOOL,
+`demo_4a631181` BOOL,
+`demo_4a928dd2` BOOL,
+`demo_4ab9f7f2` BOOL,
+`demo_4b9f5764` BOOL,
+`demo_4bb48d97` BOOL,
+`demo_4c21b1d6` BOOL,
+`demo_4c45242d` BOOL,
+`demo_4c7f1b7f` BOOL,
+`demo_4c8a10c7` BOOL,
+`demo_4c938fd8` BOOL,
+`demo_4cc19540` BOOL,
+`demo_4cc8ec34` BOOL,
+`demo_4d3e1424` BOOL,
+`demo_4d46fa1e` BOOL,
+`demo_4d4f5642` BOOL,
+`demo_4d7568f4` BOOL,
+`demo_4d8eaa2e` BOOL,
+`demo_4e30e7b2` BOOL,
+`demo_4e3a2faa` BOOL,
+`demo_4ea756ca` BOOL,
+`demo_4eb8e735` BOOL,
+`demo_4ec5d0d6` BOOL,
+`demo_4ef0ad64` BOOL,
+`demo_4f8b7797` BOOL,
+`demo_4fb6874a` BOOL,
+`demo_4fcc8357` BOOL,
+`demo_4fdd123c` BOOL,
+`demo_4ffe1a37` BOOL,
+`demo_5000186f` BOOL,
+`demo_501806b8` BOOL,
+`demo_502c29e1` BOOL,
+`demo_5035c267` BOOL,
+`demo_50394229` BOOL,
+`demo_505d6928` BOOL,
+`demo_50625f28` BOOL,
+`demo_5089dab4` BOOL,
+`demo_50bfe485` BOOL,
+`demo_51381b93` BOOL,
+`demo_51477864` BOOL,
+`demo_51a2fd73` BOOL,
+`demo_51aa1601` BOOL,
+`demo_51e6062f` BOOL,
+`demo_5207c775` BOOL,
+`demo_521362b6` BOOL,
+`demo_5247b55b` BOOL,
+`demo_52c55699` BOOL,
+`demo_52e01dcc` BOOL,
+`demo_53394ffd` BOOL,
+`demo_536857eb` BOOL,
+`demo_53a6d6fa` BOOL,
+`demo_53e9d4c2` BOOL,
+`demo_53efaca3` BOOL,
+`demo_5412168b` BOOL,
+`demo_5442181b` BOOL,
+`demo_54650ad1` BOOL,
+`demo_550d5c9c` BOOL,
+`demo_55222827` BOOL,
+`demo_55cd11ab` BOOL,
+`demo_55e2541d` BOOL,
+`demo_55f2f08b` BOOL,
+`demo_5635cac3` BOOL,
+`demo_5656f018` BOOL,
+`demo_569c08ba` BOOL,
+`demo_56a950c9` BOOL,
+`demo_56b2b2d0` BOOL,
+`demo_56e1b6bb` BOOL,
+`demo_56ed5a65` BOOL,
+`demo_57b463df` BOOL,
+`demo_57bc1e2c` BOOL,
+`demo_581249a5` BOOL,
+`demo_583c1224` BOOL,
+`demo_583fce78` BOOL,
+`demo_585c0d28` BOOL,
+`demo_58871c38` BOOL,
+`demo_588ce384` BOOL,
+`demo_58bee493` BOOL,
+`demo_5930195e` BOOL,
+`demo_59bd96c7` BOOL,
+`demo_5a45f019` BOOL,
+`demo_5acf7755` BOOL,
+`demo_5b59d97d` BOOL,
+`demo_5b5a9603` BOOL,
+`demo_5b80c360` BOOL,
+`demo_5b897509` BOOL,
+`demo_5bb9b20a` BOOL,
+`demo_5c5a20f9` BOOL,
+`demo_5c631f92` BOOL,
+`demo_5c771392` BOOL,
+`demo_5ca65f7e` BOOL,
+`demo_5ccad8c5` BOOL,
+`demo_5cdd4869` BOOL,
+`demo_5ceeb875` BOOL,
+`demo_5d928c3c` BOOL,
+`demo_5dac2750` BOOL,
+`demo_5dad66d8` BOOL,
+`demo_5e0317de` BOOL,
+`demo_5e168343` BOOL,
+`demo_5e1693f2` BOOL,
+`demo_5e337bf8` BOOL,
+`demo_5e3a8b4b` BOOL,
+`demo_5e927e23` BOOL,
+`demo_5ef07170` BOOL,
+`demo_5f4e8e2f` BOOL,
+`demo_5f71a01b` BOOL,
+`demo_5ff8106d` BOOL,
+`demo_60cda8e4` BOOL,
+`demo_612462d5` BOOL,
+`demo_613fe8ed` BOOL,
+`demo_61ccc6ea` BOOL,
+`demo_621f4c66` BOOL,
+`demo_6256d540` BOOL,
+`demo_62847e63` BOOL,
+`demo_62909430` BOOL,
+`demo_629f7879` BOOL,
+`demo_631997b6` BOOL,
+`demo_637c3d0c` BOOL,
+`demo_6386daf8` BOOL,
+`demo_63892db5` BOOL,
+`demo_63a31a9c` BOOL,
+`demo_63a7426c` BOOL,
+`demo_643c1f43` BOOL,
+`demo_644582ec` BOOL,
+`demo_646f6815` BOOL,
+`demo_6484af5b` BOOL,
+`demo_64a18e01` BOOL,
+`demo_64add53c` BOOL,
+`demo_64c0281c` BOOL,
+`demo_64c21772` BOOL,
+`demo_64f78430` BOOL,
+`demo_654ae4dd` BOOL,
+`demo_65679f97` BOOL,
+`demo_6573be04` BOOL,
+`demo_657bda97` BOOL,
+`demo_657c4c9d` BOOL,
+`demo_65b4d98f` BOOL,
+`demo_65d75aac` BOOL,
+`demo_65fa4f52` BOOL,
+`demo_65fbf07c` BOOL,
+`demo_660403e8` BOOL,
+`demo_664e226b` BOOL,
+`demo_66fc8051` BOOL,
+`demo_6718730f` BOOL,
+`demo_6750e4ec` BOOL,
+`demo_675730e2` BOOL,
+`demo_677a8c55` BOOL,
+`demo_67ae5a84` BOOL,
+`demo_67b08324` BOOL,
+`demo_67c899bd` BOOL,
+`demo_682c84ef` BOOL,
+`demo_6838d3fa` BOOL,
+`demo_6846b6c6` BOOL,
+`demo_68a2e561` BOOL,
+`demo_68b0e1d5` BOOL,
+`demo_68c2d67b` BOOL,
+`demo_6912b2aa` BOOL,
+`demo_692e499d` BOOL,
+`demo_698cf435` BOOL,
+`demo_69b45614` BOOL,
+`demo_69c1f98c` BOOL,
+`demo_69dcdfd4` BOOL,
+`demo_69efc0f9` BOOL,
+`demo_69fdf13e` BOOL,
+`demo_6a2d1d52` BOOL,
+`demo_6a3e590f` BOOL,
+`demo_6a4c4961` BOOL,
+`demo_6a536bc4` BOOL,
+`demo_6a6a7b93` BOOL,
+`demo_6a715265` BOOL,
+`demo_6a92960a` BOOL,
+`demo_6ab15ad5` BOOL,
+`demo_6af79f0b` BOOL,
+`demo_6b26efb4` BOOL,
+`demo_6b46f72c` BOOL,
+`demo_6b76e7a3` BOOL,
+`demo_6bbb8fea` BOOL,
+`demo_6bfbf270` BOOL,
+`demo_6c121652` BOOL,
+`demo_6c1d64e3` BOOL,
+`demo_6c792397` BOOL,
+`demo_6cc55fb3` BOOL,
+`demo_6cc5f9d0` BOOL,
+`demo_6d05c29b` BOOL,
+`demo_6d2d2305` BOOL,
+`demo_6d316fd3` BOOL,
+`demo_6d6cc30d` BOOL,
+`demo_6d7e3c73` BOOL,
+`demo_6dc098eb` BOOL,
+`demo_6dce0914` BOOL,
+`demo_6e18e1d0` BOOL,
+`demo_6e979e64` BOOL,
+`demo_6e9f9f26` BOOL,
+`demo_6ebdedc9` BOOL,
+`demo_6eee6b37` BOOL,
+`demo_6f2b402c` BOOL,
+`demo_6f75dce7` BOOL,
+`demo_6fbba4d1` BOOL,
+`demo_6ffd0119` BOOL,
+`demo_70102f46` BOOL,
+`demo_701d3a1f` BOOL,
+`demo_7052b5ff` BOOL,
+`demo_7060f73e` BOOL,
+`demo_70c12f4c` BOOL,
+`demo_70caaa14` BOOL,
+`demo_70e7b136` BOOL,
+`demo_713391b5` BOOL,
+`demo_71766540` BOOL,
+`demo_71a7e077` BOOL,
+`demo_71b10143` BOOL,
+`demo_71bbffb7` BOOL,
+`demo_71cf83db` BOOL,
+`demo_71e8aeda` BOOL,
+`demo_722f352c` BOOL,
+`demo_723d2a98` BOOL,
+`demo_726b187a` BOOL,
+`demo_726d6e32` BOOL,
+`demo_72861448` BOOL,
+`demo_72a4d850` BOOL,
+`demo_72c3aa99` BOOL,
+`demo_72cd7525` BOOL,
+`demo_72ec3e8a` BOOL,
+`demo_737a14b7` BOOL,
+`demo_73eb1262` BOOL,
+`demo_744a023a` BOOL,
+`demo_74774ec4` BOOL,
+`demo_74aba6f0` BOOL,
+`demo_74be2978` BOOL,
+`demo_74e91fd3` BOOL,
+`demo_74f78f12` BOOL,
+`demo_7508e29a` BOOL,
+`demo_752b73ef` BOOL,
+`demo_75488fd3` BOOL,
+`demo_754c029d` BOOL,
+`demo_756697c6` BOOL,
+`demo_759571c2` BOOL,
+`demo_75c7ed64` BOOL,
+`demo_75c835da` BOOL,
+`demo_75f0b926` BOOL,
+`demo_75ffe02e` BOOL,
+`demo_763113c1` BOOL,
+`demo_765de369` BOOL,
+`demo_7684cc72` BOOL,
+`demo_7694d292` BOOL,
+`demo_76d89724` BOOL,
+`demo_76dc377d` BOOL,
+`demo_76dcfc54` BOOL,
+`demo_76eec5dc` BOOL,
+`demo_771a7549` BOOL,
+`demo_775b5658` BOOL,
+`demo_77642561` BOOL,
+`demo_7774c4e9` BOOL,
+`demo_77c071e8` BOOL,
+`demo_77ea5586` BOOL,
+`demo_7811ca14` BOOL,
+`demo_784ed876` BOOL,
+`demo_785bb396` BOOL,
+`demo_78c7cfee` BOOL,
+`demo_78e799fe` BOOL,
+`demo_79025c87` BOOL,
+`demo_797a2e8f` BOOL,
+`demo_797e3ae8` BOOL,
+`demo_799e5883` BOOL,
+`demo_79a2c81d` BOOL,
+`demo_79bf6699` BOOL,
+`demo_7a063c7b` BOOL,
+`demo_7a274d6e` BOOL,
+`demo_7a2d69e8` BOOL,
+`demo_7a3f6ed4` BOOL,
+`demo_7a528b3f` BOOL,
+`demo_7a58449e` BOOL,
+`demo_7a6edd87` BOOL,
+`demo_7aeeef97` BOOL,
+`demo_7b120e04` BOOL,
+`demo_7b48c4fc` BOOL,
+`demo_7bb85349` BOOL,
+`demo_7bb9b407` BOOL,
+`demo_7bce0a33` BOOL,
+`demo_7c3a73f6` BOOL,
+`demo_7c8d405d` BOOL,
+`demo_7c9bd710` BOOL,
+`demo_7caf2a9d` BOOL,
+`demo_7cb905d5` BOOL,
+`demo_7cf2fa5a` BOOL,
+`demo_7d4597f7` BOOL,
+`demo_7d5dbece` BOOL,
+`demo_7d73d824` BOOL,
+`demo_7dc45f84` BOOL,
+`demo_7eb8bc00` BOOL,
+`demo_7ed21595` BOOL,
+`demo_7eeaef0d` BOOL,
+`demo_7f0e54a3` BOOL,
+`demo_7f36e844` BOOL,
+`demo_7f4b546c` BOOL,
+`demo_7fe736a0` BOOL,
+`demo_7febb2a3` BOOL,
+`demo_80017343` BOOL,
+`demo_803d8ccf` BOOL,
+`demo_8043cb0e` BOOL,
+`demo_80508697` BOOL,
+`demo_806f6faf` BOOL,
+`demo_80c75032` BOOL,
+`demo_813f0504` BOOL,
+`demo_8174990b` BOOL,
+`demo_817a896f` BOOL,
+`demo_817d398e` BOOL,
+`demo_817e6baa` BOOL,
+`demo_81af76f8` BOOL,
+`demo_82c0b25f` BOOL,
+`demo_82cce591` BOOL,
+`demo_82f64a52` BOOL,
+`demo_82f8c101` BOOL,
+`demo_82ff477a` BOOL,
+`demo_8326816f` BOOL,
+`demo_8384de0e` BOOL,
+`demo_838edbd1` BOOL,
+`demo_83a90f1f` BOOL,
+`demo_83cf9c9a` BOOL,
+`demo_84044411` BOOL,
+`demo_845f4508` BOOL,
+`demo_84928384` BOOL,
+`demo_84a97cf1` BOOL,
+`demo_84ac2fca` BOOL,
+`demo_84c86333` BOOL,
+`demo_85030dd0` BOOL,
+`demo_850d5fb9` BOOL,
+`demo_851a86bd` BOOL,
+`demo_853c996b` BOOL,
+`demo_8543b8e3` BOOL,
+`demo_85750797` BOOL,
+`demo_85986114` BOOL,
+`demo_859c5103` BOOL,
+`demo_859d58f5` BOOL,
+`demo_85c02de9` BOOL,
+`demo_85d5159f` BOOL,
+`demo_85e18511` BOOL,
+`demo_85f06d77` BOOL,
+`demo_85f2c7fb` BOOL,
+`demo_861ce27c` BOOL,
+`demo_8626c326` BOOL,
+`demo_865985d0` BOOL,
+`demo_873b2ad3` BOOL,
+`demo_873d8012` BOOL,
+`demo_877e6a92` BOOL,
+`demo_87bdb22f` BOOL,
+`demo_882173ff` BOOL,
+`demo_88fae2dd` BOOL,
+`demo_891a8ee2` BOOL,
+`demo_89255282` BOOL,
+`demo_895b1c1d` BOOL,
+`demo_8961cec9` BOOL,
+`demo_89a228fe` BOOL,
+`demo_89d9f189` BOOL,
+`demo_8a2938e3` BOOL,
+`demo_8a561c83` BOOL,
+`demo_8a6a82b2` BOOL,
+`demo_8a9d333b` BOOL,
+`demo_8aa1b413` BOOL,
+`demo_8ad6835a` BOOL,
+`demo_8afe2d94` BOOL,
+`demo_8b05983d` BOOL,
+`demo_8b114baa` BOOL,
+`demo_8b3ac54e` BOOL,
+`demo_8b536d65` BOOL,
+`demo_8b57d8c9` BOOL,
+`demo_8c0e2725` BOOL,
+`demo_8c5b2ba0` BOOL,
+`demo_8c6529a5` BOOL,
+`demo_8c7e1e47` BOOL,
+`demo_8c953eab` BOOL,
+`demo_8cabbe32` BOOL,
+`demo_8cbc99b9` BOOL,
+`demo_8ccbdc25` BOOL,
+`demo_8cd0a79c` BOOL,
+`demo_8cde1a66` BOOL,
+`demo_8ce828c8` BOOL,
+`demo_8cf4d567` BOOL,
+`demo_8cf69eb0` BOOL,
+`demo_8d568a05` BOOL,
+`demo_8d8836b6` BOOL,
+`demo_8dc21db0` BOOL,
+`demo_8dd53841` BOOL,
+`demo_8ddaf7f7` BOOL,
+`demo_8e6cf715` BOOL,
+`demo_8e6cf716` BOOL,
+`demo_8e6cf717` BOOL,
+`demo_8e86d2c8` BOOL,
+`demo_8ef9b2e2` BOOL,
+`demo_8f556ba7` BOOL,
+`demo_8f6f002f` BOOL,
+`demo_8fa1442c` BOOL,
+`demo_8fe271e4` BOOL,
+`demo_8ffc192b` BOOL,
+`demo_901ae7e9` BOOL,
+`demo_909a5196` BOOL,
+`demo_90ad1bbc` BOOL,
+`demo_9110c583` BOOL,
+`demo_917fb290` BOOL,
+`demo_918272f0` BOOL,
+`demo_918ade63` BOOL,
+`demo_91a3f39c` BOOL,
+`demo_91dee651` BOOL,
+`demo_924bb8f7` BOOL,
+`demo_92828e5e` BOOL,
+`demo_92bc58e3` BOOL,
+`demo_92efc2e9` BOOL,
+`demo_932e24be` BOOL,
+`demo_9378a995` BOOL,
+`demo_9389a51a` BOOL,
+`demo_93af2da2` BOOL,
+`demo_93e1255d` BOOL,
+`demo_945838c6` BOOL,
+`demo_945d8ec4` BOOL,
+`demo_945ff4f5` BOOL,
+`demo_9492ceac` BOOL,
+`demo_952ada3e` BOOL,
+`demo_953d7a1b` BOOL,
+`demo_9562788d` BOOL,
+`demo_9578bf0d` BOOL,
+`demo_9585b278` BOOL,
+`demo_95b1c2f5` BOOL,
+`demo_95b7f5b6` BOOL,
+`demo_960f0277` BOOL,
+`demo_96355ae1` BOOL,
+`demo_966e51cd` BOOL,
+`demo_9691f883` BOOL,
+`demo_96fa400b` BOOL,
+`demo_97252731` BOOL,
+`demo_9737f1a6` BOOL,
+`demo_974b3d82` BOOL,
+`demo_9761f64a` BOOL,
+`demo_97c9cacf` BOOL,
+`demo_980c5972` BOOL,
+`demo_982513d3` BOOL,
+`demo_98a6d232` BOOL,
+`demo_98b76bac` BOOL,
+`demo_98f6a82e` BOOL,
+`demo_99131ee0` BOOL,
+`demo_991e1ac1` BOOL,
+`demo_99465e7d` BOOL,
+`demo_999fae5c` BOOL,
+`demo_99a5aee4` BOOL,
+`demo_99df2ca6` BOOL,
+`demo_99df2e9b` BOOL,
+`demo_99e9c339` BOOL,
+`demo_9a062c09` BOOL,
+`demo_9a140c76` BOOL,
+`demo_9a60dcb0` BOOL,
+`demo_9a7e7f9a` BOOL,
+`demo_9a81c391` BOOL,
+`demo_9ab9f45a` BOOL,
+`demo_9ae01ad9` BOOL,
+`demo_9b1c9300` BOOL,
+`demo_9b47482a` BOOL,
+`demo_9b837b0e` BOOL,
+`demo_9b91e8b4` BOOL,
+`demo_9ba2368a` BOOL,
+`demo_9c00329a` BOOL,
+`demo_9c118794` BOOL,
+`demo_9c4a7c1b` BOOL,
+`demo_9c626e28` BOOL,
+`demo_9ca38734` BOOL,
+`demo_9cbfc3da` BOOL,
+`demo_9cc245cb` BOOL,
+`demo_9d2ede3c` BOOL,
+`demo_9d5f6c92` BOOL,
+`demo_9e85b8ad` BOOL,
+`demo_9ea16f8e` BOOL,
+`demo_9f16fab1` BOOL,
+`demo_9f448280` BOOL,
+`demo_9f4f10a4` BOOL,
+`demo_9fd205c0` BOOL,
+`demo_a062c843` BOOL,
+`demo_a0b08634` BOOL,
+`demo_a0ea87a6` BOOL,
+`demo_a13d3bc9` BOOL,
+`demo_a197c743` BOOL,
+`demo_a1a054a6` BOOL,
+`demo_a2466ab8` BOOL,
+`demo_a254022e` BOOL,
+`demo_a2606b0d` BOOL,
+`demo_a26a71db` BOOL,
+`demo_a281783b` BOOL,
+`demo_a3559692` BOOL,
+`demo_a3697e4c` BOOL,
+`demo_a36b6de2` BOOL,
+`demo_a389edca` BOOL,
+`demo_a3a528df` BOOL,
+`demo_a3a9d98b` BOOL,
+`demo_a3aa30c3` BOOL,
+`demo_a406c444` BOOL,
+`demo_a43a127e` BOOL,
+`demo_a43bc418` BOOL,
+`demo_a44292e3` BOOL,
+`demo_a57edd43` BOOL,
+`demo_a5a5b3c1` BOOL,
+`demo_a5dfcb53` BOOL,
+`demo_a5f17a52` BOOL,
+`demo_a67d071a` BOOL,
+`demo_a6aa82cb` BOOL,
+`demo_a6beb260` BOOL,
+`demo_a6d8c10e` BOOL,
+`demo_a6ecb786` BOOL,
+`demo_a7156cc0` BOOL,
+`demo_a73a8848` BOOL,
+`demo_a7610ed8` BOOL,
+`demo_a76ed004` BOOL,
+`demo_a7ab172b` BOOL,
+`demo_a7e58cda` BOOL,
+`demo_a7ebf934` BOOL,
+`demo_a82699e0` BOOL,
+`demo_a8552e84` BOOL,
+`demo_a85e7785` BOOL,
+`demo_a864f379` BOOL,
+`demo_a8a41835` BOOL,
+`demo_a8d2a708` BOOL,
+`demo_a8d3a937` BOOL,
+`demo_a8d8ad46` BOOL,
+`demo_a9703f0c` BOOL,
+`demo_a9e2a654` BOOL,
+`demo_a9f8c6d7` BOOL,
+`demo_a9fdf4b4` BOOL,
+`demo_aa1b5f9a` BOOL,
+`demo_aa2d4480` BOOL,
+`demo_aa4e24bf` BOOL,
+`demo_aa7d865d` BOOL,
+`demo_aa8faab7` BOOL,
+`demo_aa90316d` BOOL,
+`demo_aabd63b7` BOOL,
+`demo_aac09a88` BOOL,
+`demo_aaccc373` BOOL,
+`demo_ab323f04` BOOL,
+`demo_ab70ac21` BOOL,
+`demo_ab86816c` BOOL,
+`demo_abb90ca2` BOOL,
+`demo_abd083ea` BOOL,
+`demo_abe1271b` BOOL,
+`demo_abf14e1a` BOOL,
+`demo_abf91057` BOOL,
+`demo_ac42b5a2` BOOL,
+`demo_ac58c905` BOOL,
+`demo_ac9d3727` BOOL,
+`demo_acdb35d4` BOOL,
+`demo_ad511669` BOOL,
+`demo_adf5d5a8` BOOL,
+`demo_ae2f74fa` BOOL,
+`demo_ae4e7323` BOOL,
+`demo_ae56cec3` BOOL,
+`demo_ae608094` BOOL,
+`demo_ae65a09f` BOOL,
+`demo_ae704bfd` BOOL,
+`demo_ae871f40` BOOL,
+`demo_aebd3a3a` BOOL,
+`demo_aefeefa5` BOOL,
+`demo_af1113b4` BOOL,
+`demo_af16fa52` BOOL,
+`demo_af173237` BOOL,
+`demo_af37bd93` BOOL,
+`demo_af3d4c75` BOOL,
+`demo_aff3883f` BOOL,
+`demo_b006bbd1` BOOL,
+`demo_b037aa7c` BOOL,
+`demo_b095b6d2` BOOL,
+`demo_b0ea6350` BOOL,
+`demo_b19f63e9` BOOL,
+`demo_b2458d1c` BOOL,
+`demo_b2dba7bd` BOOL,
+`demo_b326ccfc` BOOL,
+`demo_b3d7577d` BOOL,
+`demo_b3e402d1` BOOL,
+`demo_b3fdcfa5` BOOL,
+`demo_b407c2f6` BOOL,
+`demo_b41b0f88` BOOL,
+`demo_b43e206f` BOOL,
+`demo_b44a6d43` BOOL,
+`demo_b45eb7c9` BOOL,
+`demo_b4a48a4c` BOOL,
+`demo_b4fa5a87` BOOL,
+`demo_b532cd93` BOOL,
+`demo_b5402bf1` BOOL,
+`demo_b592bc7b` BOOL,
+`demo_b5e17730` BOOL,
+`demo_b637ccec` BOOL,
+`demo_b6a1c047` BOOL,
+`demo_b6e023f0` BOOL,
+`demo_b75c6aef` BOOL,
+`demo_b7a37cc0` BOOL,
+`demo_b7e53350` BOOL,
+`demo_b7f61e89` BOOL,
+`demo_b817f881` BOOL,
+`demo_b842e7ec` BOOL,
+`demo_b8ec852c` BOOL,
+`demo_b901ce2f` BOOL,
+`demo_b920b626` BOOL,
+`demo_b92fa1ae` BOOL,
+`demo_b97669a9` BOOL,
+`demo_b99d5408` BOOL,
+`demo_b9c0f2b2` BOOL,
+`demo_b9d1502d` BOOL,
+`demo_ba0fcee7` BOOL,
+`demo_ba34cf40` BOOL,
+`demo_ba47bba1` BOOL,
+`demo_bab9ddbc` BOOL,
+`demo_bb46eb02` BOOL,
+`demo_bb5a862b` BOOL,
+`demo_bb663599` BOOL,
+`demo_bb7cf748` BOOL,
+`demo_bb94a1db` BOOL,
+`demo_bba4a1a4` BOOL,
+`demo_bbc8187c` BOOL,
+`demo_bbf2b1d1` BOOL,
+`demo_bc1190fb` BOOL,
+`demo_bc246ec5` BOOL,
+`demo_bc53c280` BOOL,
+`demo_bca5c01c` BOOL,
+`demo_bcff2992` BOOL,
+`demo_bd106ef8` BOOL,
+`demo_bd6b1a9d` BOOL,
+`demo_bdbb033f` BOOL,
+`demo_bdd16ed2` BOOL,
+`demo_bdee1098` BOOL,
+`demo_bdf52964` BOOL,
+`demo_be3fbd72` BOOL,
+`demo_be5b4fc6` BOOL,
+`demo_beba3622` BOOL,
+`demo_beca2408` BOOL,
+`demo_bef11eb3` BOOL,
+`demo_bf127e07` BOOL,
+`demo_bf479349` BOOL,
+`demo_bf65a4a9` BOOL,
+`demo_bf9f8566` BOOL,
+`demo_bfa10032` BOOL,
+`demo_bfa64ac2` BOOL,
+`demo_c06f1f3a` BOOL,
+`demo_c08ebdc8` BOOL,
+`demo_c09afec5` BOOL,
+`demo_c09b0f5a` BOOL,
+`demo_c0ccc685` BOOL,
+`demo_c0d285ba` BOOL,
+`demo_c0d69319` BOOL,
+`demo_c0e8d55f` BOOL,
+`demo_c0f94dc7` BOOL,
+`demo_c16ec8be` BOOL,
+`demo_c1797828` BOOL,
+`demo_c1a211fc` BOOL,
+`demo_c1dbb533` BOOL,
+`demo_c238fcd3` BOOL,
+`demo_c25f733e` BOOL,
+`demo_c27b0fd2` BOOL,
+`demo_c2d481a1` BOOL,
+`demo_c2f76ce9` BOOL,
+`demo_c32d17c9` BOOL,
+`demo_c34b76b6` BOOL,
+`demo_c36bbd6b` BOOL,
+`demo_c3ffad82` BOOL,
+`demo_c41958b6` BOOL,
+`demo_c4511cd6` BOOL,
+`demo_c522b05f` BOOL,
+`demo_c53ad3f4` BOOL,
+`demo_c54576b7` BOOL,
+`demo_c578d13b` BOOL,
+`demo_c5b977b4` BOOL,
+`demo_c5c92812` BOOL,
+`demo_c5d5dcf6` BOOL,
+`demo_c5eb51a8` BOOL,
+`demo_c64e665f` BOOL,
+`demo_c666999a` BOOL,
+`demo_c671e9d3` BOOL,
+`demo_c6740186` BOOL,
+`demo_c67b5a68` BOOL,
+`demo_c6a4aa55` BOOL,
+`demo_c6c4e1a3` BOOL,
+`demo_c6c51cb7` BOOL,
+`demo_c6ca3a05` BOOL,
+`demo_c6e8f140` BOOL,
+`demo_c708180e` BOOL,
+`demo_c70fbe5f` BOOL,
+`demo_c77cea0f` BOOL,
+`demo_c78f033e` BOOL,
+`demo_c7beeac0` BOOL,
+`demo_c7ed48d5` BOOL,
+`demo_c82be067` BOOL,
+`demo_c844071e` BOOL,
+`demo_c858798c` BOOL,
+`demo_c899f493` BOOL,
+`demo_c8ac5f2b` BOOL,
+`demo_c8b53c1d` BOOL,
+`demo_c8df5a17` BOOL,
+`demo_c8df9e1c` BOOL,
+`demo_c8fc0e5b` BOOL,
+`demo_c9197537` BOOL,
+`demo_c932b7d6` BOOL,
+`demo_c99b64e0` BOOL,
+`demo_c9b93452` BOOL,
+`demo_c9d9fba6` BOOL,
+`demo_ca1083e0` BOOL,
+`demo_ca1d3d34` BOOL,
+`demo_ca43b567` BOOL,
+`demo_caa6d814` BOOL,
+`demo_cac4b10f` BOOL,
+`demo_cb06249e` BOOL,
+`demo_cb2273b1` BOOL,
+`demo_cb41b969` BOOL,
+`demo_cb5d997e` BOOL,
+`demo_cbaafc9f` BOOL,
+`demo_cbcde724` BOOL,
+`demo_cbdec229` BOOL,
+`demo_cc788df8` BOOL,
+`demo_cc896fb7` BOOL,
+`demo_cc93a002` BOOL,
+`demo_ccc1d77c` BOOL,
+`demo_cd31db47` BOOL,
+`demo_cd57ad3b` BOOL,
+`demo_cdb4d45e` BOOL,
+`demo_cdd6b836` BOOL,
+`demo_cdf26b32` BOOL,
+`demo_cec952e2` BOOL,
+`demo_cf1bd0d4` BOOL,
+`demo_cf298294` BOOL,
+`demo_cf3db0b8` BOOL,
+`demo_cf4cc8c9` BOOL,
+`demo_cf85e4f2` BOOL,
+`demo_cfa0bc4b` BOOL,
+`demo_cfaeb928` BOOL,
+`demo_cff65179` BOOL,
+`demo_d0029822` BOOL,
+`demo_d00479a9` BOOL,
+`demo_d0905fb9` BOOL,
+`demo_d099006b` BOOL,
+`demo_d0ef411c` BOOL,
+`demo_d11b1704` BOOL,
+`demo_d14c81bc` BOOL,
+`demo_d16e9576` BOOL,
+`demo_d19f5482` BOOL,
+`demo_d1de96bd` BOOL,
+`demo_d20cc703` BOOL,
+`demo_d21a8965` BOOL,
+`demo_d2268f22` BOOL,
+`demo_d266a8a3` BOOL,
+`demo_d2d4c5e7` BOOL,
+`demo_d3082fb8` BOOL,
+`demo_d30d59e3` BOOL,
+`demo_d37dafae` BOOL,
+`demo_d39d7ac8` BOOL,
+`demo_d3de2f8c` BOOL,
+`demo_d3f07f55` BOOL,
+`demo_d41c7532` BOOL,
+`demo_d45daa2e` BOOL,
+`demo_d4b5e42f` BOOL,
+`demo_d4b62f7d` BOOL,
+`demo_d4b96e68` BOOL,
+`demo_d56e6bd2` BOOL,
+`demo_d5867fb6` BOOL,
+`demo_d5b6d69b` BOOL,
+`demo_d5d9536b` BOOL,
+`demo_d5dc0eed` BOOL,
+`demo_d5eb75ac` BOOL,
+`demo_d5f06c23` BOOL,
+`demo_d625590b` BOOL,
+`demo_d6935361` BOOL,
+`demo_d6bb1474` BOOL,
+`demo_d7370d46` BOOL,
+`demo_d74f7646` BOOL,
+`demo_d7991220` BOOL,
+`demo_d83f8ab2` BOOL,
+`demo_d86b0cf5` BOOL,
+`demo_d898f8a9` BOOL,
+`demo_d8c49b5b` BOOL,
+`demo_d8d437cf` BOOL,
+`demo_d9d74d43` BOOL,
+`demo_da280dd3` BOOL,
+`demo_da3ef3bb` BOOL,
+`demo_da56ae71` BOOL,
+`demo_da58fb20` BOOL,
+`demo_da9667fd` BOOL,
+`demo_da97a9ba` BOOL,
+`demo_daa51f97` BOOL,
+`demo_dabced5a` BOOL,
+`demo_db2fca1b` BOOL,
+`demo_db7f468b` BOOL,
+`demo_db9ee5a6` BOOL,
+`demo_dbabed82` BOOL,
+`demo_dc0d2cc2` BOOL,
+`demo_dcaa5d06` BOOL,
+`demo_dcb2c52b` BOOL,
+`demo_dce859d5` BOOL,
+`demo_dce9b3a9` BOOL,
+`demo_dd8dfb91` BOOL,
+`demo_dd9ea332` BOOL,
+`demo_ddcb8d46` BOOL,
+`demo_dde250df` BOOL,
+`demo_ddf7da57` BOOL,
+`demo_de5d77f3` BOOL,
+`demo_de609962` BOOL,
+`demo_de7e0560` BOOL,
+`demo_de8ac875` BOOL,
+`demo_dea59b03` BOOL,
+`demo_ded9b81e` BOOL,
+`demo_dede0d16` BOOL,
+`demo_df1c1211` BOOL,
+`demo_df4fbd13` BOOL,
+`demo_df569a55` BOOL,
+`demo_df8e71ef` BOOL,
+`demo_dfb3579d` BOOL,
+`demo_dfdb1214` BOOL,
+`demo_e023b173` BOOL,
+`demo_e0527a45` BOOL,
+`demo_e0790ee3` BOOL,
+`demo_e08929ca` BOOL,
+`demo_e1207c13` BOOL,
+`demo_e1336301` BOOL,
+`demo_e16710ee` BOOL,
+`demo_e18e1104` BOOL,
+`demo_e18f4ccb` BOOL,
+`demo_e22e1de7` BOOL,
+`demo_e2366754` BOOL,
+`demo_e25f1e54` BOOL,
+`demo_e26f9f6f` BOOL,
+`demo_e270d4c3` BOOL,
+`demo_e29881ee` BOOL,
+`demo_e2a3b62f` BOOL,
+`demo_e2c91d0e` BOOL,
+`demo_e2d3879a` BOOL,
+`demo_e36f259a` BOOL,
+`demo_e37ddee6` BOOL,
+`demo_e3e1d5bc` BOOL,
+`demo_e3e936d2` BOOL,
+`demo_e41d3eb3` BOOL,
+`demo_e42895b3` BOOL,
+`demo_e437ab04` BOOL,
+`demo_e467cacc` BOOL,
+`demo_e495210f` BOOL,
+`demo_e4dd7477` BOOL,
+`demo_e5d83f11` BOOL,
+`demo_e5d8679f` BOOL,
+`demo_e5f3843c` BOOL,
+`demo_e5fcd6b1` BOOL,
+`demo_e6726a5e` BOOL,
+`demo_e6df39c2` BOOL,
+`demo_e6f24bda` BOOL,
+`demo_e77bd400` BOOL,
+`demo_e78dc4ac` BOOL,
+`demo_e7a124ae` BOOL,
+`demo_e7c9c624` BOOL,
+`demo_e7f6cdab` BOOL,
+`demo_e80bbead` BOOL,
+`demo_e826ab4a` BOOL,
+`demo_e8298cfd` BOOL,
+`demo_e83192e0` BOOL,
+`demo_e88e9f1a` BOOL,
+`demo_e8a474ad` BOOL,
+`demo_e8ad9ff2` BOOL,
+`demo_e8c0f97e` BOOL,
+`demo_e8f0f3af` BOOL,
+`demo_e90af6a5` BOOL,
+`demo_e93e95cc` BOOL,
+`demo_e9407cdc` BOOL,
+`demo_e95c345d` BOOL,
+`demo_e980bd76` BOOL,
+`demo_e9ac9035` BOOL,
+`demo_e9f16918` BOOL,
+`demo_e9f8a8f3` BOOL,
+`demo_ea0a5cab` BOOL,
+`demo_ea3eec91` BOOL,
+`demo_ea75d4c2` BOOL,
+`demo_ea92220b` BOOL,
+`demo_eb075ab4` BOOL,
+`demo_eb521258` BOOL,
+`demo_eb576746` BOOL,
+`demo_eb7c8143` BOOL,
+`demo_ec298faa` BOOL,
+`demo_ed3b2a3f` BOOL,
+`demo_ed8f93cd` BOOL,
+`demo_eea5c67f` BOOL,
+`demo_eeada2d3` BOOL,
+`demo_eede7f64` BOOL,
+`demo_ef323f71` BOOL,
+`demo_ef765c70` BOOL,
+`demo_ef8475b8` BOOL,
+`demo_efb32625` BOOL,
+`demo_efcb3b63` BOOL,
+`demo_f08f9a8b` BOOL,
+`demo_f095d45f` BOOL,
+`demo_f0f81303` BOOL,
+`demo_f14a8b8f` BOOL,
+`demo_f158e7f3` BOOL,
+`demo_f17e93af` BOOL,
+`demo_f19068ec` BOOL,
+`demo_f190df08` BOOL,
+`demo_f1a12d4d` BOOL,
+`demo_f1ac0d9b` BOOL,
+`demo_f20f982e` BOOL,
+`demo_f2227d2e` BOOL,
+`demo_f236023f` BOOL,
+`demo_f24176d4` BOOL,
+`demo_f29faf8c` BOOL,
+`demo_f2b3f801` BOOL,
+`demo_f2c96037` BOOL,
+`demo_f2cc3781` BOOL,
+`demo_f33e3d6b` BOOL,
+`demo_f36853fe` BOOL,
+`demo_f3b585a1` BOOL,
+`demo_f3c2539f` BOOL,
+`demo_f48e7e55` BOOL,
+`demo_f4989d42` BOOL,
+`demo_f4a88076` BOOL,
+`demo_f4c1be9f` BOOL,
+`demo_f4e70396` BOOL,
+`demo_f4f55e47` BOOL,
+`demo_f59063fd` BOOL,
+`demo_f6033734` BOOL,
+`demo_f64fcf66` BOOL,
+`demo_f71a6213` BOOL,
+`demo_f7286b67` BOOL,
+`demo_f75319a3` BOOL,
+`demo_f76db87e` BOOL,
+`demo_f780a203` BOOL,
+`demo_f7a90d37` BOOL,
+`demo_f7b3f342` BOOL,
+`demo_f7b9b285` BOOL,
+`demo_f82e1b5d` BOOL,
+`demo_f83ba624` BOOL,
+`demo_f8bf874d` BOOL,
+`demo_f8e0d7e3` BOOL,
+`demo_f8eaa541` BOOL,
+`demo_f92d9fb9` BOOL,
+`demo_f93b8c54` BOOL,
+`demo_f95a9988` BOOL,
+`demo_f98d50ef` BOOL,
+`demo_f9995411` BOOL,
+`demo_f9bdc632` BOOL,
+`demo_fa369fde` BOOL,
+`demo_fa848e3f` BOOL,
+`demo_fa9486e8` BOOL,
+`demo_fa956c3c` BOOL,
+`demo_faafd03a` BOOL,
+`demo_fade2664` BOOL,
+`demo_fadfdaa7` BOOL,
+`demo_faf28bd4` BOOL,
+`demo_fb043f35` BOOL,
+`demo_fb63ada8` BOOL,
+`demo_fb6ba814` BOOL,
+`demo_fbd4ae6a` BOOL,
+`demo_fc8e6b94` BOOL,
+`demo_fca38c63` BOOL,
+`demo_fcb69ee2` BOOL,
+`demo_fcd3dde9` BOOL,
+`demo_fcfa2286` BOOL,
+`demo_fd8bb132` BOOL,
+`demo_fd8cea04` BOOL,
+`demo_fe02f3d0` BOOL,
+`demo_fe06bf80` BOOL,
+`demo_fe08de0a` BOOL,
+`demo_fe196a20` BOOL,
+`demo_fe24e4f3` BOOL,
+`demo_fe300282` BOOL,
+`demo_fe32ae8f` BOOL,
+`demo_fe67adcb` BOOL,
+`demo_fe680e3a` BOOL,
+`demo_fe68cf30` BOOL,
+`demo_fed72471` BOOL,
+`demo_ff0b7eef` BOOL,
+`demo_ff32101b` BOOL,
+`demo_ff4d4d4c` BOOL,
+`demo_ff66b648` BOOL,
+`demo_ff6c8b0d` BOOL,
+`demo_ff7e39ce` BOOL,
+`demo_g22539c5` BOOL,
+`demo_gce28a1b` BOOL,
+`demo_h4c0cfd7` BOOL,
+`demo_h6825cb9` BOOL,
+`demo_had0ca12` BOOL,
+`demo_hc03fda5` BOOL,
+`demo_hdf4a3dc` BOOL,
+`demo_he3a9a58` BOOL,
+`demo_i2347355` BOOL,
+`demo_i432f155` BOOL,
+`demo_ia417dd6` BOOL,
+`demo_ic018c03` BOOL,
+`demo_ieb80b2e` BOOL,
+`demo_j05ac8e3` BOOL,
+`demo_j4c4f236` BOOL,
+`demo_j54cb9fe` BOOL,
+`demo_j91027c9` BOOL,
+`demo_j943486e` BOOL,
+`demo_j9552d3d` BOOL,
+`demo_ja6207ee` BOOL,
+`demo_jf94f908` BOOL,
+`demo_k3819893` BOOL,
+`demo_k5ded17c` BOOL,
+`demo_k608b725` BOOL,
+`demo_k79d2b0c` BOOL,
+`demo_k843fb22` BOOL,
+`demo_k934d6fb` BOOL,
+`demo_k9f0f32a` BOOL,
+`demo_kd2f6570` BOOL,
+`demo_kdc857ea` BOOL,
+`demo_l4750181` BOOL,
+`demo_l6d87179` BOOL,
+`demo_l7085ed3` BOOL,
+`demo_l8a68939` BOOL,
+`demo_m2dc6845` BOOL,
+`demo_m6e942a1` BOOL,
+`demo_mf73aab7` BOOL,
+`demo_n1149f01` BOOL,
+`demo_n6dce776` BOOL,
+`demo_n8d7db61` BOOL,
+`demo_n9ecb3de` BOOL,
+`demo_na1deaa9` BOOL,
+`demo_o7507544` BOOL,
+`demo_obb49119` BOOL,
+`demo_offd2ba0` BOOL,
+`demo_p2e4532f` BOOL,
+`demo_p5c64a14` BOOL,
+`demo_p7027854` BOOL,
+`demo_p867d4c1` BOOL,
+`demo_p8dd9585` BOOL,
+`demo_pbc78e33` BOOL,
+`demo_pdb337f7` BOOL,
+`demo_q09db089` BOOL,
+`demo_q198d4c6` BOOL,
+`demo_q4c0b428` BOOL,
+`demo_q4e7c8f4` BOOL,
+`demo_q6d97b44` BOOL,
+`demo_q871e77c` BOOL,
+`demo_qaec6650` BOOL,
+`demo_r2668107` BOOL,
+`demo_r585088b` BOOL,
+`demo_s19d6e48` BOOL,
+`demo_s54a9868` BOOL,
+`demo_s787269b` BOOL,
+`demo_sc360725` BOOL,
+`demo_t24e55d3` BOOL,
+`demo_te4527b0` BOOL,
+`demo_u48634da` BOOL,
+`demo_u9a3dacd` BOOL,
+`demo_v0f4948a` BOOL,
+`demo_v1d470d9` BOOL,
+`demo_v5e58cee` BOOL,
+`demo_va159272` BOOL,
+`demo_vb7aa4b5` BOOL,
+`demo_ved99e14` BOOL,
+`demo_vf3f72d9` BOOL,
+    `inventory_type` VARCHAR(64) DEFAULT '',
+    `publisher` VARCHAR(64) DEFAULT '',
+    `capacity` BIGINT DEFAULT '0',
+    `realdate_est` DATE,
+    `day_of_week` INT DEFAULT '-1',
+    `hour_of_day` INT DEFAULT '-1',
+    `distribution_partner` VARCHAR(64) DEFAULT '',
+    `inventory_location` VARCHAR(64) DEFAULT '',
+    `clip` VARCHAR(64) DEFAULT '',
+    `entitlement` VARCHAR(64) DEFAULT '',
+    `authorization_provider` VARCHAR(64) DEFAULT '',
+SHARD KEY(realdate_est, inventory_id),
+KEY (realdate_est) USING CLUSTERED COLUMNSTORE)
+AUTOSTATS_SAMPLING = OFF
+COMMENT = "timestamp=2026-05-28T09:17:04.870169158,runner_id=disney_plus -> 3575,fx -> 3750,abc_news_chicago -> 3761,abc_news_north_carolina -> 3756,hulu -> 3766,national_geographic -> 3760,abc_news_los_angeles -> 3758,abc_news_houston -> 3762,espn -> 3765,abc_news_bay_area -> 3753,abc_news -> 3759,abc -> 3757,fubo_tv -> 3754,abc_news_philadelphia -> 3752,abc_news_new_york -> 3751,freeform -> 3755,abc_news_central_california -> 3763";
+
+Cleared s3 path before pipeline start: s3a://ap-ifp-data-landing-uat-uw2/adi-ifp/ifp-olap-sink/date=2026-05-09/
+Creating pipeline create_line_item_capacity_pipeline_2026_05_09 (target=line_item_capacity_tmp, source=s3://ap-ifp-data-landing-uat-uw2/adi-ifp/ifp-olap-sink/date=2026-05-09/)
+Writing data to S3 path with date partition: s3a://ap-ifp-data-landing-uat-uw2/adi-ifp/ifp-olap-sink/date=2026-05-09/
+[2026-05-28T09:18:40.424+0000][695.157s][info][gc] GC(14) Pause Young (Allocation Failure) 32913M->1034M(97610M) 57.725ms
+[2026-05-28T09:38:21.055+0000][1875.788s][info][gc] GC(15) Pause Young (Allocation Failure) 32831M->1266M(97818M) 61.396ms

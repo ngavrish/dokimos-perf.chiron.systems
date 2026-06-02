@@ -54,5 +54,10 @@
     ],
     "endpoints": 3
   },
-  "share_hash": "9dGMKxaMcV0"
+  "share_hash": "9dGMKxaMcV0",
+  "regenerated_at": "2026-06-02T12:39:14+02:00",
+  "databricks": {
+    "files_saved": 18,
+    "bytes_saved": 1547189
+  }
 }

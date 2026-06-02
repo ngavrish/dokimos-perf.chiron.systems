@@ -45,11 +45,21 @@ from datetime import datetime, date, timedelta
 from typing import Optional, Tuple
 from zoneinfo import ZoneInfo
 
-from .analyzer import (
-    PORT,
-    REPORT_CSS_BASE,
-    generate_report_for_urls,
-)
+# Import works in two modes:
+#   * package install (`python -m rp_perf_report`)  -> relative
+#   * direct script (`python spa.py`)               -> absolute via sys.path[0]
+try:
+    from .analyzer import (
+        PORT,
+        REPORT_CSS_BASE,
+        generate_report_for_urls,
+    )
+except ImportError:
+    from analyzer import (  # type: ignore[no-redef]
+        PORT,
+        REPORT_CSS_BASE,
+        generate_report_for_urls,
+    )
 
 # --------------------------------------------------------------------------- #
 # Sprint window
@@ -525,7 +535,8 @@ def _generate_share_hash() -> str:
     return secrets.token_urlsafe(8)
 
 
-def _save_report(html: str, urls: list, analyzer_meta: dict, report_password: str) -> dict:
+def _save_report(html: str, urls: list, analyzer_meta: dict, report_password: str,
+                 dbx_log_dir: Optional[str] = None) -> dict:
     """Persist a generated report to disk and return the public list entry.
 
     SECURITY-REVIEW: ``report_password`` is the AES-256-GCM password the
@@ -550,6 +561,25 @@ def _save_report(html: str, urls: list, analyzer_meta: dict, report_password: st
     with open(os.path.join(report_path, "index.html"), "w") as fp:
         fp.write(html)
 
+    # Persist the uploaded Databricks log set alongside the report so the
+    # source data sticks with the artifact -- useful for regenerating later,
+    # or just reading a particular log file from the report's directory.
+    # We copy rather than move because the caller is still responsible for
+    # cleaning up the tempdir in their finally block.
+    databricks_files_saved = 0
+    databricks_bytes_saved = 0
+    if dbx_log_dir and os.path.isdir(dbx_log_dir):
+        import shutil
+        dst = os.path.join(report_path, "databricks_logs")
+        os.makedirs(dst, exist_ok=True)
+        for fname in sorted(os.listdir(dbx_log_dir)):
+            src = os.path.join(dbx_log_dir, fname)
+            if not os.path.isfile(src):
+                continue
+            shutil.copy2(src, os.path.join(dst, fname))
+            databricks_files_saved += 1
+            databricks_bytes_saved += os.path.getsize(src)
+
     title = now_la.strftime("%Y-%m-%d %H:%M") + f"  ({num_launches} launch{'es' if num_launches != 1 else ''})"
     metadata = {
         "id":           report_id,
@@ -560,6 +590,10 @@ def _save_report(html: str, urls: list, analyzer_meta: dict, report_password: st
         "num_launches": num_launches,
         "urls":         urls,
         "analyzer":     analyzer_meta,
+        "databricks": {
+            "files_saved": databricks_files_saved,
+            "bytes_saved": databricks_bytes_saved,
+        } if databricks_files_saved else None,
     }
     with open(os.path.join(report_path, "metadata.json"), "w") as fp:
         json.dump(metadata, fp, indent=2)
@@ -594,15 +628,56 @@ def _generate_report_password() -> str:
     return secrets.token_urlsafe(12)
 
 
-def _run_generation(urls: list, payload_key: Optional[str] = None) -> dict:
+def _run_generation(urls: list, payload_key: Optional[str] = None,
+                    databricks_log_dir: Optional[str] = None) -> dict:
     report_password = _generate_report_password()
     html, meta = generate_report_for_urls(
         urls,
         payload_key=payload_key,
         log=lambda m: None,
         report_password=report_password,
+        databricks_log_dir=databricks_log_dir,
     )
-    return _save_report(html, urls, meta, report_password)
+    return _save_report(html, urls, meta, report_password, dbx_log_dir=databricks_log_dir)
+
+
+# Filenames the Databricks log parser knows how to read. Used to gate the
+# files we'll accept from the SPA upload area -- anything else is dropped
+# silently to avoid spilling stray data into the tempdir.
+_DBX_FILENAME_PREFIXES = ("log4j-", "stdout", "stderr")
+
+
+def _materialize_databricks_uploads(files: list) -> Optional[str]:
+    """Decode a list of {name, data_b64} dicts into a fresh tempdir. Returns
+    the directory path, or None if no recognized files were provided. The
+    caller is responsible for shutil.rmtree() on the returned path."""
+    if not isinstance(files, list) or not files:
+        return None
+    import base64
+    import os
+    import tempfile
+
+    tmpdir = tempfile.mkdtemp(prefix="dokimos_dbx_")
+    written = 0
+    for f in files:
+        if not isinstance(f, dict):
+            continue
+        name = os.path.basename(str(f.get("name") or ""))
+        if not name or not name.startswith(_DBX_FILENAME_PREFIXES):
+            continue
+        try:
+            raw = base64.b64decode(f.get("data") or "", validate=False)
+        except Exception:
+            continue
+        with open(os.path.join(tmpdir, name), "wb") as out:
+            out.write(raw)
+        written += 1
+
+    if written == 0:
+        import shutil
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        return None
+    return tmpdir
 
 
 # --------------------------------------------------------------------------- #
@@ -902,6 +977,125 @@ html, body {
 .inbox-btn.remove { color: var(--red); border-color: rgba(226,101,101,0.5); }
 .inbox-btn.remove:hover { background: rgba(226,101,101,0.14); }
 .inbox-btn:disabled { opacity: 0.25; cursor: not-allowed; }
+
+/* ----- Databricks-logs upload section ----- */
+.dbx-section { margin: 6px 0 22px; }
+.dbx-section-head {
+    display: flex; align-items: baseline; gap: 12px;
+    margin-bottom: 8px;
+}
+.dbx-section-title {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    letter-spacing: 1.2px;
+    text-transform: uppercase;
+    color: var(--bronze);
+}
+.dbx-section-sub {
+    font-size: 12px;
+    color: rgba(255,255,255,0.45);
+}
+.dbx-dropzone {
+    border: 1px dashed rgba(205,127,50,0.35);
+    background: rgba(205,127,50,0.04);
+    border-radius: 6px;
+    padding: 18px 16px;
+    text-align: center;
+    cursor: pointer;
+    transition: background 120ms ease, border-color 120ms ease;
+    outline: none;
+}
+.dbx-dropzone:hover,
+.dbx-dropzone:focus-visible {
+    background: rgba(205,127,50,0.08);
+    border-color: rgba(205,127,50,0.65);
+}
+.dbx-dropzone.dragover {
+    background: rgba(205,127,50,0.15);
+    border-color: var(--bronze);
+    border-style: solid;
+}
+.dbx-dropzone-cta {
+    font-family: var(--font-mono);
+    font-size: 13px;
+    color: rgba(255,255,255,0.85);
+    margin-bottom: 4px;
+}
+.dbx-dropzone-hint {
+    font-size: 11.5px;
+    color: rgba(255,255,255,0.40);
+}
+.dbx-dropzone-hint code {
+    background: rgba(255,255,255,0.06);
+    padding: 1px 5px;
+    border-radius: 3px;
+    font-family: var(--font-mono);
+}
+.dbx-file-list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 10px;
+}
+.dbx-file-list:empty { display: none; }
+.dbx-file-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 6px 4px 10px;
+    background: var(--bg-card-hi);
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 4px;
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    color: rgba(255,255,255,0.85);
+}
+.dbx-file-chip.invalid {
+    border-color: rgba(226,101,101,0.45);
+    color: rgba(226,101,101,0.9);
+}
+.dbx-file-chip-size {
+    color: rgba(255,255,255,0.45);
+    font-size: 11px;
+}
+.dbx-file-chip-remove {
+    background: transparent;
+    border: none;
+    color: rgba(255,255,255,0.45);
+    cursor: pointer;
+    font-size: 14px;
+    padding: 0 4px;
+    line-height: 1;
+}
+.dbx-file-chip-remove:hover { color: var(--red); }
+.dbx-file-summary {
+    margin-top: 6px;
+    font-size: 11.5px;
+    color: rgba(255,255,255,0.55);
+    font-family: var(--font-mono);
+}
+.dbx-folder-link {
+    color: var(--bronze);
+    text-decoration: none;
+    border-bottom: 1px dotted rgba(205,127,50,0.6);
+    padding-bottom: 1px;
+}
+.dbx-folder-link:hover { color: #ffa867; border-bottom-color: #ffa867; }
+.busy-progress {
+    width: 100%;
+    height: 4px;
+    background: rgba(255,255,255,0.06);
+    border-radius: 2px;
+    overflow: hidden;
+    margin-top: 12px;
+}
+.busy-progress-bar {
+    height: 100%;
+    background: var(--bronze);
+    width: 0%;
+    transition: width 220ms ease;
+}
+.busy-progress.hidden { display: none; }
 
 /* ----- Primary action button ----- */
 .btn-primary {
@@ -1279,6 +1473,29 @@ SPA_HTML = f"""<!DOCTYPE html>
 
                 <div class="inboxes" id="inboxes"></div>
 
+                <div class="dbx-section" id="dbxSection">
+                    <div class="dbx-section-head">
+                        <span class="dbx-section-title">Databricks logs (optional)</span>
+                        <span class="dbx-section-sub">Adds a Timeline tab correlating job phases &amp; slow requests.</span>
+                    </div>
+                    <div class="dbx-dropzone" id="dbxDropzone" tabindex="0"
+                         onclick="document.getElementById('dbxFileInput').click()"
+                         onkeydown="if(event.key==='Enter'||event.key===' '){{event.preventDefault();document.getElementById('dbxFileInput').click();}}">
+                        <input type="file" id="dbxFileInput" multiple
+                               accept=".log,.gz,.txt"
+                               style="display:none">
+                        <input type="file" id="dbxFolderInput" multiple
+                               webkitdirectory directory
+                               style="display:none">
+                        <div class="dbx-dropzone-cta">Drop files or a folder here, or click to browse</div>
+                        <div class="dbx-dropzone-hint">
+                            <a href="#" class="dbx-folder-link" onclick="event.preventDefault();event.stopPropagation();document.getElementById('dbxFolderInput').click();">Pick a folder instead</a>
+                            &nbsp;&middot;&nbsp; Accepts <code>log4j-*.log[.gz]</code>, <code>stdout*.txt</code>, <code>stderr*.txt</code>. Other files are ignored.
+                        </div>
+                    </div>
+                    <div class="dbx-file-list" id="dbxFileList"></div>
+                </div>
+
                 <button class="btn-primary" id="generateBtn" onclick="generateReport()">Generate Report</button>
                 <div class="err-line" id="newError"></div>
 
@@ -1332,6 +1549,7 @@ SPA_HTML = f"""<!DOCTYPE html>
             <div class="busy-spinner"></div>
             <div class="busy-text" id="busyText">Generating report&hellip;</div>
             <div class="busy-sub" id="busySub">Fetching Report Portal logs &amp; rendering HTML</div>
+            <div class="busy-progress hidden" id="busyProgress"><div class="busy-progress-bar" id="busyProgressBar"></div></div>
         </div>
     </div>
 
@@ -1427,6 +1645,187 @@ SPA_HTML = f"""<!DOCTYPE html>
             if (text) document.getElementById('busyText').textContent = text;
             if (sub  != null) document.getElementById('busySub').textContent = sub;
             document.getElementById('generateBtn').disabled = !!on;
+            if (!on) {{ setProgress(null); }}
+        }}
+        function setProgress(pct) {{
+            const wrap = document.getElementById('busyProgress');
+            const bar  = document.getElementById('busyProgressBar');
+            if (!wrap || !bar) return;
+            if (pct == null) {{
+                wrap.classList.add('hidden');
+                bar.style.width = '0%';
+                return;
+            }}
+            wrap.classList.remove('hidden');
+            bar.style.width = Math.max(0, Math.min(100, pct)) + '%';
+        }}
+
+        // ----- Databricks log upload area -----
+        // Pending files live in this array; the chip list re-renders from it
+        // on every change. We don't read the bytes until the user clicks
+        // Generate so editing the selection is cheap.
+        const _dbxFiles = [];
+        const _DBX_PREFIXES = ['log4j-', 'stdout', 'stderr'];
+        function _dbxAccept(name) {{
+            for (const p of _DBX_PREFIXES) if (name.indexOf(p) === 0) return true;
+            return false;
+        }}
+        function _humanBytes(n) {{
+            if (n < 1024) return n + ' B';
+            if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+            return (n / 1024 / 1024).toFixed(2) + ' MB';
+        }}
+        function _dbxRender() {{
+            const list = document.getElementById('dbxFileList');
+            if (!list) return;
+            const accepted = _dbxFiles.filter(function(f) {{ return _dbxAccept(f.name); }});
+            const rejected = _dbxFiles.filter(function(f) {{ return !_dbxAccept(f.name); }});
+            const chips = _dbxFiles.map(function(f, idx) {{
+                const ok = _dbxAccept(f.name);
+                return '<span class="dbx-file-chip' + (ok ? '' : ' invalid') + '" title="'
+                    + (ok ? '' : 'Filename will be ignored by the parser') + '">'
+                    +   _escapeHtml(f.name)
+                    +   '<span class="dbx-file-chip-size">' + _humanBytes(f.size) + '</span>'
+                    +   '<button type="button" class="dbx-file-chip-remove" title="Remove" onclick="_dbxRemove(' + idx + ')">&times;</button>'
+                    + '</span>';
+            }}).join('');
+            let summary = '';
+            if (accepted.length) {{
+                const total = accepted.reduce(function(a, f) {{ return a + f.size; }}, 0);
+                summary = accepted.length + ' file' + (accepted.length === 1 ? '' : 's')
+                    + ' ready &middot; ' + _humanBytes(total) + ' total';
+                if (rejected.length) summary += ' &middot; ' + rejected.length + ' ignored';
+            }} else if (rejected.length) {{
+                summary = 'No recognized files yet';
+            }}
+            list.innerHTML = chips + (summary ? '<div class="dbx-file-summary">' + summary + '</div>' : '');
+        }}
+        function _dbxAddFiles(fileList) {{
+            const seen = new Set(_dbxFiles.map(function(f) {{ return f.name + ':' + f.size; }}));
+            for (const f of fileList) {{
+                const key = f.name + ':' + f.size;
+                if (seen.has(key)) continue;
+                seen.add(key);
+                _dbxFiles.push(f);
+            }}
+            _dbxRender();
+        }}
+        function _dbxRemove(idx) {{
+            if (idx < 0 || idx >= _dbxFiles.length) return;
+            _dbxFiles.splice(idx, 1);
+            _dbxRender();
+        }}
+        function _dbxReset() {{
+            _dbxFiles.length = 0;
+            const inp = document.getElementById('dbxFileInput');
+            if (inp) inp.value = '';
+            _dbxRender();
+        }}
+        function _escapeHtml(s) {{
+            return String(s == null ? '' : s)
+                .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;').replace(/"/g, '&quot;')
+                .replace(/'/g, '&#39;');
+        }}
+        // Reads files sequentially (not Promise.all) so we can update a real
+        // progress bar in the busy overlay. For typical Databricks log sets
+        // (~20 files, a few MB total) the time-to-base64 is sub-second
+        // anyway, but a 100 MB upload feels much better with progress.
+        function _readDbxFilesAsBase64(onProgress) {{
+            const accepted = _dbxFiles.filter(function(f) {{ return _dbxAccept(f.name); }});
+            if (!accepted.length) return Promise.resolve([]);
+            const out = [];
+            let i = 0;
+            function next() {{
+                if (i >= accepted.length) return Promise.resolve(out);
+                const f = accepted[i];
+                return new Promise(function(resolve, reject) {{
+                    const reader = new FileReader();
+                    reader.onerror = function() {{ reject(new Error('read failed: ' + f.name)); }};
+                    reader.onload = function() {{
+                        const u = String(reader.result || '');
+                        const comma = u.indexOf(',');
+                        out.push({{ name: f.name, data: comma >= 0 ? u.slice(comma + 1) : '' }});
+                        i++;
+                        if (onProgress) onProgress(i, accepted.length, f.name);
+                        resolve(null);
+                    }};
+                    reader.readAsDataURL(f);
+                }}).then(next);
+            }}
+            return next();
+        }}
+
+        // Walk a DataTransferItem entry (file or directory) recursively and
+        // return a flat array of File objects.
+        function _walkEntry(entry) {{
+            return new Promise(function(resolve) {{
+                if (!entry) return resolve([]);
+                if (entry.isFile) {{
+                    entry.file(function(f) {{ resolve([f]); }}, function() {{ resolve([]); }});
+                }} else if (entry.isDirectory) {{
+                    const reader = entry.createReader();
+                    const collected = [];
+                    function readBatch() {{
+                        reader.readEntries(function(entries) {{
+                            if (!entries.length) {{
+                                Promise.all(collected.map(_walkEntry)).then(function(arrs) {{
+                                    resolve([].concat.apply([], arrs));
+                                }});
+                            }} else {{
+                                collected.push.apply(collected, entries);
+                                readBatch();
+                            }}
+                        }}, function() {{ resolve(collected); }});
+                    }}
+                    readBatch();
+                }} else {{
+                    resolve([]);
+                }}
+            }});
+        }}
+
+        function _initDbxUploader() {{
+            const dz = document.getElementById('dbxDropzone');
+            const inp = document.getElementById('dbxFileInput');
+            const dirInp = document.getElementById('dbxFolderInput');
+            if (!dz || !inp) return;
+            inp.addEventListener('change', function(e) {{
+                _dbxAddFiles(e.target.files || []);
+                inp.value = '';
+            }});
+            if (dirInp) {{
+                dirInp.addEventListener('change', function(e) {{
+                    _dbxAddFiles(e.target.files || []);
+                    dirInp.value = '';
+                }});
+            }}
+            ['dragenter', 'dragover'].forEach(function(t) {{
+                dz.addEventListener(t, function(e) {{ e.preventDefault(); e.stopPropagation(); dz.classList.add('dragover'); }});
+            }});
+            ['dragleave', 'drop'].forEach(function(t) {{
+                dz.addEventListener(t, function(e) {{ e.preventDefault(); e.stopPropagation(); dz.classList.remove('dragover'); }});
+            }});
+            dz.addEventListener('drop', function(e) {{
+                const dt = e.dataTransfer;
+                if (!dt) return;
+                // Prefer the entries API so dropped folders work; fall back
+                // to dt.files for browsers without webkitGetAsEntry.
+                const items = dt.items;
+                if (items && items.length && typeof items[0].webkitGetAsEntry === 'function') {{
+                    const entries = [];
+                    for (let i = 0; i < items.length; i++) {{
+                        const ent = items[i].webkitGetAsEntry && items[i].webkitGetAsEntry();
+                        if (ent) entries.push(ent);
+                    }}
+                    Promise.all(entries.map(_walkEntry)).then(function(arrs) {{
+                        const files = [].concat.apply([], arrs);
+                        if (files.length) _dbxAddFiles(files);
+                    }});
+                }} else if (dt.files && dt.files.length) {{
+                    _dbxAddFiles(dt.files);
+                }}
+            }});
         }}
 
         async function generateReport() {{
@@ -1445,12 +1844,40 @@ SPA_HTML = f"""<!DOCTYPE html>
                 urls.length === 1 ? 'Generating single-launch report\u2026' : 'Generating comparison of ' + urls.length + ' launches\u2026',
                 'Fetching Report Portal logs & rendering HTML');
             try {{
+                let dbxFiles = [];
+                const acceptedCount = _dbxFiles.filter(function(f) {{ return _dbxAccept(f.name); }}).length;
+                if (acceptedCount > 0) {{
+                    setBusy(true,
+                        'Reading ' + acceptedCount + ' log file' + (acceptedCount === 1 ? '' : 's') + '…',
+                        'Encoding for upload');
+                    setProgress(0);
+                    try {{
+                        dbxFiles = await _readDbxFilesAsBase64(function(done, total, _name) {{
+                            setProgress(Math.round((done / total) * 100));
+                            setBusy(true,
+                                'Reading log file ' + done + ' / ' + total + '…',
+                                'Encoding for upload');
+                        }});
+                    }} catch (e) {{
+                        err.textContent = 'Failed to read uploaded files: ' + (e && e.message ? e.message : 'unknown');
+                        return;
+                    }}
+                    setProgress(null);
+                }}
+                setBusy(true,
+                    urls.length === 1 ? 'Generating single-launch report…' : 'Generating comparison of ' + urls.length + ' launches…',
+                    dbxFiles.length
+                        ? 'Server: fetching RP logs, parsing Databricks events, rendering HTML'
+                        : 'Fetching Report Portal logs & rendering HTML');
                 let res;
                 try {{
                     res = await fetch('/api/generate', {{
                         method: 'POST',
                         headers: {{'Content-Type': 'application/json'}},
-                        body: JSON.stringify({{urls: urls}}),
+                        body: JSON.stringify({{
+                            urls: urls,
+                            databricks_files: dbxFiles,
+                        }}),
                     }});
                 }} catch (_netErr) {{
                     err.textContent = GENERIC_ERROR;
@@ -1482,6 +1909,8 @@ SPA_HTML = f"""<!DOCTYPE html>
             // Hide the form chrome so the panel takes focus.
             document.getElementById('inboxes').style.display       = 'none';
             document.getElementById('generateBtn').style.display   = 'none';
+            const dbxSec = document.getElementById('dbxSection');
+            if (dbxSec) dbxSec.style.display = 'none';
             // Re-focus the readout so the user can Ctrl/Cmd+C immediately
             // without having to mouse over.
             const ro = document.getElementById('pwReadout');
@@ -1497,8 +1926,11 @@ SPA_HTML = f"""<!DOCTYPE html>
             document.getElementById('pwCopyBtn').textContent = 'Copy';
             document.getElementById('inboxes').style.display     = '';
             document.getElementById('generateBtn').style.display = '';
+            const dbxSec = document.getElementById('dbxSection');
+            if (dbxSec) dbxSec.style.display = '';
             document.getElementById('newError').textContent = '';
             renderInboxes(['']);
+            _dbxReset();
         }}
 
         async function copyGeneratedPassword() {{
@@ -1741,6 +2173,7 @@ SPA_HTML = f"""<!DOCTYPE html>
         }}
 
         renderInboxes(['']);
+        _initDbxUploader();
         _applySidebarState();
     </script>
 </body>
@@ -1930,7 +2363,7 @@ class _SpaHandler(http.server.BaseHTTPRequestHandler):
             return
         self._send(404, "text/plain; charset=utf-8", b"Not found")
 
-    def _read_json_body(self, max_bytes: int = 1_000_000):
+    def _read_json_body(self, max_bytes: int = 100_000_000):
         length = int(self.headers.get("Content-Length", "0") or 0)
         if length <= 0 or length > max_bytes:
             return None, "missing or oversized request body"
@@ -1968,23 +2401,29 @@ class _SpaHandler(http.server.BaseHTTPRequestHandler):
         urls = flat
 
         payload_key = payload.get("payload_key") if isinstance(payload, dict) else None
+        databricks_files = payload.get("databricks_files") if isinstance(payload, dict) else None
 
+        dbx_dir = _materialize_databricks_uploads(databricks_files or [])
         try:
-            entry = _run_generation(urls, payload_key=payload_key)
-        except ValueError as e:
-            self._bad_request(str(e))
-            return
-        except urllib.error.URLError as e:
-            self._server_error(f"upstream fetch failed: {e}")
-            return
-        except RuntimeError as e:
-            self._bad_request(str(e))
-            return
-        except Exception as e:  # noqa: BLE001
-            self._server_error(f"{type(e).__name__}: {e}")
-            return
-
-        self._send_json(200, entry)
+            try:
+                entry = _run_generation(urls, payload_key=payload_key, databricks_log_dir=dbx_dir)
+            except ValueError as e:
+                self._bad_request(str(e))
+                return
+            except urllib.error.URLError as e:
+                self._server_error(f"upstream fetch failed: {e}")
+                return
+            except RuntimeError as e:
+                self._bad_request(str(e))
+                return
+            except Exception as e:  # noqa: BLE001
+                self._server_error(f"{type(e).__name__}: {e}")
+                return
+            self._send_json(200, entry)
+        finally:
+            if dbx_dir:
+                import shutil
+                shutil.rmtree(dbx_dir, ignore_errors=True)
 
 
 class _ThreadingTcpServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
@@ -2025,3 +2464,11 @@ def serve_spa(port: int = PORT) -> None:
             httpd.serve_forever()
         except KeyboardInterrupt:
             print("\nServer stopped.")
+
+
+# Direct-script entry point. Lets the user run `python3 spa.py` from this
+# directory without needing to `pip install` the package or fight with
+# `python -m rp_perf_report` (which depends on the parent dir + package name
+# matching, broken by the directory rename to dokimos-perf.chiron.systems).
+if __name__ == "__main__":
+    serve_spa()

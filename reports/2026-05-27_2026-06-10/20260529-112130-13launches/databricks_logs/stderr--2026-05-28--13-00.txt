@@ -1,0 +1,24 @@
+[dd.trace 2026-05-28 12:02:32:947 +0000] [dd-remote-config] WARN datadog.remoteconfig.ConfigurationPoller - Failed to retrieve remote configuration: unexpected response code Internal Server Error 500 rpc error: code = Unknown desc = empty targets meta in director local store
+ (Will not log warnings for 5 minutes)
+[dd.trace 2026-05-28 12:07:37:945 +0000] [dd-remote-config] WARN datadog.remoteconfig.ConfigurationPoller - Failed to retrieve remote configuration: unexpected response code Internal Server Error 500 rpc error: code = Unknown desc = empty targets meta in director local store
+ (Will not log warnings for 5 minutes)
+[dd.trace 2026-05-28 12:12:37:947 +0000] [dd-remote-config] WARN datadog.remoteconfig.ConfigurationPoller - Failed to retrieve remote configuration: unexpected response code Internal Server Error 500 rpc error: code = Unknown desc = empty targets meta in director local store
+ (Will not log warnings for 5 minutes)
+[dd.trace 2026-05-28 12:17:42:945 +0000] [dd-remote-config] WARN datadog.remoteconfig.ConfigurationPoller - Failed to retrieve remote configuration: unexpected response code Internal Server Error 500 rpc error: code = Unknown desc = empty targets meta in director local store
+ (Will not log warnings for 5 minutes)
+[dd.trace 2026-05-28 12:22:47:945 +0000] [dd-remote-config] WARN datadog.remoteconfig.ConfigurationPoller - Failed to retrieve remote configuration: unexpected response code Internal Server Error 500 rpc error: code = Unknown desc = empty targets meta in director local store
+ (Will not log warnings for 5 minutes)
+[dd.trace 2026-05-28 12:27:47:945 +0000] [dd-remote-config] WARN datadog.remoteconfig.ConfigurationPoller - Failed to retrieve remote configuration: unexpected response code Internal Server Error 500 rpc error: code = Unknown desc = empty targets meta in director local store
+ (Will not log warnings for 5 minutes)
+[dd.trace 2026-05-28 12:32:52:945 +0000] [dd-remote-config] WARN datadog.remoteconfig.ConfigurationPoller - Failed to retrieve remote configuration: unexpected response code Internal Server Error 500 rpc error: code = Unknown desc = empty targets meta in director local store
+ (Will not log warnings for 5 minutes)
+[dd.trace 2026-05-28 12:37:52:945 +0000] [dd-remote-config] WARN datadog.remoteconfig.ConfigurationPoller - Failed to retrieve remote configuration: unexpected response code Internal Server Error 500 rpc error: code = Unknown desc = empty targets meta in director local store
+ (Will not log warnings for 5 minutes)
+[dd.trace 2026-05-28 12:42:52:945 +0000] [dd-remote-config] WARN datadog.remoteconfig.ConfigurationPoller - Failed to retrieve remote configuration: unexpected response code Internal Server Error 500 rpc error: code = Unknown desc = empty targets meta in director local store
+ (Will not log warnings for 5 minutes)
+[dd.trace 2026-05-28 12:47:57:945 +0000] [dd-remote-config] WARN datadog.remoteconfig.ConfigurationPoller - Failed to retrieve remote configuration: unexpected response code Internal Server Error 500 rpc error: code = Unknown desc = empty targets meta in director local store
+ (Will not log warnings for 5 minutes)
+[dd.trace 2026-05-28 12:53:02:945 +0000] [dd-remote-config] WARN datadog.remoteconfig.ConfigurationPoller - Failed to retrieve remote configuration: unexpected response code Internal Server Error 500 rpc error: code = Unknown desc = empty targets meta in director local store
+ (Will not log warnings for 5 minutes)
+[dd.trace 2026-05-28 12:58:02:945 +0000] [dd-remote-config] WARN datadog.remoteconfig.ConfigurationPoller - Failed to retrieve remote configuration: unexpected response code Internal Server Error 500 rpc error: code = Unknown desc = empty targets meta in director local store
+ (Will not log warnings for 5 minutes)

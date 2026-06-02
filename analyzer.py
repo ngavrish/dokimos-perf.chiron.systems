@@ -46,6 +46,8 @@ from statistics import median as _median, quantiles as _quantiles
 from zoneinfo import ZoneInfo
 from typing import Optional
 
+from databricks_logs import fetch_databricks_logs
+
 
 # ---------------------------------------------------------------------------
 # Shared report CSS
@@ -1438,6 +1440,11 @@ DD_API_KEY = os.environ.get("DISNEY_DD_API_KEY", "")
 DD_APP_KEY = os.environ.get("DISNEY_DD_APP_KEY", "")
 DD_SERVICE = "ifp-service"
 
+# Databricks job log directory (log4j/stdout/stderr files). When set, the
+# multi-launch report fetches events from this directory in the launches'
+# time window. Empty = feature disabled.
+DATABRICKS_LOG_DIR = os.environ.get("DOKIMOS_DATABRICKS_LOG_DIR", "")
+
 
 def fetch_datadog_traces(from_ts: int, to_ts: int, limit: int = 50, min_duration_s: float = 3.0, service_filter: str = None) -> list:
     """
@@ -1912,12 +1919,15 @@ def analyze_timings_detailed(logs_data: dict) -> dict:
                 endpoint_data[endpoint]['durations'].append(duration)
                 endpoint_data[endpoint]['by_payload'][payload_str].append(duration)
                 
-                # Track slow requests (> 3s) with their timestamps for Datadog lookup
+                # Track slow requests (> 3s) with their timestamps for Datadog
+                # lookup and the Timeline-tab detail panel. Cap at 32 KB so
+                # huge payloads can't blow up memory but real-world JSON
+                # request bodies fit comfortably.
                 if duration > 3.0 and log_time:
                     endpoint_data[endpoint]['slow_requests'].append({
                         'timestamp': log_time,
                         'duration': duration,
-                        'payload': payload_str[:200]
+                        'payload': payload_str[:32768]
                     })
             continue
         
@@ -2475,7 +2485,7 @@ def print_multi_comparison(launch_labels: list, logs_list: list, timings_list: l
     print('=' * 100)
 
 
-def generate_multi_comparison_html(launch_labels: list, logs_list: list, timings_list: list, detailed_timings_list: list = None, launch_timestamps: list = None, launch_ids: list = None, report_password: Optional[str] = None) -> str:
+def generate_multi_comparison_html(launch_labels: list, logs_list: list, timings_list: list, detailed_timings_list: list = None, launch_timestamps: list = None, launch_ids: list = None, report_password: Optional[str] = None, databricks_events: list = None) -> str:
     """Generate HTML comparison report for multiple launches.
 
     When ``len(launch_labels) >= 4`` the report renders as four tabs:
@@ -3188,6 +3198,163 @@ def generate_multi_comparison_html(launch_labels: list, logs_list: list, timings
 
     trend_chart_data_json = json.dumps(trend_chart_data)
 
+    # ----- Build the Timeline-tab dataset -----
+    # Lanes (top to bottom in the chart): RP launches, Databricks phases,
+    # Databricks point events (business loggers, near-collocated events
+    # collapsed into bursts), per-endpoint slow requests (>3s).
+    timeline_data: Optional[dict] = None
+    if databricks_events:
+        _DB_INTERESTING_PREFIXES = (
+            'OlapIngestTaskDatabricks', 'DbAccessor', 'DatabricksAccessor',
+            'DataIngestDatabricks', 'JdbcManager',
+            'pipeline_drain', 'optimize_table',
+        )
+
+        def _ts_ms(dt: datetime) -> int:
+            return int(dt.timestamp() * 1000)
+
+        def _make_event_burst(group: list) -> dict:
+            if len(group) == 1:
+                return {**group[0], 'count': 1}
+            loggers_seen: list = []
+            seen: set = set()
+            for g in group:
+                if g['logger'] not in seen:
+                    loggers_seen.append(g['logger'])
+                    seen.add(g['logger'])
+            return {
+                'ts_ms':    group[0]['ts_ms'],
+                'logger':   f"burst (×{len(group)})",
+                'level':    'BURST',
+                'message':  '; '.join(loggers_seen[:5]) + (f"  +{len(loggers_seen) - 5} more" if len(loggers_seen) > 5 else ''),
+                'approx':   any(g['approx'] for g in group),
+                'count':    len(group),
+                'children': [{'logger': g['logger'], 'message': g['message']} for g in group],
+            }
+
+        # Lane 1: RP launches -- derive (start, end) per launch from log entries.
+        rp_launches_data: list = []
+        for i, logs in enumerate(logs_list):
+            entries = logs if isinstance(logs, list) else logs.get('content', logs.get('items', []))
+            times: list = []
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                t = entry.get('time')
+                if not t:
+                    continue
+                try:
+                    times.append(datetime.fromisoformat(t.replace('Z', '+00:00')))
+                except Exception:
+                    pass
+            if not times:
+                continue
+            rp_launches_data.append({
+                'label': launch_labels[i] if i < len(launch_labels) else f'L{i+1}',
+                'id':    str(launch_ids[i]) if launch_ids and i < len(launch_ids) else f'L{i+1}',
+                'start': _ts_ms(min(times)),
+                'end':   _ts_ms(max(times)),
+            })
+
+        # Lane 2: Databricks phase intervals.
+        db_phases_data: list = []
+        for e in databricks_events:
+            if e.level == 'PHASE' and e.end_timestamp and e.duration_s:
+                db_phases_data.append({
+                    'logger':     e.logger,
+                    'start':      _ts_ms(e.timestamp),
+                    'end':        _ts_ms(e.end_timestamp),
+                    'duration_s': e.duration_s,
+                    'message':    e.message,
+                    'approx':     e.approx,
+                })
+
+        # Lane 3: business-logger point events, with near-collocated events
+        # collapsed into burst markers (gap <= BURST_GAP_MS).
+        _raw_events: list = []
+        for e in databricks_events:
+            if e.level == 'PHASE':
+                continue
+            if not e.logger.startswith(_DB_INTERESTING_PREFIXES):
+                continue
+            _raw_events.append({
+                'ts_ms':   _ts_ms(e.timestamp),
+                'logger':  e.logger,
+                'level':   e.level,
+                'message': (e.message or '')[:200],
+                'approx':  e.approx,
+            })
+        _raw_events.sort(key=lambda x: x['ts_ms'])
+
+        BURST_GAP_MS = 1000
+        db_events_data: list = []
+        if _raw_events:
+            _cur = [_raw_events[0]]
+            for ev in _raw_events[1:]:
+                if ev['ts_ms'] - _cur[-1]['ts_ms'] <= BURST_GAP_MS:
+                    _cur.append(ev)
+                else:
+                    db_events_data.append(_make_event_burst(_cur))
+                    _cur = [ev]
+            db_events_data.append(_make_event_burst(_cur))
+
+        # Lane 4: per-endpoint slow requests across all launches.
+        # The test runner captures the request body only on some calls --
+        # repeated invocations of the same endpoint commonly leave the
+        # payload field as the literal string "(no payload)". To make the
+        # detail panel useful even on those, we build a per-endpoint
+        # representative payload (the longest captured one) and backfill any
+        # missing payloads from it. The flag `payload_borrowed` lets the UI
+        # tell the user when they're looking at a sibling's payload.
+        _representative_payload: dict = {}
+        def _is_real_payload(s: str) -> bool:
+            return bool(s) and s != '(no payload)'
+
+        for detailed in (detailed_timings_list or []):
+            for endpoint, data in (detailed or {}).items():
+                for sr in data.get('slow_requests', []):
+                    pl = sr.get('payload') or ''
+                    if not _is_real_payload(pl):
+                        continue
+                    if len(pl) > len(_representative_payload.get(endpoint, '')):
+                        _representative_payload[endpoint] = pl
+
+        slow_reqs_data: list = []
+        for launch_idx, detailed in enumerate(detailed_timings_list or []):
+            for endpoint, data in (detailed or {}).items():
+                for sr in data.get('slow_requests', []):
+                    t = sr.get('timestamp')
+                    if not t:
+                        continue
+                    try:
+                        ts = datetime.fromisoformat(t.replace('Z', '+00:00'))
+                    except Exception:
+                        continue
+                    raw_pl = sr.get('payload') or ''
+                    if _is_real_payload(raw_pl):
+                        pl = raw_pl
+                        borrowed = False
+                    else:
+                        pl = _representative_payload.get(endpoint, '')
+                        borrowed = bool(pl)
+                    slow_reqs_data.append({
+                        'ts_ms':            _ts_ms(ts),
+                        'endpoint':         endpoint,
+                        'duration_s':       sr.get('duration', 0),
+                        'launch_idx':       launch_idx,
+                        'payload':          pl[:32768],
+                        'payload_borrowed': borrowed,
+                    })
+
+        timeline_data = {
+            'rpLaunches': rp_launches_data,
+            'dbPhases':   db_phases_data,
+            'dbEvents':   db_events_data,
+            'slowReqs':   slow_reqs_data,
+        }
+
+    timeline_data_json = json.dumps(timeline_data) if timeline_data else 'null'
+
     _endpoint_cards_joined = (
         ''.join(endpoint_cards)
         if endpoint_cards
@@ -3195,12 +3362,28 @@ def generate_multi_comparison_html(launch_labels: list, logs_list: list, timings
     )
 
     if show_tabs:
+        _timeline_tab_btn = (
+            '<button class="tab-btn"        data-tab="4" onclick="switchTab(4)">Timeline</button>'
+            if timeline_data else ''
+        )
+        _timeline_tab_pane = f'''
+        <div class="tab-pane" data-tab-pane="4">
+            <div class="tab-intro">Pipeline timeline: RP launches, Databricks phases, business events, and slow requests (&gt;3s) overlaid on the full job window. Tilde (~) marks timestamps inferred from a nearby anchor; near-collocated events collapse into burst markers.</div>
+            <div class="timeline-wrapper">
+                <canvas id="timelineCanvas"></canvas>
+            </div>
+            <div class="slow-req-detail placeholder" id="slowReqDetailPanel">
+                Click any slow-request stem to inspect that call (endpoint, timestamp, duration, payload).
+            </div>
+        </div>
+        ''' if timeline_data else ''
         tabs_nav_html = f'''
         <div class="tabs-nav">
             <button class="tab-btn active" data-tab="0" onclick="switchTab(0)">Median vs Slowest</button>
             <button class="tab-btn"        data-tab="1" onclick="switchTab(1)">Fastest vs Slowest</button>
             <button class="tab-btn"        data-tab="2" onclick="switchTab(2)">Per-endpoint Trend</button>
             <button class="tab-btn"        data-tab="3" onclick="switchTab(3)">All {n} Launches</button>
+            {_timeline_tab_btn}
         </div>
         '''
         tab_panes_html = f'''
@@ -3220,6 +3403,7 @@ def generate_multi_comparison_html(launch_labels: list, logs_list: list, timings
             <div class="tab-intro">Full comparison across all {n} launches (original layout).</div>
             {_endpoint_cards_joined}
         </div>
+        {_timeline_tab_pane}
         '''
     else:
         tabs_nav_html  = ""
@@ -3281,6 +3465,7 @@ def generate_multi_comparison_html(launch_labels: list, logs_list: list, timings
             "html":           protected_html,
             "reportData":     js_data,
             "trendChartData": trend_chart_data,
+            "timelineData":   timeline_data,
         }
         enc = _encrypt_report_payload(
             json.dumps(bundle, separators=(",", ":")).encode("utf-8"),
@@ -3292,6 +3477,7 @@ def generate_multi_comparison_html(launch_labels: list, logs_list: list, timings
         protected_html_rendered = ''
         js_data_json = 'null'
         trend_chart_data_json = 'null'
+        timeline_data_json = 'null'
         body_locked_class = ' class="locked"'
         auth_overlay_html = '''
     <div class="auth-overlay" id="authOverlay">
@@ -3328,6 +3514,97 @@ def generate_multi_comparison_html(launch_labels: list, logs_list: list, timings
            dynamically here because CSS can't put a var() inside repeat()'s
            first arg. */
         .timings-grid {{ grid-template-columns: repeat({n}, 1fr); }}
+        .timeline-wrapper {{
+            position: relative;
+            height: 720px;
+            margin: 16px 0 8px;
+            padding: 10px 14px;
+            background: linear-gradient(180deg, rgba(255,255,255,0.025), rgba(255,255,255,0.01));
+            border-radius: 8px;
+            border: 1px solid rgba(255,255,255,0.04);
+        }}
+        .timeline-wrapper canvas {{ width: 100% !important; height: 100% !important; cursor: crosshair; }}
+        .slow-req-detail {{
+            margin: 8px 0 16px;
+            padding: 14px 16px;
+            background: rgba(255,255,255,0.03);
+            border-radius: 8px;
+            border-left: 3px solid #ef4444;
+            font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+            font-size: 12px;
+            min-height: 72px;
+            line-height: 1.55;
+        }}
+        .slow-req-detail.placeholder {{
+            border-left-color: rgba(255,255,255,0.10);
+            color: rgba(255,255,255,0.40);
+            font-style: italic;
+            font-family: inherit;
+            font-size: 13px;
+            display: flex;
+            align-items: center;
+        }}
+        .slow-req-detail-header {{
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 10px;
+        }}
+        .slow-req-detail-title {{
+            font-weight: 600;
+            color: rgba(255,255,255,0.92);
+            font-size: 13px;
+            letter-spacing: 0.2px;
+        }}
+        .slow-req-detail-close {{
+            background: none;
+            border: none;
+            color: rgba(255,255,255,0.45);
+            cursor: pointer;
+            font-size: 20px;
+            line-height: 1;
+            padding: 0 6px;
+        }}
+        .slow-req-detail-close:hover {{ color: rgba(255,255,255,0.95); }}
+        .slow-req-detail-meta {{
+            display: flex;
+            gap: 18px;
+            margin-bottom: 10px;
+            color: rgba(255,255,255,0.80);
+            flex-wrap: wrap;
+            font-size: 11.5px;
+        }}
+        .slow-req-detail-meta strong {{
+            color: rgba(255,255,255,0.45);
+            font-weight: 500;
+            margin-right: 4px;
+            letter-spacing: 0.3px;
+            text-transform: uppercase;
+            font-size: 10px;
+        }}
+        .slow-req-detail-note {{
+            margin: -2px 0 10px;
+            padding: 6px 10px;
+            background: rgba(245,158,11,0.10);
+            border-left: 2px solid rgba(245,158,11,0.6);
+            color: rgba(255,229,180,0.92);
+            font-size: 11.5px;
+            border-radius: 0 4px 4px 0;
+        }}
+        .slow-req-detail-payload {{
+            background: rgba(0,0,0,0.35);
+            padding: 12px 14px;
+            border-radius: 6px;
+            margin: 0;
+            white-space: pre-wrap;
+            word-break: break-word;
+            max-height: 560px;
+            overflow: auto;
+            color: rgba(220,230,242,0.92);
+            font-size: 11.5px;
+            line-height: 1.55;
+            border: 1px solid rgba(255,255,255,0.04);
+        }}
     </style>
 </head>
 <body{body_locked_class}>
@@ -3350,6 +3627,7 @@ def generate_multi_comparison_html(launch_labels: list, logs_list: list, timings
     <script>
         let reportData = {js_data_json};
         let trendChartData = {trend_chart_data_json};
+        let timelineData = {timeline_data_json};
         let currentFilter = '';
 
         // ---------- AES-GCM password gate ----------
@@ -3438,6 +3716,7 @@ def generate_multi_comparison_html(launch_labels: list, logs_list: list, timings
             const obj = JSON.parse(plaintextJson);
             reportData = obj.reportData || {{}};
             trendChartData = obj.trendChartData || {{}};
+            timelineData = obj.timelineData || null;
             const slot = document.getElementById('protectedContent');
             if (slot) slot.innerHTML = obj.html || '';
             _bindSearchInput();
@@ -3445,9 +3724,10 @@ def generate_multi_comparison_html(launch_labels: list, logs_list: list, timings
             // elements; re-localize them now that they're in the DOM.
             _localizeReportTimes(slot || document);
             // Chart.js canvases were just (re)created in the freshly injected
-            // HTML; clear the init flag so they get drawn the next time the
-            // user opens the trend tab.
+            // HTML; clear the init flags so they get drawn the next time the
+            // user opens the corresponding tab.
             _trendChartsInited = false;
+            _timelineChartInited = false;
         }}
 
         async function checkAuthPassword() {{
@@ -3512,9 +3792,10 @@ def generate_multi_comparison_html(launch_labels: list, logs_list: list, timings
             document.querySelectorAll('.tab-pane').forEach(function(p) {{
                 p.classList.toggle('active', p.getAttribute('data-tab-pane') == idx);
             }});
-            // Charts on tab 2 must be initialized lazily so canvas elements are
-            // visible (Chart.js mis-measures hidden canvases).
+            // Charts on tabs 2 and 4 must be initialized lazily so canvas
+            // elements are visible (Chart.js mis-measures hidden canvases).
             if (idx == 2) initTrendCharts();
+            if (idx == 4) initTimelineChart();
         }}
 
         let _trendChartsInited = false;
@@ -3591,6 +3872,405 @@ def generate_multi_comparison_html(launch_labels: list, logs_list: list, timings
                         }},
                     }}
                 }});
+            }});
+        }}
+
+        // ---------- Timeline tab ----------
+        let _timelineChartInited = false;
+        function _humanDurMs(ms) {{
+            const s = Math.round(ms / 1000);
+            if (s < 60) return s + 's';
+            const m = Math.floor(s / 60);
+            if (m < 60) return m + 'm' + (s % 60 ? ' ' + (s % 60) + 's' : '');
+            const h = Math.floor(m / 60);
+            return h + 'h ' + (m % 60) + 'm';
+        }}
+        function _utcHhmm(epochMs) {{
+            const d = new Date(epochMs);
+            return d.getUTCHours().toString().padStart(2, '0') + ':' +
+                   d.getUTCMinutes().toString().padStart(2, '0');
+        }}
+        function _utcFull(epochMs) {{
+            const d = new Date(epochMs);
+            return d.toISOString().replace('T', ' ').replace(/\.\d+Z$/, 'Z');
+        }}
+        function _escapeHtml(s) {{
+            return String(s == null ? '' : s)
+                .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;').replace(/"/g, '&quot;')
+                .replace(/'/g, '&#39;');
+        }}
+        function _formatPayload(payload) {{
+            if (!payload) return '(no payload)';
+            // Try JSON pretty-print; if it isn't JSON, show raw.
+            try {{
+                const obj = JSON.parse(payload);
+                return JSON.stringify(obj, null, 2);
+            }} catch (e) {{}}
+            return payload;
+        }}
+        function _showSlowReqDetail(meta) {{
+            const panel = document.getElementById('slowReqDetailPanel');
+            if (!panel) return;
+            panel.classList.remove('placeholder');
+            const ts = _utcFull(meta.ts_ms);
+            const dur = (+meta.duration_s).toFixed(2);
+            const launch = 'L' + (meta.launch_idx + 1);
+            const payload = _formatPayload(meta.payload || '');
+            const borrowedHint = meta.payload_borrowed
+                ? '<div class="slow-req-detail-note">Payload captured on a sibling call to this endpoint &mdash; this specific call did not log its own body.</div>'
+                : '';
+            panel.innerHTML = ''
+                + '<div class="slow-req-detail-header">'
+                +   '<span class="slow-req-detail-title">' + _escapeHtml(meta.endpoint) + '</span>'
+                +   '<button class="slow-req-detail-close" onclick="_closeSlowReqDetail()" title="Dismiss">&times;</button>'
+                + '</div>'
+                + '<div class="slow-req-detail-meta">'
+                +   '<span><strong>Duration</strong>' + dur + 's</span>'
+                +   '<span><strong>When</strong>' + _escapeHtml(ts) + '</span>'
+                +   '<span><strong>Launch</strong>' + launch + '</span>'
+                + '</div>'
+                + borrowedHint
+                + '<pre class="slow-req-detail-payload">' + _escapeHtml(payload) + '</pre>';
+        }}
+        function _closeSlowReqDetail() {{
+            const panel = document.getElementById('slowReqDetailPanel');
+            if (!panel) return;
+            panel.classList.add('placeholder');
+            panel.innerHTML = 'Click any slow-request stem to inspect that call (endpoint, timestamp, duration, payload).';
+        }}
+
+        function initTimelineChart() {{
+            if (_timelineChartInited) return;
+            if (!timelineData) return;
+            if (typeof Chart === 'undefined') return;
+            _timelineChartInited = true;
+
+            const canvas = document.getElementById('timelineCanvas');
+            if (!canvas) return;
+
+            const LANE_RP = 6, LANE_PHASE = 5, LANE_EVENT = 4, LANE_SLOW = 2;
+            // The slow-request lane is a stem plot occupying roughly half the
+            // chart's vertical space. Each request renders as a vertical line
+            // from SLOW_LANE_BASE up to a y proportional to its duration.
+            const SLOW_LANE_BASE = 0.5;
+            const SLOW_LANE_TOP  = 3.5;
+            const _slowReqsRaw = (timelineData.slowReqs || []);
+            const slowMaxDur = _slowReqsRaw.length
+                ? Math.max.apply(null, _slowReqsRaw.map(function(s) {{ return +s.duration_s || 0; }}))
+                : 1;
+            function _slowY(duration_s) {{
+                const d = Math.min(+duration_s || 0, slowMaxDur);
+                return SLOW_LANE_BASE + (d / slowMaxDur) * (SLOW_LANE_TOP - SLOW_LANE_BASE);
+            }}
+            const LANE_NAMES = {{
+                2: 'Slow Reqs (0-' + slowMaxDur.toFixed(0) + 's, height=dur)',
+                4: 'DB Events',
+                5: 'DB Phases',
+                6: 'RP Launches',
+            }};
+
+            const bars = [];
+            (timelineData.rpLaunches || []).forEach(function(l) {{
+                bars.push({{
+                    x1: l.start, x2: l.end, y: LANE_RP,
+                    color: 'rgba(96,165,250,0.78)',
+                    label: l.label + ' · ' + _humanDurMs(l.end - l.start),
+                    tooltip: {{ kind: 'launch', label: l.label, id: l.id, start: l.start, end: l.end }},
+                }});
+            }});
+            (timelineData.dbPhases || []).forEach(function(p) {{
+                bars.push({{
+                    x1: p.start, x2: p.end, y: LANE_PHASE,
+                    color: p.logger === 'pipeline_drain'
+                        ? 'rgba(245,158,11,0.88)'    // amber
+                        : 'rgba(139,92,246,0.88)',   // violet
+                    label: p.logger + ' · ' + _humanDurMs(p.end - p.start) + (p.approx ? ' ~' : ''),
+                    tooltip: {{ kind: 'phase', logger: p.logger, start: p.start, end: p.end,
+                               duration_s: p.duration_s, message: p.message, approx: p.approx }},
+                }});
+            }});
+
+            const eventPoints = (timelineData.dbEvents || []).map(function(e) {{
+                return {{ x: e.ts_ms, y: LANE_EVENT, _meta: e }};
+            }});
+            const slowPoints = _slowReqsRaw.map(function(s) {{
+                return {{ x: s.ts_ms, y: _slowY(s.duration_s), _meta: s }};
+            }});
+
+            // x-axis bounds with 2% padding both sides.
+            const allTimes = [];
+            bars.forEach(function(b) {{ allTimes.push(b.x1, b.x2); }});
+            eventPoints.forEach(function(p) {{ allTimes.push(p.x); }});
+            slowPoints.forEach(function(p) {{ allTimes.push(p.x); }});
+            if (!allTimes.length) return;
+            const xMin = Math.min.apply(null, allTimes);
+            const xMax = Math.max.apply(null, allTimes);
+            const pad = Math.max(60000, (xMax - xMin) * 0.02);
+
+            // Percentile thresholds drive both the reference lines and the
+            // duration buckets so the color encoding stays meaningful across
+            // datasets with different shape: < median = baseline carpet,
+            // median..p90 = mid-tier, > p90 = the outliers worth a look.
+            const _sortedDurs = _slowReqsRaw.map(function(s) {{ return +s.duration_s || 0; }}).sort(function(a, b) {{ return a - b; }});
+            const _p = function(q) {{
+                if (!_sortedDurs.length) return 0;
+                const idx = Math.min(_sortedDurs.length - 1, Math.floor(q * _sortedDurs.length));
+                return _sortedDurs[idx];
+            }};
+            const slowP50 = _p(0.50);
+            const slowP90 = _p(0.90);
+            const slowP99 = _p(0.99);
+            const _bucketMed  = slowP50 > 0 ? slowP50 : 5;
+            const _bucketHigh = slowP90 > 0 ? slowP90 : 8;
+            function _slowBucket(dur_s) {{
+                if (dur_s <  _bucketMed)  return 0;
+                if (dur_s <  _bucketHigh) return 1;
+                return 2;
+            }}
+            const SLOW_STEM_COLORS = [
+                'rgba(45,212,191,0.42)',
+                'rgba(245,158,11,0.62)',
+                'rgba(239,68,68,0.85)',
+            ];
+            const SLOW_DOT_COLORS = [
+                'rgba(45,212,191,0.85)',
+                'rgba(245,158,11,0.92)',
+                'rgba(239,68,68,0.98)',
+            ];
+
+            const intervalBarPlugin = {{
+                id: 'intervalBars',
+                beforeDatasetsDraw: function(chart) {{
+                    const ctx = chart.ctx;
+                    const xs = chart.scales.x, ys = chart.scales.y;
+                    if (!xs || !ys) return;
+                    const area = chart.chartArea;
+
+                    // 1) Subtle horizontal bands for each lane.
+                    const bands = [
+                        {{ y1: 0.30, y2: 3.70, color: 'rgba(255,255,255,0.022)' }}, // slow stems zone (large)
+                        {{ y1: 3.75, y2: 4.30, color: 'rgba(255,255,255,0.035)' }}, // events
+                        {{ y1: 4.70, y2: 5.30, color: 'rgba(255,255,255,0.022)' }}, // phases
+                        {{ y1: 5.70, y2: 6.30, color: 'rgba(255,255,255,0.035)' }}, // RP launches
+                    ];
+                    ctx.save();
+                    bands.forEach(function(b) {{
+                        const y1 = ys.getPixelForValue(b.y1);
+                        const y2 = ys.getPixelForValue(b.y2);
+                        ctx.fillStyle = b.color;
+                        ctx.fillRect(area.left, Math.min(y1, y2), area.right - area.left, Math.abs(y2 - y1));
+                    }});
+                    ctx.restore();
+
+                    // 2) Slow-request stems, batched by color bucket so we
+                    // only flip strokeStyle three times for thousands of points.
+                    if (slowPoints.length) {{
+                        const baselineY = ys.getPixelForValue(SLOW_LANE_BASE);
+                        ctx.save();
+                        ctx.lineWidth = 1;
+                        for (let bucket = 0; bucket < 3; bucket++) {{
+                            ctx.strokeStyle = SLOW_STEM_COLORS[bucket];
+                            ctx.beginPath();
+                            slowPoints.forEach(function(p) {{
+                                if (_slowBucket(p._meta.duration_s) !== bucket) return;
+                                const px = xs.getPixelForValue(p.x);
+                                const py = ys.getPixelForValue(p.y);
+                                ctx.moveTo(px, baselineY);
+                                ctx.lineTo(px, py);
+                            }});
+                            ctx.stroke();
+                        }}
+                        ctx.restore();
+                    }}
+                }},
+                afterDatasetsDraw: function(chart) {{
+                    const ctx = chart.ctx;
+                    const xs = chart.scales.x, ys = chart.scales.y;
+                    if (!xs || !ys) return;
+                    const area = chart.chartArea;
+
+                    // 1) p90 / p99 reference lines in the slow lane.
+                    if (slowMaxDur > 0 && _sortedDurs.length) {{
+                        ctx.save();
+                        [
+                            {{ value: slowP90, label: 'p90 ' + slowP90.toFixed(1) + 's', alpha: 0.30 }},
+                            {{ value: slowP99, label: 'p99 ' + slowP99.toFixed(1) + 's', alpha: 0.45 }},
+                        ].forEach(function(line) {{
+                            const yPix = ys.getPixelForValue(_slowY(line.value));
+                            ctx.strokeStyle = 'rgba(255,255,255,' + line.alpha + ')';
+                            ctx.setLineDash([3, 4]);
+                            ctx.lineWidth = 1;
+                            ctx.beginPath();
+                            ctx.moveTo(area.left, yPix);
+                            ctx.lineTo(area.right, yPix);
+                            ctx.stroke();
+                            ctx.setLineDash([]);
+                            ctx.fillStyle = 'rgba(255,255,255,' + (line.alpha + 0.15) + ')';
+                            ctx.font = '10px ui-monospace, Menlo, monospace';
+                            ctx.textBaseline = 'bottom';
+                            ctx.textAlign = 'right';
+                            ctx.fillText(line.label, area.right - 6, yPix - 2);
+                        }});
+                        ctx.restore();
+                    }}
+
+                    // 2) Interval bars for RP launches & DB phases.
+                    ctx.save();
+                    ctx.font = '11px ui-monospace, Menlo, monospace';
+                    ctx.textBaseline = 'middle';
+                    bars.forEach(function(bar) {{
+                        const x1 = xs.getPixelForValue(bar.x1);
+                        const x2 = xs.getPixelForValue(bar.x2);
+                        const yPix = ys.getPixelForValue(bar.y);
+                        const h = 18;
+                        const left = Math.min(x1, x2);
+                        const w = Math.max(2, Math.abs(x2 - x1));
+                        // Rounded rect for a softer look.
+                        const r = Math.min(4, h / 2, w / 2);
+                        ctx.fillStyle = bar.color;
+                        ctx.beginPath();
+                        ctx.moveTo(left + r, yPix - h / 2);
+                        ctx.arcTo(left + w, yPix - h / 2, left + w, yPix + h / 2, r);
+                        ctx.arcTo(left + w, yPix + h / 2, left, yPix + h / 2, r);
+                        ctx.arcTo(left, yPix + h / 2, left, yPix - h / 2, r);
+                        ctx.arcTo(left, yPix - h / 2, left + w, yPix - h / 2, r);
+                        ctx.closePath();
+                        ctx.fill();
+                        if (w > 80) {{
+                            ctx.fillStyle = 'rgba(255,255,255,0.95)';
+                            ctx.save();
+                            ctx.beginPath();
+                            ctx.rect(left, yPix - h / 2, w, h);
+                            ctx.clip();
+                            ctx.fillText(bar.label, left + 8, yPix);
+                            ctx.restore();
+                        }}
+                    }});
+                    ctx.restore();
+                }},
+            }};
+
+            new Chart(canvas, {{
+                type: 'scatter',
+                data: {{
+                    datasets: [
+                        {{
+                            label: 'DB Events',
+                            data: eventPoints,
+                            backgroundColor: '#10b981',
+                            borderColor: '#065f46',
+                            borderWidth: 1,
+                            pointRadius: function(ctx) {{
+                                const meta = ctx.raw && ctx.raw._meta;
+                                if (meta && meta.count && meta.count > 1) return 7;
+                                return 5;
+                            }},
+                            pointHoverRadius: 9,
+                            parsing: false,
+                        }},
+                        {{
+                            label: 'Slow Requests (>3s)',
+                            data: slowPoints,
+                            backgroundColor: function(ctx) {{
+                                const m = ctx.raw && ctx.raw._meta;
+                                return SLOW_DOT_COLORS[m ? _slowBucket(m.duration_s) : 0];
+                            }},
+                            borderWidth: 0,
+                            pointRadius: function(ctx) {{
+                                const m = ctx.raw && ctx.raw._meta;
+                                // Larger dots for higher buckets so outliers
+                                // catch the eye even at scroll-level.
+                                return m ? [2, 2.5, 3.5][_slowBucket(m.duration_s)] : 2;
+                            }},
+                            pointHoverRadius: 7,
+                            parsing: false,
+                        }},
+                    ],
+                }},
+                options: {{
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    animation: false,
+                    interaction: {{ mode: 'nearest', intersect: false }},
+                    onClick: function(evt, _items, chart) {{
+                        // Re-resolve elements with intersect:false so a click
+                        // close to (but not exactly on) a tiny stem still
+                        // picks the nearest slow-request point.
+                        const items = chart.getElementsAtEventForMode(
+                            evt, 'nearest', {{ intersect: false }}, false
+                        );
+                        if (!items || !items.length) return;
+                        const item = items[0];
+                        const ds = chart.data.datasets[item.datasetIndex];
+                        if (!ds || ds.label !== 'Slow Requests (>3s)') return;
+                        const point = ds.data[item.index];
+                        if (point && point._meta) _showSlowReqDetail(point._meta);
+                    }},
+                    scales: {{
+                        x: {{
+                            type: 'linear',
+                            min: xMin - pad,
+                            max: xMax + pad,
+                            ticks: {{
+                                callback: function(v) {{ return _utcHhmm(v); }},
+                                maxTicksLimit: 10,
+                                color: 'rgba(255,255,255,0.6)',
+                            }},
+                            grid: {{ color: 'rgba(255,255,255,0.05)' }},
+                            title: {{ display: true, text: 'Time (UTC)',
+                                     color: 'rgba(255,255,255,0.6)' }},
+                        }},
+                        y: {{
+                            type: 'linear',
+                            min: 0.2, max: 6.4,
+                            ticks: {{
+                                stepSize: 1,
+                                callback: function(v) {{ return LANE_NAMES[v] || ''; }},
+                                color: 'rgba(255,255,255,0.72)',
+                            }},
+                            grid: {{ color: 'rgba(255,255,255,0.05)' }},
+                        }},
+                    }},
+                    plugins: {{
+                        legend: {{
+                            display: true,
+                            labels: {{ color: 'rgba(255,255,255,0.7)', filter: function(item) {{
+                                return item.text !== '_bars';
+                            }} }},
+                        }},
+                        tooltip: {{
+                            callbacks: {{
+                                title: function(items) {{
+                                    if (!items || !items.length) return '';
+                                    return _utcFull(items[0].parsed.x);
+                                }},
+                                label: function(item) {{
+                                    const raw = item.raw;
+                                    if (!raw || !raw._meta) return '';
+                                    const m = raw._meta;
+                                    if (m.endpoint) {{
+                                        return m.endpoint + '  ' + (+m.duration_s).toFixed(2)
+                                            + 's  (L' + (m.launch_idx + 1) + ')';
+                                    }}
+                                    const prefix = m.approx ? '~ ' : '';
+                                    if (m.children && m.children.length) {{
+                                        const lines = [prefix + m.logger];
+                                        m.children.slice(0, 10).forEach(function(c) {{
+                                            lines.push('  · ' + c.logger);
+                                        }});
+                                        if (m.children.length > 10) {{
+                                            lines.push('  · +' + (m.children.length - 10) + ' more');
+                                        }}
+                                        return lines;
+                                    }}
+                                    return prefix + m.logger + (m.message ? ': ' + m.message : '');
+                                }},
+                            }},
+                        }},
+                    }},
+                }},
+                plugins: [intervalBarPlugin],
             }});
         }}
 
@@ -3870,7 +4550,8 @@ def serve_html(html_content: str):
         httpd.serve_forever()
 
 
-def generate_report_for_urls(urls, payload_key=None, log=print, report_password=None):
+def generate_report_for_urls(urls, payload_key=None, log=print, report_password=None,
+                              databricks_log_dir=None):
     """Run the same pipeline as the CLI but return the rendered HTML instead
     of serving it. Used by the SPA backend so it can persist the report to
     disk and serve it later. Mirrors the dispatch in ``main()`` exactly.
@@ -3955,11 +4636,33 @@ def generate_report_for_urls(urls, payload_key=None, log=print, report_password=
     timings_list          = [r[1] for r in results]
     detailed_timings_list = [r[2] for r in results]
 
+    # Optionally pull the full Databricks job log set. We don't clamp to the
+    # RP launch window: the pipeline runs span beyond the test execution
+    # (data prep before, cleanup after) and the user wants the full
+    # performance-dynamics view, not just the overlap.
+    # Resolution order for the log dir: explicit kwarg (per-report upload via
+    # the SPA) > DOKIMOS_DATABRICKS_LOG_DIR env var > disabled.
+    effective_dbx_log_dir = databricks_log_dir or DATABRICKS_LOG_DIR
+    databricks_events: list = []
+    if effective_dbx_log_dir:
+        log(f"Fetching Databricks events from {effective_dbx_log_dir}...")
+        try:
+            databricks_events = fetch_databricks_logs(effective_dbx_log_dir)
+            if databricks_events:
+                log(f"  Found {len(databricks_events)} events "
+                    f"({databricks_events[0].timestamp.isoformat()} -> "
+                    f"{databricks_events[-1].timestamp.isoformat()})")
+            else:
+                log(f"  No events parsed from {DATABRICKS_LOG_DIR}")
+        except Exception as exc:
+            log(f"  WARN: failed to load Databricks logs: {exc}")
+
     launch_ids = [launch['numeric_id'] for launch in launches]
     html = generate_multi_comparison_html(
         launch_labels, logs_list, timings_list, detailed_timings_list,
         launch_ids=launch_ids,
         report_password=report_password,
+        databricks_events=databricks_events,
     )
     all_eps = set()
     for t in timings_list:
