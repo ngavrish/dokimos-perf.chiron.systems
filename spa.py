@@ -95,9 +95,628 @@ def _sprint_label(start: date, end: date) -> str:
 # --------------------------------------------------------------------------- #
 # Storage paths
 # --------------------------------------------------------------------------- #
-PACKAGE_DIR = os.path.dirname(os.path.abspath(__file__))
-REPORTS_DIR = os.path.join(PACKAGE_DIR, "reports")
-ASSETS_DIR  = os.path.join(PACKAGE_DIR, "assets")
+PACKAGE_DIR    = os.path.dirname(os.path.abspath(__file__))
+REPORTS_DIR    = os.path.join(PACKAGE_DIR, "reports")
+ASSETS_DIR     = os.path.join(PACKAGE_DIR, "assets")
+PIPELINES_FILE = os.path.join(PACKAGE_DIR, "pipelines.json")
+
+# Root for the Tests tab's file browser. Defaults to the local
+# InventoryForecasting test corpus when present; override with
+# DOKIMOS_TESTS_DIR to point at any other tree.
+TESTS_DIR = os.environ.get(
+    "DOKIMOS_TESTS_DIR",
+    "/Users/boberit/work/disney/ad-apps-test-automation/NAS_components/InventoryForecasting",
+)
+
+# Cap a single served file at ~2 MB so a stray binary in the tree can't
+# crash the browser or starve memory.
+_TESTS_FILE_MAX_BYTES = 2 * 1024 * 1024
+# Directories to skip entirely when walking the tree.
+_TESTS_SKIP_DIRS = {".git", "__pycache__", ".venv", "node_modules",
+                    ".pytest_cache", ".mypy_cache", ".ruff_cache"}
+# Suffixes we refuse to serve (binary / huge / not useful as source).
+_TESTS_BINARY_SUFFIXES = {
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".pdf",
+    ".jar", ".so", ".dylib", ".dll", ".exe", ".bin",
+    ".zip", ".tar", ".gz", ".tgz", ".7z", ".rar",
+    ".pyc", ".pyo", ".class",
+    ".woff", ".woff2", ".ttf", ".otf", ".eot",
+    ".mp4", ".mov", ".mp3", ".wav",
+    ".db", ".sqlite", ".sqlite3",
+}
+
+
+def _safe_test_path(rel: str) -> Optional[str]:
+    """Resolve a relative path against TESTS_DIR, refusing any escape via
+    symlinks or `..`. Returns the absolute path if safe, else None."""
+    if not TESTS_DIR or not os.path.isdir(TESTS_DIR):
+        return None
+    root = os.path.realpath(TESTS_DIR)
+    candidate = os.path.realpath(os.path.join(root, rel))
+    # Must live strictly under root (or be root itself).
+    if candidate != root and not candidate.startswith(root + os.sep):
+        return None
+    return candidate
+
+
+# --------------------------------------------------------------------------- #
+# Pipelines: lightweight on-disk queue of test-run requests
+# --------------------------------------------------------------------------- #
+# A "pipeline" is a single requested test run -- captured from the Tests tab's
+# Schedule/Run-now buttons. We persist these as a JSON list so the queue
+# survives SPA restarts. There is intentionally no execution backend yet:
+# pipelines created here sit in `scheduled`/`running` until an out-of-band
+# runner (Docker, Spinnaker, etc.) advances them. Until then this is just a
+# durable record of what was requested.
+
+_PIPELINE_KINDS    = ("schedule", "now")
+_PIPELINE_STATUSES = ("scheduled", "running", "finished", "failed")
+
+# Default Docker image tag (overridable via env). The repo's perf README
+# documents this exact tag as the canonical local build target.
+DOCKER_IMAGE = os.environ.get("DOKIMOS_DOCKER_IMAGE", "ifp-fcap-perf:latest")
+
+# Where in the InventoryForecasting tree the perf Dockerfile + README live.
+# We auto-discover by scanning, but this constant is the documented spot.
+_DOCKERFILE_BASENAMES = ("Dockerfile",)
+_DOCKER_README_BASENAMES = ("README.md", "Readme.md", "readme.md")
+
+# Persistence write lock -- pipeline runner threads and the scheduler can
+# race on _save_pipelines() otherwise.
+_PIPELINES_LOCK = None  # lazily initialised on first use to avoid import-time threading
+
+
+def _pipelines_lock():
+    global _PIPELINES_LOCK
+    if _PIPELINES_LOCK is None:
+        import threading
+        _PIPELINES_LOCK = threading.Lock()
+    return _PIPELINES_LOCK
+
+
+def _discover_docker_assets() -> dict:
+    """Walk TESTS_DIR for a Dockerfile + an adjacent README. Returns
+    {'dockerfile': abs_path | None, 'readme': abs_path | None,
+     'context_dir': abs_path | None, 'rel_root': abs_path | None}.
+
+    `context_dir` is the directory the README's documented `docker build`
+    expects to run from (the repo root, two levels up from
+    .../perf/Dockerfile). We look for the nearest ancestor that has a
+    `pyproject.toml` -- that pins it without hardcoding."""
+    if not os.path.isdir(TESTS_DIR):
+        return {"dockerfile": None, "readme": None, "context_dir": None, "rel_root": None}
+    # Prefer perf/ subdir (canonical), fall back to anything under TESTS_DIR.
+    candidates = []
+    perf_dir = os.path.join(TESTS_DIR, "perf")
+    if os.path.isdir(perf_dir):
+        candidates.append(perf_dir)
+    candidates.append(TESTS_DIR)
+
+    found_df, found_readme = None, None
+    for cand in candidates:
+        for root, dirs, files in os.walk(cand):
+            dirs[:] = [d for d in dirs if d not in _TESTS_SKIP_DIRS]
+            if not found_df:
+                for fn in files:
+                    if fn in _DOCKERFILE_BASENAMES:
+                        found_df = os.path.join(root, fn)
+                        break
+            if found_df and not found_readme:
+                # README in the same directory as the Dockerfile wins.
+                df_dir = os.path.dirname(found_df)
+                for fn in _DOCKER_README_BASENAMES:
+                    rp = os.path.join(df_dir, fn)
+                    if os.path.isfile(rp):
+                        found_readme = rp
+                        break
+            if found_df and found_readme:
+                break
+        if found_df and found_readme:
+            break
+
+    # Walk up from the Dockerfile until we find a pyproject.toml; that's the
+    # documented `docker build` context root.
+    context_dir = None
+    if found_df:
+        p = os.path.dirname(found_df)
+        for _ in range(8):
+            if os.path.isfile(os.path.join(p, "pyproject.toml")):
+                context_dir = p
+                break
+            new_p = os.path.dirname(p)
+            if new_p == p:
+                break
+            p = new_p
+
+    return {"dockerfile": found_df, "readme": found_readme,
+            "context_dir": context_dir, "rel_root": context_dir}
+
+
+def _build_docker_command(pipeline: dict, assets: dict) -> tuple:
+    """Build the `docker run` argv from a pipeline record + discovered assets.
+
+    Follows the documented invocation in the perf README: mount tests/.envrc
+    read-only so credentials don't need to live in the SPA process env, and
+    pass ENV / PARALLEL_THREADS / optional TESTS+BEHAVEX_EXTRA as env vars.
+
+    Returns (argv, envrc_host_path | None)."""
+    argv = ["docker", "run", "--rm"]
+    # Mount the local .envrc so secrets aren't echoed via -e flags.
+    envrc_host = None
+    if assets.get("rel_root"):
+        envrc_candidate = os.path.join(
+            assets["rel_root"],
+            "NAS_components", "InventoryForecasting", "tests", ".envrc",
+        )
+        if os.path.isfile(envrc_candidate):
+            envrc_host = envrc_candidate
+            argv += ["-v", f"{envrc_host}:/secrets/.envrc:ro",
+                     "-e", "PERF_ENVRC=/secrets/.envrc"]
+
+    # Env vars from the pipeline config.
+    env_pairs = [
+        ("ENV",              pipeline["env"]),
+        ("PARALLEL_THREADS", str(pipeline["parallel"])),
+    ]
+    if pipeline.get("feature"):
+        env_pairs.append(("TESTS", pipeline["feature"]))
+    extras = (pipeline.get("tests") or "").strip()
+    if extras:
+        # Whatever the user typed in the Tests filter field -- pass through
+        # as raw behavex args. The entrypoint forwards BEHAVEX_EXTRA verbatim.
+        env_pairs.append(("BEHAVEX_EXTRA", extras))
+
+    for k, v in env_pairs:
+        argv += ["-e", f"{k}={v}"]
+
+    argv.append(DOCKER_IMAGE)
+    return argv, envrc_host
+
+
+# Regex for spotting a Report Portal launch URL in behavex output. The IFP
+# suite logs lines like "Launch URL: https://ads-report-portal.../launches/all/<id>".
+_RP_URL_RE = None
+def _rp_url_re():
+    global _RP_URL_RE
+    if _RP_URL_RE is None:
+        import re as _re
+        _RP_URL_RE = _re.compile(r"(https?://[^\s'\"]*report-portal[^\s'\"]*launches[^\s'\"]+)")
+    return _RP_URL_RE
+
+
+def _append_pipeline_log(pipeline_id: str, *lines: str, **mut) -> None:
+    """Atomically append log lines (and optionally mutate top-level fields)
+    on a single pipeline record. Held under the persistence lock so the
+    runner thread and the scheduler can't trample each other."""
+    with _pipelines_lock():
+        pipelines = _load_pipelines()
+        for p in pipelines:
+            if p.get("id") == pipeline_id:
+                p.setdefault("logs", []).extend(lines)
+                for k, v in mut.items():
+                    p[k] = v
+                break
+        _save_pipelines(pipelines)
+
+
+def _run_pipeline(pipeline_id: str) -> None:
+    """Execute a pipeline's docker container. Runs in a worker thread.
+
+    Hard invariant: this function NEVER lets a pipeline stay in `running`
+    when it returns. Any exit path -- success, docker non-zero exit, missing
+    binary, missing image, unexpected exception in the stdout-read loop --
+    sets a final status (`finished` or `failed`) before returning. The
+    outermost try/except ensures even a bug here can't strand a record."""
+    import shutil
+    import subprocess
+    import traceback
+
+    final_status = None  # set by inner paths; the outer finally enforces it.
+    proc = None
+    try:
+        with _pipelines_lock():
+            pipelines = _load_pipelines()
+            rec = next((p for p in pipelines if p.get("id") == pipeline_id), None)
+        if rec is None:
+            return
+
+        assets = _discover_docker_assets()
+        if not assets["dockerfile"]:
+            _append_pipeline_log(
+                pipeline_id,
+                f"[{_now_iso()}] ERROR: no Dockerfile found under {TESTS_DIR}",
+                f"[{_now_iso()}] expected one of: {TESTS_DIR}/perf/Dockerfile",
+                status="failed", finished_at=_now_iso(),
+            )
+            final_status = "failed"
+            return
+
+        if shutil.which("docker") is None:
+            _append_pipeline_log(
+                pipeline_id,
+                f"[{_now_iso()}] ERROR: `docker` not found on PATH.",
+                f"[{_now_iso()}] install Docker Desktop (or colima) and retry.",
+                status="failed", finished_at=_now_iso(),
+            )
+            final_status = "failed"
+            return
+
+        argv, envrc = _build_docker_command(rec, assets)
+        _append_pipeline_log(
+            pipeline_id,
+            f"[{_now_iso()}] discovered Dockerfile: {assets['dockerfile']}",
+            f"[{_now_iso()}] readme: {assets['readme'] or '(none)'}",
+            f"[{_now_iso()}] build context: {assets['rel_root'] or '(unknown)'}",
+            f"[{_now_iso()}] mounted secrets: {envrc or '(none, expect missing-env failures)'}",
+            f"[{_now_iso()}] running: {' '.join(argv)}",
+            status="running",
+            started_at=rec.get("started_at") or _now_iso(),
+        )
+
+        try:
+            proc = subprocess.Popen(
+                argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1,
+            )
+        except FileNotFoundError:
+            _append_pipeline_log(
+                pipeline_id,
+                f"[{_now_iso()}] ERROR: docker invocation failed (binary missing?)",
+                status="failed", finished_at=_now_iso(),
+            )
+            final_status = "failed"
+            return
+        except Exception as exc:
+            _append_pipeline_log(
+                pipeline_id,
+                f"[{_now_iso()}] ERROR: failed to start docker: {type(exc).__name__}: {exc}",
+                status="failed", finished_at=_now_iso(),
+            )
+            final_status = "failed"
+            return
+
+        image_missing_hint_emitted = False
+        rp_url_found = None
+        try:
+            for raw_line in proc.stdout:
+                line = raw_line.rstrip("\r\n")
+                if not line:
+                    continue
+                # Surface a useful hint if Docker tells us the image isn't built.
+                if (not image_missing_hint_emitted and (
+                    "Unable to find image" in line or "pull access denied" in line
+                )):
+                    image_missing_hint_emitted = True
+                    _append_pipeline_log(
+                        pipeline_id,
+                        line,
+                        f"[{_now_iso()}] HINT: build the image first --",
+                        f"[{_now_iso()}]   cd {assets['rel_root']}",
+                        f"[{_now_iso()}]   DOCKER_BUILDKIT=1 docker build -f {assets['dockerfile']} -t {DOCKER_IMAGE} .",
+                    )
+                    continue
+                # Capture the first Report Portal URL we see.
+                if rp_url_found is None:
+                    m = _rp_url_re().search(line)
+                    if m:
+                        rp_url_found = m.group(1)
+                        _append_pipeline_log(pipeline_id, line, rp_url=rp_url_found)
+                        continue
+                _append_pipeline_log(pipeline_id, line)
+        except Exception as exc:
+            # Unexpected error while streaming output -- log it but make sure
+            # we still drain + wait the process and mark the pipeline failed.
+            _append_pipeline_log(
+                pipeline_id,
+                f"[{_now_iso()}] ERROR: runner streaming loop crashed: "
+                f"{type(exc).__name__}: {exc}",
+                f"[{_now_iso()}] traceback: {traceback.format_exc()}",
+            )
+            final_status = "failed"
+
+        # Wait for the process even if streaming was interrupted.
+        try:
+            rc = proc.wait(timeout=30)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            rc = -1
+
+        # If we didn't already decide to fail (no exception above), use the
+        # process exit code to choose between finished and failed.
+        if final_status is None:
+            final_status = "finished" if rc == 0 else "failed"
+        _append_pipeline_log(
+            pipeline_id,
+            f"[{_now_iso()}] docker exited with code {rc} -- status: {final_status}",
+            status=final_status, finished_at=_now_iso(),
+        )
+
+    except Exception as exc:
+        # Catch-all outer guard: anything weird (lock errors, JSON corruption,
+        # whatever) lands the pipeline in `failed` rather than leaving it
+        # stuck in `running` forever.
+        try:
+            _append_pipeline_log(
+                pipeline_id,
+                f"[{_now_iso()}] FATAL: runner thread crashed: "
+                f"{type(exc).__name__}: {exc}",
+                f"[{_now_iso()}] traceback: {traceback.format_exc()}",
+                status="failed", finished_at=_now_iso(),
+            )
+        except Exception:
+            pass
+        final_status = "failed"
+    finally:
+        # Defence in depth: if some path above forgot to set a final status,
+        # do it here. The record cannot stay in `running` after this thread.
+        try:
+            with _pipelines_lock():
+                pipelines = _load_pipelines()
+                for p in pipelines:
+                    if p.get("id") == pipeline_id and p.get("status") == "running":
+                        p["status"] = "failed"
+                        p["finished_at"] = _now_iso()
+                        p.setdefault("logs", []).append(
+                            f"[{p['finished_at']}] WATCHDOG: runner exited "
+                            "without setting a final status; flipping to failed."
+                        )
+                        _save_pipelines(pipelines)
+                        break
+        except Exception:
+            pass
+
+
+def _start_runner(pipeline_id: str) -> None:
+    """Spawn a daemon thread to execute the pipeline."""
+    import threading
+    t = threading.Thread(target=_run_pipeline, args=(pipeline_id,),
+                         daemon=True, name=f"pipeline-{pipeline_id}")
+    t.start()
+
+
+def _reconcile_orphan_pipelines() -> int:
+    """Any pipeline marked `running` at boot is an orphan -- its runner
+    thread died with the previous SPA process. The docker container itself
+    was started with `--rm` so it's already gone (or will be gone shortly).
+    We flip those records to `failed` so they don't sit in Running forever.
+
+    Returns the number of records reconciled."""
+    with _pipelines_lock():
+        pipelines = _load_pipelines()
+        n = 0
+        for p in pipelines:
+            if p.get("status") == "running":
+                p["status"] = "failed"
+                p["finished_at"] = _now_iso()
+                p.setdefault("logs", []).append(
+                    f"[{p['finished_at']}] ORPHANED: SPA restarted while this "
+                    "pipeline was running. Runner thread did not survive the "
+                    "restart, so its docker container is no longer tracked. "
+                    "Marking failed. Re-trigger the run if needed."
+                )
+                n += 1
+        if n:
+            _save_pipelines(pipelines)
+        return n
+
+
+_SCHEDULER_STARTED = False
+def _ensure_pipeline_scheduler() -> None:
+    """Start the singleton scheduler thread on first call. Picks up scheduled
+    pipelines whose `scheduled_for` has arrived and kicks off their runners."""
+    global _SCHEDULER_STARTED
+    if _SCHEDULER_STARTED:
+        return
+    _SCHEDULER_STARTED = True
+    import threading
+
+    def loop():
+        import time as _time
+        while True:
+            try:
+                now = datetime.now().astimezone()
+                with _pipelines_lock():
+                    pipelines = _load_pipelines()
+                    changed = False
+                    to_launch = []
+                    for p in pipelines:
+                        if p.get("status") != "scheduled":
+                            continue
+                        sf = p.get("scheduled_for")
+                        if not sf:
+                            continue
+                        try:
+                            sf_dt = datetime.fromisoformat(sf.replace("Z", "+00:00"))
+                        except ValueError:
+                            continue
+                        if sf_dt <= now:
+                            p["status"] = "running"
+                            p["started_at"] = _now_iso()
+                            p.setdefault("logs", []).append(
+                                f"[{p['started_at']}] scheduler: due, launching docker"
+                            )
+                            to_launch.append(p["id"])
+                            changed = True
+                    if changed:
+                        _save_pipelines(pipelines)
+                for pid in to_launch:
+                    _start_runner(pid)
+            except Exception:
+                pass
+            _time.sleep(15)
+
+    threading.Thread(target=loop, daemon=True, name="pipeline-scheduler").start()
+
+
+def _load_pipelines() -> list:
+    if not os.path.isfile(PIPELINES_FILE):
+        return []
+    try:
+        with open(PIPELINES_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except (OSError, ValueError):
+        return []
+
+
+def _save_pipelines(pipelines: list) -> None:
+    """Atomic write so a crash mid-save doesn't truncate the file."""
+    tmp = PIPELINES_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(pipelines, f, indent=2)
+    os.replace(tmp, PIPELINES_FILE)
+
+
+def _new_pipeline_id() -> str:
+    return "pl_" + secrets.token_urlsafe(8).replace("-", "").replace("_", "")[:10]
+
+
+def _now_iso() -> str:
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _create_pipeline(cfg: dict, iteration_index: int = 1, iteration_count: int = 1) -> dict:
+    """Build a new pipeline record from the run config posted by the SPA,
+    persist it, and return the full record. When part of a multi-iteration
+    burst, ``iteration_index`` / ``iteration_count`` drive name suffixing
+    (e.g. ``nightly-smoke-1``, ``nightly-smoke-2``)."""
+    kind = cfg.get("kind") if cfg.get("kind") in _PIPELINE_KINDS else "now"
+    now = datetime.now().astimezone()
+    if kind == "now":
+        status, started_at, scheduled_for = "running", now.isoformat(timespec="seconds"), None
+    else:
+        status, started_at = "scheduled", None
+        # Honour a client-provided scheduled_for (from the datetime modal) if
+        # it parses; otherwise fall back to "now + 1h".
+        scheduled_str = cfg.get("scheduled_for")
+        scheduled_for = None
+        if scheduled_str:
+            try:
+                parsed = datetime.fromisoformat(str(scheduled_str).replace("Z", "+00:00"))
+                scheduled_for = parsed.astimezone().isoformat(timespec="seconds")
+            except (ValueError, TypeError):
+                scheduled_for = None
+        if not scheduled_for:
+            scheduled_for = (now + timedelta(hours=1)).isoformat(timespec="seconds")
+
+    name = (cfg.get("name") or "").strip()
+    if not name:
+        # Generate a sensible default name.
+        name = f"{kind}-{now.strftime('%Y%m%d-%H%M%S')}"
+    # When the user requested >1 iteration, suffix the name so each pipeline
+    # is individually identifiable in the queue.
+    if iteration_count > 1:
+        name = f"{name}-{iteration_index}"
+
+    record = {
+        "id":            _new_pipeline_id(),
+        "name":          name,
+        "status":        status,
+        "kind":          kind,
+        "env":           (cfg.get("env") or "prod").lower(),
+        "parallel":      max(1, min(6, int(cfg.get("parallel") or 2))),
+        "feature":       (cfg.get("feature") or "").strip(),
+        "tests":         (cfg.get("tests") or "").strip(),
+        "created_at":    now.isoformat(timespec="seconds"),
+        "scheduled_for": scheduled_for,
+        "started_at":    started_at,
+        "finished_at":   None,
+        "rp_url":        None,
+        "logs": [
+            f"[{_now_iso()}] pipeline created: id={record_id_placeholder()}"  # noqa: F821
+        ],
+    }
+    # Reify the log line with the real ID now that we have one.
+    record["logs"][0] = (
+        f"[{record['created_at']}] pipeline {record['id']} created "
+        f"(kind={kind}, env={record['env']}, parallel={record['parallel']})"
+    )
+    if record["feature"]:
+        record["logs"].append(f"[{record['created_at']}] feature: {record['feature']}")
+    if record["tests"]:
+        record["logs"].append(f"[{record['created_at']}] tests filter: {record['tests']}")
+    if status == "running":
+        record["logs"].append(f"[{record['created_at']}] state: running (waiting for runner)")
+    else:
+        record["logs"].append(
+            f"[{record['created_at']}] state: scheduled for {scheduled_for}"
+        )
+
+    pipelines = _load_pipelines()
+    pipelines.append(record)
+    _save_pipelines(pipelines)
+    return record
+
+
+def record_id_placeholder() -> str:
+    # Tiny shim so the f-string above stays readable; the value is replaced
+    # immediately after with record["id"].
+    return "?"
+
+
+def _discover_environments() -> list:
+    """Read tests/.envrc and extract environment names from variable suffixes.
+
+    Matches variable names ending in `_dev`, `_qa`, `_staging`, `_preprod`,
+    `_prod` (and similar) -- those are how the IFP test suite signals which
+    environment each credential belongs to. Returns the unique env names in
+    a stable canonical order (most-stable → least-stable, prod first).
+    """
+    import re
+    canonical_order = ["prod", "preprod", "staging", "uat", "qa", "dev"]
+    envrc_path = os.path.join(TESTS_DIR, "tests", ".envrc")
+    if not os.path.isfile(envrc_path):
+        return ["prod"]
+    found: set = set()
+    pat = re.compile(r"^\s*export\s+([A-Za-z_][A-Za-z0-9_]*)\s*=", re.MULTILINE)
+    try:
+        with open(envrc_path, "r", encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except OSError:
+        return ["prod"]
+    for m in pat.finditer(text):
+        var = m.group(1).lower()
+        for env in canonical_order:
+            if var.endswith("_" + env):
+                found.add(env)
+                break
+    # Preserve canonical order, drop missing, ensure 'prod' is always offered
+    # so the default works even if .envrc is sparse.
+    out = [e for e in canonical_order if e in found]
+    if "prod" not in out:
+        out.insert(0, "prod")
+    return out
+
+
+def _build_tests_tree(root: str) -> dict:
+    """Walk TESTS_DIR and return a nested dict {name, type, path, children?}.
+    Folders are listed before files; both alphabetised. Skips common
+    machine-generated directories so the UI stays tidy."""
+    def _node(abs_path: str, rel: str) -> dict:
+        name = os.path.basename(abs_path) or rel or "(root)"
+        if os.path.isdir(abs_path):
+            children = []
+            try:
+                entries = sorted(os.listdir(abs_path), key=str.lower)
+            except OSError:
+                entries = []
+            for entry in entries:
+                if entry.startswith(".DS_Store"):
+                    continue
+                if entry in _TESTS_SKIP_DIRS:
+                    continue
+                child_abs = os.path.join(abs_path, entry)
+                child_rel = os.path.join(rel, entry) if rel else entry
+                children.append(_node(child_abs, child_rel))
+            # Folders first, then files, each alphabetical.
+            children.sort(key=lambda n: (0 if n["type"] == "dir" else 1, n["name"].lower()))
+            return {"name": name, "type": "dir", "path": rel, "children": children}
+        return {"name": name, "type": "file", "path": rel,
+                "size": os.path.getsize(abs_path) if os.path.exists(abs_path) else 0}
+    return _node(os.path.realpath(root), "")
 
 
 def _ensure_reports_dir() -> None:
@@ -886,6 +1505,418 @@ html, body {
 }
 .tab-btn .num     { color: var(--bronze); margin-right: 6px; }
 
+/* ----- Tests tab: file tree + code viewer ----- */
+.tests-layout {
+    display: grid;
+    grid-template-columns: 320px 1fr;
+    gap: 0;
+    min-height: 70vh;
+    border: 1px solid var(--divider);
+    border-radius: 6px;
+    overflow: hidden;
+}
+.tests-tree {
+    background: var(--bg-card);
+    overflow: auto;
+    padding: 10px 6px;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    border-right: 1px solid var(--divider);
+    max-height: 80vh;
+}
+.tests-tree-loading,
+.tests-tree-error {
+    color: rgba(255,255,255,0.45);
+    padding: 8px 10px;
+}
+.tests-tree-error { color: var(--red); }
+.tests-tree ul { list-style: none; margin: 0; padding-left: 14px; }
+.tests-tree ul.tree-root { padding-left: 0; }
+.tests-tree li { line-height: 1.6; white-space: nowrap; }
+.tests-tree .tree-dir-label {
+    cursor: pointer;
+    color: rgba(255,255,255,0.85);
+    user-select: none;
+    padding: 1px 4px;
+    border-radius: 3px;
+}
+.tests-tree .tree-dir-label:hover { background: var(--bg-card-hi); }
+.tests-tree .tree-dir-label::before { content: "▾ "; color: var(--bronze); font-size: 9px; }
+.tests-tree .tree-dir.collapsed > .tree-dir-label::before { content: "▸ "; }
+.tests-tree .tree-dir.collapsed > .tree-children { display: none; }
+.tests-tree .tree-file {
+    cursor: pointer;
+    color: rgba(255,255,255,0.72);
+    padding: 1px 4px 1px 14px;
+    border-radius: 3px;
+}
+.tests-tree .tree-file:hover { background: var(--bg-card-hi); color: var(--white-soft); }
+.tests-tree .tree-file.active {
+    background: rgba(205,127,50,0.18);
+    color: var(--bronze);
+}
+
+.tests-view {
+    display: flex;
+    flex-direction: column;
+    background: var(--bg-dark);
+    overflow: hidden;
+    min-width: 0;
+}
+.tests-view-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 8px 14px;
+    border-bottom: 1px solid var(--divider);
+    background: var(--bg-card);
+    font-family: var(--font-mono);
+    font-size: 12px;
+}
+.tests-view-path {
+    color: var(--white-soft);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.tests-view-size { color: rgba(255,255,255,0.45); margin-left: 12px; }
+.tests-view-body {
+    flex: 1;
+    overflow: auto;
+    margin: 0;
+    padding: 14px 16px;
+    font-family: var(--font-mono);
+    font-size: 12.5px;
+    line-height: 1.5;
+    background: var(--bg-dark);
+}
+.tests-view-body code.hljs {
+    background: transparent !important;
+    padding: 0 !important;
+    color: rgba(220,230,242,0.92);
+}
+
+/* Tests tab toolbar */
+.tests-toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px 14px;
+    align-items: flex-end;
+    margin-bottom: 12px;
+    padding: 12px 14px;
+    background: var(--bg-card);
+    border: 1px solid var(--divider);
+    border-radius: 6px;
+}
+.tests-control { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.tests-control-grow { flex: 1 1 200px; }
+.tests-control label {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    letter-spacing: 1.1px;
+    text-transform: uppercase;
+    color: rgba(255,255,255,0.5);
+}
+.tests-control label .opt {
+    color: rgba(255,255,255,0.30);
+    text-transform: none;
+    letter-spacing: 0;
+    margin-left: 2px;
+}
+.tests-control select,
+.tests-control input[type="text"] {
+    background: var(--bg-dark);
+    color: var(--white-soft);
+    border: 1px solid var(--divider);
+    border-radius: 4px;
+    padding: 7px 10px;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    min-width: 110px;
+    outline: none;
+    transition: border-color 120ms ease;
+}
+.tests-control input[type="text"] { width: 100%; }
+.tests-control select:focus,
+.tests-control input[type="text"]:focus { border-color: var(--bronze); }
+.tests-toolbar-actions { display: flex; gap: 8px; align-self: flex-end; }
+.tests-toolbar-actions .btn-primary,
+.tests-toolbar-actions .btn-secondary {
+    padding: 8px 16px;
+    font-size: 11px;
+    white-space: nowrap;
+}
+.tests-parallel-warning {
+    flex-basis: 100%;
+    padding: 8px 12px;
+    background: rgba(245,158,11,0.10);
+    border-left: 2px solid rgba(245,158,11,0.7);
+    color: rgba(255,229,180,0.92);
+    font-size: 11.5px;
+    border-radius: 0 4px 4px 0;
+    font-family: var(--font-mono);
+}
+
+/* Pipelines tab: list (left) + log viewer (right) */
+.pipelines-layout {
+    display: grid;
+    grid-template-columns: 360px 1fr;
+    min-height: 70vh;
+    border: 1px solid var(--divider);
+    border-radius: 6px;
+    overflow: hidden;
+}
+.pipelines-list {
+    background: var(--bg-card);
+    overflow: auto;
+    padding: 12px 10px;
+    border-right: 1px solid var(--divider);
+    max-height: 80vh;
+}
+.pipelines-list-loading { color: rgba(255,255,255,0.45); padding: 8px 6px; }
+.pipelines-list-section {
+    margin-bottom: 14px;
+}
+.pipelines-list-section-title {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 1.2px;
+    color: rgba(255,255,255,0.45);
+    padding: 4px 6px 6px;
+    border-bottom: 1px solid var(--divider);
+    margin-bottom: 6px;
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+}
+.pipelines-list-section-title .count {
+    background: var(--bg-card-hi);
+    color: rgba(255,255,255,0.65);
+    padding: 1px 6px;
+    border-radius: 8px;
+    font-size: 9px;
+}
+.pipelines-list-empty {
+    color: rgba(255,255,255,0.30);
+    font-size: 11px;
+    padding: 6px 8px;
+    font-style: italic;
+}
+.pipeline-item {
+    padding: 8px 10px;
+    margin-bottom: 5px;
+    border-radius: 4px;
+    cursor: pointer;
+    transition: background 100ms ease;
+    border-left: 3px solid transparent;
+}
+.pipeline-item:hover { background: var(--bg-card-hi); }
+.pipeline-item.active { background: var(--bg-card-hi); border-left-color: var(--bronze); }
+.pipeline-item-name {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--white-soft);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.pipeline-item-meta {
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    color: rgba(255,255,255,0.55);
+    margin-top: 3px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.pipeline-item .rp-link {
+    color: var(--bronze);
+    text-decoration: none;
+    border-bottom: 1px dotted var(--bronze-dk);
+    font-size: 11px;
+    margin-top: 5px;
+    display: inline-block;
+}
+.pipeline-item .rp-link:hover { color: #ffa867; }
+.pipeline-item.status-running   { border-left-color: #60a5fa; }
+.pipeline-item.status-scheduled { border-left-color: #f59e0b; }
+.pipeline-item.status-finished  { border-left-color: #10b981; }
+.pipeline-item.status-failed    { border-left-color: var(--red); }
+
+.pipelines-view {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    background: var(--bg-dark);
+}
+.pipelines-view-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 8px 14px;
+    border-bottom: 1px solid var(--divider);
+    background: var(--bg-card);
+    font-family: var(--font-mono);
+    font-size: 12px;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+.pipelines-view-title { color: var(--white-soft); }
+.pipelines-view-status {
+    color: rgba(255,255,255,0.55);
+    font-size: 11px;
+}
+.pipelines-view-status .status-pill {
+    padding: 2px 8px;
+    border-radius: 10px;
+    font-size: 10px;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    color: var(--white-soft);
+}
+.pipelines-view-status .status-running   { background: rgba(96,165,250,0.25); color: #93c5fd; }
+.pipelines-view-status .status-scheduled { background: rgba(245,158,11,0.20); color: #fcd34d; }
+.pipelines-view-status .status-finished  { background: rgba(16,185,129,0.22); color: #6ee7b7; }
+.pipelines-view-status .status-failed    { background: rgba(226,101,101,0.22); color: #fca5a5; }
+
+/* Pulsing "live" indicator for running pipelines. Sits inline next to the
+   pipeline name in the list and next to the status pill in the header. */
+.live-dot {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #10b981;
+    box-shadow: 0 0 4px rgba(16, 185, 129, 0.55);
+    margin-right: 6px;
+    vertical-align: middle;
+    animation: dokimos-pulse-green 1.5s ease-in-out infinite;
+}
+@keyframes dokimos-pulse-green {
+    0%, 100% {
+        opacity: 0.55;
+        box-shadow: 0 0 3px rgba(16, 185, 129, 0.45),
+                    0 0 0 0 rgba(16, 185, 129, 0.0);
+    }
+    50% {
+        opacity: 1;
+        box-shadow: 0 0 8px rgba(16, 185, 129, 0.95),
+                    0 0 0 4px rgba(16, 185, 129, 0.12);
+    }
+}
+
+/* Schedule-run modal */
+.schedule-modal {
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.65);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 9000;
+    backdrop-filter: blur(2px);
+}
+.schedule-modal[hidden] { display: none; }
+.schedule-modal-box {
+    background: var(--bg-card);
+    border: 1px solid var(--divider);
+    border-radius: 8px;
+    padding: 22px 26px;
+    width: 100%;
+    max-width: 440px;
+    box-shadow: 0 18px 60px rgba(0,0,0,0.55);
+}
+.schedule-modal-box h3 {
+    margin: 0 0 8px;
+    color: var(--bronze);
+    font-family: var(--font-mono);
+    font-size: 14px;
+    letter-spacing: 1.2px;
+    text-transform: uppercase;
+}
+.schedule-modal-sub {
+    margin: 0 0 16px;
+    color: rgba(255,255,255,0.65);
+    font-size: 12.5px;
+    line-height: 1.5;
+}
+.schedule-modal-sub span { color: var(--bronze); font-family: var(--font-mono); }
+.schedule-modal-label {
+    display: block;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    letter-spacing: 1.2px;
+    text-transform: uppercase;
+    color: rgba(255,255,255,0.5);
+    margin-bottom: 4px;
+}
+.schedule-modal input[type="datetime-local"] {
+    width: 100%;
+    background: var(--bg-dark);
+    color: var(--white-soft);
+    border: 1px solid var(--divider);
+    border-radius: 4px;
+    padding: 9px 12px;
+    font-family: var(--font-mono);
+    font-size: 13px;
+    outline: none;
+    color-scheme: dark;
+}
+.schedule-modal input[type="datetime-local"]:focus { border-color: var(--bronze); }
+.schedule-modal-iter {
+    margin: 10px 0 0;
+    color: rgba(255,255,255,0.45);
+    font-size: 11.5px;
+    font-family: var(--font-mono);
+}
+.schedule-modal-actions {
+    display: flex;
+    gap: 8px;
+    justify-content: flex-end;
+    margin-top: 18px;
+}
+
+/* Config strip above the log body -- shows the pipeline's params at a glance
+   so the viewer doesn't have to scroll to the top of the log to remember
+   what env / parallel / feature this run is. */
+.pipelines-view-config {
+    padding: 10px 16px;
+    border-bottom: 1px solid var(--divider);
+    background: rgba(255,255,255,0.018);
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    display: grid;
+    grid-template-columns: max-content 1fr;
+    gap: 4px 16px;
+    color: rgba(255,255,255,0.85);
+}
+.pipelines-view-config[hidden] { display: none; }
+.pipelines-view-config strong {
+    color: rgba(255,255,255,0.45);
+    font-weight: 500;
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 1.1px;
+    align-self: center;
+}
+.pipelines-view-config span.val { word-break: break-all; }
+.pipelines-view-config .empty   { color: rgba(255,255,255,0.30); font-style: italic; }
+
+.pipelines-view-logs {
+    flex: 1;
+    overflow: auto;
+    margin: 0;
+    padding: 14px 16px;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    line-height: 1.55;
+    color: rgba(220,230,242,0.92);
+    background: var(--bg-dark);
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
 /* ----- Cards (Dokimos "std_card") ----- */
 .card {
     position: relative;
@@ -1436,8 +2467,12 @@ SPA_HTML = f"""<!DOCTYPE html>
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Dokimos: Performance Report</title>
+    <title>Perf Runner</title>
     <link rel="icon" href="data:,">
+    <!-- highlight.js for the Tests tab code viewer. Atom One Dark matches
+         the existing dokimos dark palette closely enough to look native. -->
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.10.0/build/styles/atom-one-dark.min.css">
+    <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.10.0/build/highlight.min.js"></script>
     <style>{DOKIMOS_CSS}</style>
 </head>
 <body>
@@ -1452,13 +2487,15 @@ SPA_HTML = f"""<!DOCTYPE html>
                     </span>
                 </span>
             </a>
-            <span class="brand">Dokimos: Performance Report</span>
+            <span class="brand">Perf Runner</span>
             <span class="brand-sub">Prototype &middot; Encrypted reports</span>
         </header>
 
         <nav class="tabs">
-            <button class="tab-btn active" data-tab="new"     onclick="showTab('new')"><span class="num">01.</span>New</button>
-            <button class="tab-btn"        data-tab="reports" onclick="showTab('reports')"><span class="num">02.</span>Reports</button>
+            <button class="tab-btn active" data-tab="new"       onclick="showTab('new')"><span class="num">01.</span>New</button>
+            <button class="tab-btn"        data-tab="tests"     onclick="showTab('tests')"><span class="num">02.</span>Tests</button>
+            <button class="tab-btn"        data-tab="pipelines" onclick="showTab('pipelines')"><span class="num">03.</span>Pipelines</button>
+            <button class="tab-btn"        data-tab="reports"   onclick="showTab('reports')"><span class="num">04.</span>Reports</button>
         </nav>
 
         <section class="tab-panel active" data-panel="new">
@@ -1518,6 +2555,77 @@ SPA_HTML = f"""<!DOCTYPE html>
             </div>
         </section>
 
+        <section class="tab-panel" data-panel="tests">
+            <div class="tests-toolbar">
+                <div class="tests-control">
+                    <label>Environment</label>
+                    <select id="testsEnv"><option value="prod" selected>prod</option></select>
+                </div>
+                <div class="tests-control">
+                    <label>Parallel</label>
+                    <select id="testsParallel">
+                        <option value="2" selected>2</option>
+                        <option value="3">3</option>
+                        <option value="4">4</option>
+                        <option value="5">5</option>
+                        <option value="6">6</option>
+                    </select>
+                </div>
+                <div class="tests-control">
+                    <label>Iterations</label>
+                    <input type="number" id="testsIterations" min="1" max="50" value="1"
+                           title="Number of identical pipelines to enqueue">
+                </div>
+                <div class="tests-control tests-control-grow">
+                    <label>Name <span class="opt">(optional)</span></label>
+                    <input type="text" id="testsName" placeholder="e.g. nightly-smoke-2026-06-03">
+                </div>
+                <div class="tests-control tests-control-grow">
+                    <label>Feature path <span class="opt">(optional)</span></label>
+                    <input type="text" id="testsFeature" placeholder="tests/api_tests/some.feature">
+                </div>
+                <div class="tests-control tests-control-grow">
+                    <label>Tests <span class="opt">(optional, e.g. --tags ~@wip)</span></label>
+                    <input type="text" id="testsFilter" placeholder="--tags ~@wip">
+                </div>
+                <div class="tests-toolbar-actions">
+                    <button class="btn-secondary" onclick="_dispatchRun('schedule')">Schedule run</button>
+                    <button class="btn-primary"   onclick="_dispatchRun('now')">Run now</button>
+                </div>
+                <div class="tests-parallel-warning" id="testsParallelWarning" hidden>
+                    Parallel &gt; 3 exceeds the local hard cap — expect "session not created" Chrome contention.
+                </div>
+            </div>
+            <div class="tests-layout">
+                <aside class="tests-tree" id="testsTreePanel">
+                    <div class="tests-tree-loading">Loading tree&hellip;</div>
+                </aside>
+                <main class="tests-view">
+                    <div class="tests-view-header">
+                        <span class="tests-view-path" id="testsViewPath">Select a file from the tree</span>
+                        <span class="tests-view-size" id="testsViewSize"></span>
+                    </div>
+                    <pre class="tests-view-body"><code id="testsViewCode" class="hljs">// Pick a file on the left to view its contents.</code></pre>
+                </main>
+            </div>
+        </section>
+
+        <section class="tab-panel" data-panel="pipelines">
+            <div class="pipelines-layout">
+                <aside class="pipelines-list" id="pipelinesListPanel">
+                    <div class="pipelines-list-loading">Loading pipelines&hellip;</div>
+                </aside>
+                <main class="pipelines-view">
+                    <div class="pipelines-view-header">
+                        <span class="pipelines-view-title" id="pipelinesViewTitle">Select a pipeline on the left</span>
+                        <span class="pipelines-view-status" id="pipelinesViewStatus"></span>
+                    </div>
+                    <div class="pipelines-view-config" id="pipelinesViewConfig" hidden></div>
+                    <pre class="pipelines-view-logs" id="pipelinesViewLogs">No pipeline selected.</pre>
+                </main>
+            </div>
+        </section>
+
         <section class="tab-panel" data-panel="reports">
             <div class="reports-layout" id="reportsLayout">
                 <aside class="reports-sidebar" id="reportsSidebar">
@@ -1553,6 +2661,24 @@ SPA_HTML = f"""<!DOCTYPE html>
         </div>
     </div>
 
+    <!-- Schedule-run modal: shown when the user clicks "Schedule run" on
+         the Tests tab. The datetime-local input is interpreted in the
+         browser's local timezone; we convert to ISO-with-offset on confirm
+         so the server stores an unambiguous instant. -->
+    <div class="schedule-modal" id="scheduleModal" hidden>
+        <div class="schedule-modal-box">
+            <h3>Schedule run</h3>
+            <p class="schedule-modal-sub">Pick when these pipelines should start. Time is in your browser's local timezone (<span id="scheduleTzHint"></span>).</p>
+            <label class="schedule-modal-label" for="scheduleDateTime">Run at</label>
+            <input type="datetime-local" id="scheduleDateTime" step="60">
+            <div class="schedule-modal-iter" id="scheduleIterHint"></div>
+            <div class="schedule-modal-actions">
+                <button class="btn-secondary" type="button" onclick="_cancelSchedule()">Cancel</button>
+                <button class="btn-primary"   type="button" onclick="_confirmSchedule()">Schedule</button>
+            </div>
+        </div>
+    </div>
+
     <script>
         const MAX_INBOXES = 20;
         // Single user-facing error string -- never leak HTTP status codes,
@@ -1568,7 +2694,7 @@ SPA_HTML = f"""<!DOCTYPE html>
         // navigate to it. Cleared by resetGenerateUI().
         let _pendingReport = null;
 
-        function showTab(name) {{
+        function showTab(name, opts) {{
             document.querySelectorAll('.tab-btn').forEach(function(b) {{
                 b.classList.toggle('active', b.getAttribute('data-tab') === name);
             }});
@@ -1576,6 +2702,398 @@ SPA_HTML = f"""<!DOCTYPE html>
                 p.classList.toggle('active', p.getAttribute('data-panel') === name);
             }});
             if (name === 'reports') refreshReports();
+            if (name === 'tests') {{ _loadTestsTree(); _loadTestsEnvs(); }}
+            if (name === 'pipelines') {{ _enterPipelinesTab(); }}
+            else _stopPipelinesPolling();
+            // Keep the URL in sync with the active tab (but don't push a
+            // history entry when we're just *reading* a URL on load).
+            if (!opts || !opts.fromPop) {{
+                let target;
+                if (name === 'new') target = '/';
+                else if (name === 'pipelines' && _selectedPipelineId) target = '/pipelines/' + _selectedPipelineId;
+                else target = '/' + name;
+                if (target !== window.location.pathname) {{
+                    history.pushState({{tab: name, pid: _selectedPipelineId}}, '', target);
+                }}
+            }}
+        }}
+
+        async function _loadTestsEnvs() {{
+            const sel = document.getElementById('testsEnv');
+            if (!sel || sel.dataset.loaded) return;
+            try {{
+                const res = await fetch('/api/tests/envs');
+                if (!res.ok) return;
+                const data = await res.json();
+                const envs = (data.environments || []);
+                if (!envs.length) return;
+                const prior = sel.value || 'prod';
+                sel.innerHTML = envs.map(function(e) {{
+                    return '<option value="' + e + '"' + (e === 'prod' ? ' selected' : '') + '>' + e + '</option>';
+                }}).join('');
+                // Preserve previous selection if still present, else default to prod.
+                if (envs.indexOf(prior) >= 0) sel.value = prior;
+                else if (envs.indexOf('prod') >= 0) sel.value = 'prod';
+                sel.dataset.loaded = '1';
+            }} catch (e) {{ /* leave default 'prod' */ }}
+        }}
+
+        function _testsParallelCheck() {{
+            const sel = document.getElementById('testsParallel');
+            const warn = document.getElementById('testsParallelWarning');
+            if (!sel || !warn) return;
+            warn.hidden = parseInt(sel.value, 10) <= 3;
+        }}
+
+        function _readRunForm() {{
+            let iters = parseInt(document.getElementById('testsIterations').value, 10);
+            if (!Number.isFinite(iters) || iters < 1) iters = 1;
+            if (iters > 50) iters = 50;
+            return {{
+                env:        document.getElementById('testsEnv').value,
+                parallel:   parseInt(document.getElementById('testsParallel').value, 10),
+                name:       document.getElementById('testsName').value.trim(),
+                feature:    document.getElementById('testsFeature').value.trim(),
+                tests:      document.getElementById('testsFilter').value.trim(),
+                iterations: iters,
+            }};
+        }}
+
+        async function _dispatchRun(kind) {{
+            if (kind === 'schedule') {{
+                _openScheduleModal();
+                return;
+            }}
+            await _submitRun({{kind: 'now', scheduled_for: null}});
+        }}
+
+        async function _submitRun(extras) {{
+            const cfg = Object.assign(_readRunForm(), extras || {{}});
+            try {{
+                const res = await fetch('/api/pipelines', {{
+                    method: 'POST',
+                    headers: {{'Content-Type': 'application/json'}},
+                    body: JSON.stringify(cfg),
+                }});
+                if (res.ok) {{
+                    const data = await res.json();
+                    const list = (data && data.pipelines) ? data.pipelines : [];
+                    if (list.length) _selectedPipelineId = list[0].id;
+                }}
+            }} catch (_e) {{ /* tab will still navigate so the user sees the queue */ }}
+            showTab('pipelines');
+        }}
+
+        // ----- Schedule-run modal -----
+        function _pad2(n) {{ return String(n).padStart(2, '0'); }}
+        function _localDateTimeInputValue(date) {{
+            return date.getFullYear() + '-' + _pad2(date.getMonth() + 1) + '-' + _pad2(date.getDate())
+                 + 'T' + _pad2(date.getHours()) + ':' + _pad2(date.getMinutes());
+        }}
+        function _openScheduleModal() {{
+            const modal = document.getElementById('scheduleModal');
+            const input = document.getElementById('scheduleDateTime');
+            const tzHint = document.getElementById('scheduleTzHint');
+            const iterHint = document.getElementById('scheduleIterHint');
+            if (!modal || !input) return;
+            // Default to now + 1h.
+            const def = new Date(Date.now() + 60 * 60 * 1000);
+            input.value = _localDateTimeInputValue(def);
+            // Minimum: now (no scheduling in the past).
+            input.min = _localDateTimeInputValue(new Date());
+            // Surface the user's locale-friendly timezone label.
+            if (tzHint) {{
+                try {{
+                    tzHint.textContent = Intl.DateTimeFormat().resolvedOptions().timeZone || '';
+                }} catch (_e) {{ tzHint.textContent = ''; }}
+            }}
+            if (iterHint) {{
+                const it = _readRunForm().iterations;
+                iterHint.textContent = it > 1
+                    ? ('Will enqueue ' + it + ' identical pipelines for this start time.')
+                    : '';
+            }}
+            modal.hidden = false;
+            setTimeout(function() {{ try {{ input.focus(); }} catch (_e) {{}} }}, 30);
+        }}
+        function _cancelSchedule() {{
+            const modal = document.getElementById('scheduleModal');
+            if (modal) modal.hidden = true;
+        }}
+        async function _confirmSchedule() {{
+            const input = document.getElementById('scheduleDateTime');
+            if (!input || !input.value) return;
+            // datetime-local has no timezone -- the browser will treat the
+            // value as local time when constructed via `new Date(string)`,
+            // which is exactly what we want. toISOString() then produces a
+            // UTC instant the server stores unambiguously.
+            const localDate = new Date(input.value);
+            if (isNaN(localDate.getTime())) return;
+            _cancelSchedule();
+            await _submitRun({{kind: 'schedule', scheduled_for: localDate.toISOString()}});
+        }}
+
+        // ----- Pipelines tab -----
+        let _selectedPipelineId = null;
+        let _pipelinesPollTimer = null;
+        let _logsPollTimer      = null;
+
+        function _humanWhen(iso) {{
+            if (!iso) return '';
+            try {{
+                const d = new Date(iso);
+                return d.toLocaleString();
+            }} catch (e) {{ return iso; }}
+        }}
+
+        function _pipelineItemHtml(p) {{
+            const meta = [
+                'env=' + p.env,
+                'parallel=' + p.parallel,
+                p.kind === 'schedule' ? 'kind=scheduled' : 'kind=now',
+            ].join(' · ');
+            const timing = (p.status === 'scheduled')
+                ? 'scheduled for ' + _humanWhen(p.scheduled_for)
+                : (p.status === 'finished')
+                    ? 'finished ' + _humanWhen(p.finished_at)
+                    : (p.status === 'running')
+                        ? 'started ' + _humanWhen(p.started_at || p.created_at)
+                        : 'created ' + _humanWhen(p.created_at);
+            const rp = p.rp_url
+                ? '<a class="rp-link" href="' + _testsEscape(p.rp_url) + '" target="_blank" rel="noopener noreferrer" onclick="event.stopPropagation()">Report Portal &rarr;</a>'
+                : (p.status === 'finished' ? '<span class="rp-link" style="border-bottom-style:dotted;opacity:.5">RP link pending</span>' : '');
+            const cls = 'pipeline-item status-' + p.status + (p.id === _selectedPipelineId ? ' active' : '');
+            // Pulsing green dot for the running ones -- visible-at-a-glance
+            // signal that something is actually in flight.
+            const liveDot = (p.status === 'running') ? '<span class="live-dot" title="running"></span>' : '';
+            return '<div class="' + cls + '" onclick="_selectPipeline(\\'' + _testsEscape(p.id) + '\\')">'
+                 +   '<div class="pipeline-item-name">' + liveDot + _testsEscape(p.name) + '</div>'
+                 +   '<div class="pipeline-item-meta">' + _testsEscape(meta) + '</div>'
+                 +   '<div class="pipeline-item-meta">' + _testsEscape(timing) + '</div>'
+                 +   (rp ? '<div>' + rp + '</div>' : '')
+                 + '</div>';
+        }}
+
+        function _renderPipelinesList(pipelines) {{
+            const panel = document.getElementById('pipelinesListPanel');
+            if (!panel) return;
+            const buckets = {{ running: [], scheduled: [], finished: [], failed: [] }};
+            (pipelines || []).forEach(function(p) {{
+                (buckets[p.status] || (buckets.finished)).push(p);
+            }});
+            // Sort: running by start desc, scheduled by scheduled_for asc, finished by finished_at desc.
+            buckets.running.sort(function(a, b) {{ return (b.started_at || '').localeCompare(a.started_at || ''); }});
+            buckets.scheduled.sort(function(a, b) {{ return (a.scheduled_for || '').localeCompare(b.scheduled_for || ''); }});
+            buckets.finished.sort(function(a, b) {{ return (b.finished_at || b.created_at || '').localeCompare(a.finished_at || a.created_at || ''); }});
+            buckets.failed.sort(function(a, b) {{ return (b.finished_at || b.created_at || '').localeCompare(a.finished_at || a.created_at || ''); }});
+
+            function section(label, items) {{
+                const body = items.length
+                    ? items.map(_pipelineItemHtml).join('')
+                    : '<div class="pipelines-list-empty">none</div>';
+                return '<div class="pipelines-list-section">'
+                     +   '<div class="pipelines-list-section-title">' + label
+                     +     ' <span class="count">' + items.length + '</span>'
+                     +   '</div>'
+                     +   body
+                     + '</div>';
+            }}
+            panel.innerHTML =
+                  section('Running',   buckets.running)
+                + section('Scheduled', buckets.scheduled)
+                + section('Finished',  buckets.finished)
+                + section('Failed',    buckets.failed);
+        }}
+
+        async function _refreshPipelines() {{
+            try {{
+                const res = await fetch('/api/pipelines');
+                if (!res.ok) return;
+                const data = await res.json();
+                _renderPipelinesList(data.pipelines || []);
+            }} catch (_e) {{ /* leave previous render */ }}
+        }}
+
+        async function _selectPipeline(id, opts) {{
+            _selectedPipelineId = id;
+            // Highlight in list immediately.
+            document.querySelectorAll('.pipeline-item.active').forEach(function(e) {{
+                e.classList.remove('active');
+            }});
+            document.querySelectorAll('.pipeline-item').forEach(function(e) {{
+                if (e.getAttribute('onclick') && e.getAttribute('onclick').indexOf(id) >= 0) {{
+                    e.classList.add('active');
+                }}
+            }});
+            await _refreshLogs();
+            if (_logsPollTimer) clearInterval(_logsPollTimer);
+            _logsPollTimer = setInterval(_refreshLogs, 4000);
+            // Deep-link this pipeline in the URL bar so a copy/paste of the
+            // link opens the same view next time.
+            if (!opts || !opts.fromPop) {{
+                const target = '/pipelines/' + id;
+                if (window.location.pathname !== target) {{
+                    history.pushState({{tab: 'pipelines', pid: id}}, '', target);
+                }}
+            }}
+        }}
+
+        async function _refreshLogs() {{
+            if (!_selectedPipelineId) return;
+            try {{
+                const res = await fetch('/api/pipelines/' + encodeURIComponent(_selectedPipelineId) + '/logs');
+                const data = await res.json();
+                const title = document.getElementById('pipelinesViewTitle');
+                const status = document.getElementById('pipelinesViewStatus');
+                const logs = document.getElementById('pipelinesViewLogs');
+                if (!res.ok) {{
+                    if (logs) logs.textContent = data.error || ('HTTP ' + res.status);
+                    return;
+                }}
+                if (title) title.textContent = data.name ? (data.name + '  (' + data.id + ')') : data.id;
+                if (status) {{
+                    const cls = 'status-pill status-' + (data.status || '');
+                    const rp = data.rp_url
+                        ? ' &middot; <a class="rp-link" href="' + _testsEscape(data.rp_url) + '" target="_blank" rel="noopener noreferrer">Report Portal &rarr;</a>'
+                        : '';
+                    const live = (data.status === 'running')
+                        ? '<span class="live-dot" title="running"></span>'
+                        : '';
+                    status.innerHTML = live + '<span class="' + cls + '">' + (data.status || '') + '</span>' + rp;
+                }}
+                // Render the config strip above the log body.
+                const cfg = document.getElementById('pipelinesViewConfig');
+                if (cfg) {{
+                    const rows = [
+                        ['name',         data.name],
+                        ['id',           data.id],
+                        ['env',          data.env],
+                        ['parallel',     data.parallel],
+                        ['kind',         data.kind],
+                        ['feature',      data.feature || ''],
+                        ['tests',        data.tests || ''],
+                        ['created',      data.created_at],
+                        ['scheduled',    data.scheduled_for || ''],
+                        ['started',      data.started_at || ''],
+                        ['finished',     data.finished_at || ''],
+                    ];
+                    cfg.innerHTML = rows.map(function(r) {{
+                        const v = (r[1] == null || r[1] === '')
+                            ? '<span class="empty">&mdash;</span>'
+                            : ('<span class="val">' + _testsEscape(String(r[1])) + '</span>');
+                        return '<strong>' + r[0] + '</strong>' + v;
+                    }}).join('');
+                    cfg.hidden = false;
+                }}
+                if (logs) {{
+                    const text = (data.logs || []).join('\\n');
+                    const wasNearBottom = (logs.scrollHeight - logs.scrollTop - logs.clientHeight) < 60;
+                    logs.textContent = text || '(no log lines yet)';
+                    if (wasNearBottom) logs.scrollTop = logs.scrollHeight;
+                }}
+            }} catch (_e) {{ /* leave previous render */ }}
+        }}
+
+        function _stopPipelinesPolling() {{
+            if (_pipelinesPollTimer) {{ clearInterval(_pipelinesPollTimer); _pipelinesPollTimer = null; }}
+            if (_logsPollTimer)      {{ clearInterval(_logsPollTimer);      _logsPollTimer = null; }}
+        }}
+
+        async function _enterPipelinesTab() {{
+            await _refreshPipelines();
+            if (_selectedPipelineId) await _selectPipeline(_selectedPipelineId);
+            if (_pipelinesPollTimer) clearInterval(_pipelinesPollTimer);
+            _pipelinesPollTimer = setInterval(_refreshPipelines, 5000);
+        }}
+
+        // ----- Tests tab: tree + code viewer -----
+        // Suffix -> highlight.js language hint. Falls back to auto-detect.
+        const _TESTS_LANG_MAP = {{
+            'py': 'python', 'feature': 'gherkin', 'yaml': 'yaml', 'yml': 'yaml',
+            'json': 'json', 'md': 'markdown', 'sh': 'bash', 'sql': 'sql',
+            'js': 'javascript', 'ts': 'typescript', 'html': 'xml', 'xml': 'xml',
+            'css': 'css', 'toml': 'ini', 'conf': 'ini', 'cfg': 'ini',
+            'ini': 'ini', 'env': 'bash', 'rb': 'ruby', 'go': 'go', 'rs': 'rust',
+        }};
+        let _testsTreeLoaded = false;
+
+        function _testsEscape(s) {{
+            return String(s == null ? '' : s)
+                .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+        }}
+        function _renderTreeNode(node) {{
+            if (node.type === 'file') {{
+                const safePath = _testsEscape(node.path);
+                return '<li class="tree-file" data-path="' + safePath + '" '
+                     +     'onclick="_loadTestFile(this, this.getAttribute(\\'data-path\\'))">'
+                     +   _testsEscape(node.name)
+                     + '</li>';
+            }}
+            const kids = (node.children || []).map(_renderTreeNode).join('');
+            return '<li class="tree-dir">'
+                 +   '<div class="tree-dir-label" onclick="this.parentNode.classList.toggle(\\'collapsed\\')">'
+                 +     _testsEscape(node.name)
+                 +   '</div>'
+                 +   '<ul class="tree-children">' + kids + '</ul>'
+                 + '</li>';
+        }}
+        async function _loadTestsTree() {{
+            if (_testsTreeLoaded) return;
+            const panel = document.getElementById('testsTreePanel');
+            if (!panel) return;
+            try {{
+                const res = await fetch('/api/tests/tree');
+                if (!res.ok) {{
+                    panel.innerHTML = '<div class="tests-tree-error">Tree fetch failed: HTTP ' + res.status + '</div>';
+                    return;
+                }}
+                const data = await res.json();
+                panel.innerHTML = '<ul class="tree-root">' + _renderTreeNode(data.tree) + '</ul>';
+                _testsTreeLoaded = true;
+            }} catch (e) {{
+                panel.innerHTML = '<div class="tests-tree-error">' + _testsEscape(e.message || String(e)) + '</div>';
+            }}
+        }}
+        async function _loadTestFile(el, path) {{
+            document.querySelectorAll('.tests-tree .tree-file.active').forEach(function(e) {{
+                e.classList.remove('active');
+            }});
+            if (el) el.classList.add('active');
+            // Clicking a .feature file auto-fills the toolbar's Feature path
+            // (only when it's empty so a manual entry isn't clobbered).
+            if (path && path.endsWith('.feature')) {{
+                const feat = document.getElementById('testsFeature');
+                if (feat && !feat.value) feat.value = path;
+            }}
+            const code = document.getElementById('testsViewCode');
+            const pathEl = document.getElementById('testsViewPath');
+            const sizeEl = document.getElementById('testsViewSize');
+            if (!code || !pathEl || !sizeEl) return;
+            pathEl.textContent = path;
+            sizeEl.textContent = 'loading…';
+            code.textContent = '';
+            code.className = 'hljs';
+            try {{
+                const res = await fetch('/api/tests/file?path=' + encodeURIComponent(path));
+                const data = await res.json();
+                if (!res.ok) {{
+                    code.textContent = data.error || ('HTTP ' + res.status);
+                    sizeEl.textContent = data.size ? (data.size + ' bytes') : '';
+                    return;
+                }}
+                sizeEl.textContent = data.size + ' bytes';
+                code.textContent = data.content;
+                const lang = _TESTS_LANG_MAP[data.suffix] || '';
+                code.className = lang ? ('hljs language-' + lang) : 'hljs';
+                if (window.hljs) {{
+                    delete code.dataset.highlighted;
+                    hljs.highlightElement(code);
+                }}
+            }} catch (e) {{
+                code.textContent = 'error: ' + (e.message || String(e));
+                sizeEl.textContent = '';
+            }}
         }}
 
         function renderInboxes(initial) {{
@@ -2175,6 +3693,38 @@ SPA_HTML = f"""<!DOCTYPE html>
         renderInboxes(['']);
         _initDbxUploader();
         _applySidebarState();
+        // Live-update the parallel-warning band as the dropdown changes.
+        const _pp = document.getElementById('testsParallel');
+        if (_pp) _pp.addEventListener('change', _testsParallelCheck);
+
+        // ----- URL routing -----
+        // /                 -> New tab
+        // /tests            -> Tests tab
+        // /pipelines        -> Pipelines tab, no selection
+        // /pipelines/<id>   -> Pipelines tab, that pipeline auto-selected
+        // /reports          -> Reports tab
+        function _routeFromPath(path, fromPop) {{
+            const m = (path || '/').match(/^\/pipelines\/([A-Za-z0-9_-]+)\/?$/);
+            if (m) {{
+                _selectedPipelineId = m[1];
+                showTab('pipelines', {{fromPop: fromPop}});
+                // _enterPipelinesTab already selects _selectedPipelineId if set.
+                return;
+            }}
+            if (path === '/pipelines' || path === '/pipelines/') {{
+                _selectedPipelineId = null;
+                showTab('pipelines', {{fromPop: fromPop}});
+                return;
+            }}
+            if (path === '/tests'   || path === '/tests/')   {{ showTab('tests',   {{fromPop: fromPop}}); return; }}
+            if (path === '/reports' || path === '/reports/') {{ showTab('reports', {{fromPop: fromPop}}); return; }}
+            // default
+            showTab('new', {{fromPop: fromPop}});
+        }}
+        window.addEventListener('popstate', function() {{
+            _routeFromPath(window.location.pathname, true);
+        }});
+        _routeFromPath(window.location.pathname, false);
     </script>
 </body>
 </html>
@@ -2226,12 +3776,35 @@ class _SpaHandler(http.server.BaseHTTPRequestHandler):
 
         # / -> SPA. No login gate anymore -- the only password barrier is
         # the per-report encryption inside each report's HTML.
-        if path in ("/", "/index.html"):
+        # Tab and per-pipeline routes resolve to the same SPA HTML; the
+        # client-side router reads `location.pathname` on load to choose
+        # the right tab + (for pipelines) auto-select a pipeline.
+        if (
+            path in ("/", "/index.html")
+            or path in ("/tests", "/pipelines", "/reports", "/new")
+            or path.startswith("/pipelines/")
+        ):
             self._send(200, "text/html; charset=utf-8", SPA_HTML.encode("utf-8"))
             return
 
         if path == "/api/reports":
             self._send_json(200, _list_reports())
+            return
+        if path == "/api/tests/tree":
+            self._handle_tests_tree()
+            return
+        if path == "/api/tests/file":
+            self._handle_tests_file()
+            return
+        if path == "/api/tests/envs":
+            self._send_json(200, {"environments": _discover_environments()})
+            return
+        if path == "/api/pipelines":
+            self._send_json(200, {"pipelines": _load_pipelines()})
+            return
+        if path.startswith("/api/pipelines/") and path.endswith("/logs"):
+            pid = path[len("/api/pipelines/"):-len("/logs")]
+            self._handle_pipeline_logs(pid)
             return
         if path.startswith("/reports/"):
             self._serve_report_file(path)
@@ -2361,6 +3934,9 @@ class _SpaHandler(http.server.BaseHTTPRequestHandler):
         if path == "/api/generate":
             self._handle_generate()
             return
+        if path == "/api/pipelines":
+            self._handle_pipeline_create()
+            return
         self._send(404, "text/plain; charset=utf-8", b"Not found")
 
     def _read_json_body(self, max_bytes: int = 100_000_000):
@@ -2372,6 +3948,95 @@ class _SpaHandler(http.server.BaseHTTPRequestHandler):
             return json.loads(raw.decode("utf-8")), None
         except (ValueError, UnicodeDecodeError) as e:
             return None, f"invalid JSON body: {e}"
+
+    def _handle_tests_tree(self):
+        if not TESTS_DIR or not os.path.isdir(TESTS_DIR):
+            self._send_json(404, {"error": f"tests root not found at {TESTS_DIR}"})
+            return
+        tree = _build_tests_tree(TESTS_DIR)
+        self._send_json(200, {"root": os.path.basename(TESTS_DIR.rstrip("/")) or "tests",
+                              "tree": tree})
+
+    def _handle_tests_file(self):
+        # Parse ?path=... from the query string.
+        from urllib.parse import urlsplit, parse_qs
+        qs = parse_qs(urlsplit(self.path).query)
+        rel = (qs.get("path") or [""])[0]
+        abs_path = _safe_test_path(rel)
+        if not abs_path or not os.path.isfile(abs_path):
+            self._send_json(404, {"error": "file not found"})
+            return
+        # Refuse binaries / huge files outright -- the code view can't render them.
+        suffix = os.path.splitext(abs_path)[1].lower()
+        if suffix in _TESTS_BINARY_SUFFIXES:
+            self._send_json(415, {"error": f"binary file type {suffix} is not viewable",
+                                   "path": rel, "size": os.path.getsize(abs_path)})
+            return
+        size = os.path.getsize(abs_path)
+        if size > _TESTS_FILE_MAX_BYTES:
+            self._send_json(413, {"error": f"file too large ({size} bytes); cap is {_TESTS_FILE_MAX_BYTES}",
+                                   "path": rel, "size": size})
+            return
+        try:
+            with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+        except OSError as e:
+            self._send_json(500, {"error": f"read failed: {e}"})
+            return
+        self._send_json(200, {"path": rel, "size": size, "content": content,
+                              "suffix": suffix.lstrip(".")})
+
+    def _handle_pipeline_create(self):
+        payload, err = self._read_json_body()
+        if err:
+            self._bad_request(err)
+            return
+        if not isinstance(payload, dict):
+            self._bad_request("expected JSON object")
+            return
+        try:
+            iterations = max(1, min(50, int(payload.get("iterations", 1))))
+        except (TypeError, ValueError):
+            iterations = 1
+        records = []
+        for i in range(iterations):
+            rec = _create_pipeline(payload, iteration_index=i + 1, iteration_count=iterations)
+            records.append(rec)
+        # Kick off `run-now` pipelines immediately. `scheduled` ones get
+        # picked up by the scheduler thread when their time arrives.
+        for r in records:
+            if r.get("status") == "running":
+                _start_runner(r["id"])
+        self._send_json(200, {"pipelines": records, "count": len(records)})
+
+    def _handle_pipeline_logs(self, pid: str):
+        if not pid or not all(c.isalnum() or c in "-_" for c in pid):
+            self._send_json(404, {"error": "not found"})
+            return
+        pipelines = _load_pipelines()
+        for p in pipelines:
+            if p.get("id") == pid:
+                # Full record minus the (potentially huge) logs list as a
+                # separate field, so the UI can render a config strip
+                # alongside the log tail without two round-trips.
+                self._send_json(200, {
+                    "id":            pid,
+                    "name":          p.get("name"),
+                    "status":        p.get("status"),
+                    "kind":          p.get("kind"),
+                    "env":           p.get("env"),
+                    "parallel":      p.get("parallel"),
+                    "feature":       p.get("feature"),
+                    "tests":         p.get("tests"),
+                    "created_at":    p.get("created_at"),
+                    "scheduled_for": p.get("scheduled_for"),
+                    "started_at":    p.get("started_at"),
+                    "finished_at":   p.get("finished_at"),
+                    "rp_url":        p.get("rp_url"),
+                    "logs":          p.get("logs") or [],
+                })
+                return
+        self._send_json(404, {"error": "not found"})
 
     def _handle_generate(self):
         payload, err = self._read_json_body()
@@ -2435,6 +4100,15 @@ class _ThreadingTcpServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
 def serve_spa(port: int = PORT) -> None:
     """Start the Dokimos Performance SPA HTTP server. Blocks until Ctrl+C."""
     _ensure_reports_dir()
+    # Reconcile any pipelines left in `running` by the previous SPA process
+    # (their runner threads died on shutdown, so they're orphans).
+    orphaned = _reconcile_orphan_pipelines()
+    if orphaned:
+        print(f"  Reconciled {orphaned} orphaned pipeline(s) -> failed")
+    # Start the pipeline scheduler so any pipelines created later -- and any
+    # already-scheduled ones from prior server runs -- get picked up when
+    # their `scheduled_for` arrives.
+    _ensure_pipeline_scheduler()
     # One-shot, idempotent migration of legacy reports: bring their CSS in
     # line with the current theme, inject the localize-times script, and
     # scrub any per-report passwords that the previous server version
@@ -2445,7 +4119,7 @@ def serve_spa(port: int = PORT) -> None:
     with _ThreadingTcpServer(("", port), _SpaHandler) as httpd:
         bar = "=" * 60
         print(f"\n{bar}")
-        print(f"  Dokimos: Performance Report available at: http://localhost:{port}")
+        print(f"  Perf Runner available at: http://localhost:{port}")
         print(f"  Per-report password protection only (no SPA login)")
         print(f"  Reports persisted under: {REPORTS_DIR}")
         if (backfill_stats["restyled"]
