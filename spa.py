@@ -100,13 +100,84 @@ REPORTS_DIR    = os.path.join(PACKAGE_DIR, "reports")
 ASSETS_DIR     = os.path.join(PACKAGE_DIR, "assets")
 PIPELINES_FILE = os.path.join(PACKAGE_DIR, "pipelines.json")
 
-# Root for the Tests tab's file browser. Defaults to the local
-# InventoryForecasting test corpus when present; override with
-# DOKIMOS_TESTS_DIR to point at any other tree.
-TESTS_DIR = os.environ.get(
-    "DOKIMOS_TESTS_DIR",
-    "/Users/boberit/work/disney/ad-apps-test-automation/NAS_components/InventoryForecasting",
-)
+# Root for the Tests tab's file browser. Resolution order:
+#   1. DOKIMOS_TESTS_DIR env var (explicit override, prod uses this)
+#   2. First path in _TESTS_DIR_CANDIDATES that actually exists on disk
+# If nothing is found, TESTS_DIR is the first candidate (so the error
+# message in the UI still references a plausible path the operator can fix).
+_TESTS_DIR_CANDIDATES = [
+    # Common docker-mount locations in production
+    "/workspace/ad-apps-test-automation/NAS_components/InventoryForecasting",
+    "/workspace/NAS_components/InventoryForecasting",
+    "/app/ad-apps-test-automation/NAS_components/InventoryForecasting",
+    "/app/NAS_components/InventoryForecasting",
+    "/srv/ad-apps-test-automation/NAS_components/InventoryForecasting",
+    # Common local-dev checkouts
+    os.path.expanduser("~/work/disney/ad-apps-test-automation/NAS_components/InventoryForecasting"),
+    os.path.expanduser("~/work/ad-apps-test-automation/NAS_components/InventoryForecasting"),
+    os.path.expanduser("~/ad-apps-test-automation/NAS_components/InventoryForecasting"),
+    # Sibling of the dokimos-perf checkout (works when both repos are cloned
+    # under the same parent directory, e.g. ~/work/dokimos-perf.chiron.systems
+    # alongside ~/work/ad-apps-test-automation).
+    os.path.join(os.path.dirname(PACKAGE_DIR),
+                 "ad-apps-test-automation", "NAS_components", "InventoryForecasting"),
+]
+
+
+# TEMPORARY DEBUG: until production deploys are stable, the 404 response from
+# /api/tests/tree includes the output of `ls -la` for a handful of likely
+# parent paths, so an operator can see what's actually on the production
+# filesystem from the SPA's process perspective without shell access.
+_DEBUG_LS_TARGETS = [
+    "~/work/disney/",
+    "~/work/",
+    "/workspace/",
+    "/app/",
+    "/srv/",
+]
+
+
+def _debug_filesystem_listings() -> list:
+    """Run `ls -la` on each of _DEBUG_LS_TARGETS and return a list of
+    {target, expanded, output} dicts. Failures (path missing, etc.) are
+    rendered as the ls binary's own stderr -- exactly what a human would see
+    if they typed the command. Capped at ~64 KB per listing to bound the
+    response size."""
+    import subprocess
+    out = []
+    for target in _DEBUG_LS_TARGETS:
+        expanded = os.path.expanduser(target)
+        try:
+            r = subprocess.run(
+                ["ls", "-la", expanded],
+                capture_output=True, text=True, timeout=5,
+            )
+            text = (r.stdout or "") + (r.stderr or "")
+        except FileNotFoundError:
+            text = "ls binary not found"
+        except subprocess.TimeoutExpired:
+            text = "ls timed out after 5s"
+        except Exception as exc:
+            text = f"ls failed: {type(exc).__name__}: {exc}"
+        if len(text) > 64 * 1024:
+            text = text[:64 * 1024] + "\n... (truncated)"
+        out.append({"target": target, "expanded": expanded, "output": text})
+    return out
+
+
+def _resolve_tests_dir() -> str:
+    env = os.environ.get("DOKIMOS_TESTS_DIR", "").strip()
+    if env:
+        return env
+    for p in _TESTS_DIR_CANDIDATES:
+        if p and os.path.isdir(p):
+            return p
+    # Nothing found -- return the first candidate so the UI can still display
+    # a coherent error message about where it was looking.
+    return _TESTS_DIR_CANDIDATES[0]
+
+
+TESTS_DIR = _resolve_tests_dir()
 
 # Cap a single served file at ~2 MB so a stray binary in the tree can't
 # crash the browser or starve memory.
@@ -1530,6 +1601,37 @@ html, body {
     padding: 8px 10px;
 }
 .tests-tree-error { color: var(--red); }
+.tests-tree-error code { color: rgba(255,255,255,0.75); background: rgba(255,255,255,0.04); padding: 1px 4px; border-radius: 2px; }
+.tests-debug-sep    { border: none; border-top: 1px solid var(--divider); margin: 14px 0 10px; }
+.tests-debug-title  {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 1.2px;
+    color: var(--bronze);
+    margin-bottom: 8px;
+}
+.tests-debug-target {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: rgba(255,255,255,0.70);
+    margin-top: 8px;
+}
+.tests-debug-output {
+    background: var(--bg-dark);
+    border: 1px solid var(--divider);
+    border-radius: 4px;
+    padding: 8px 10px;
+    margin: 4px 0 0;
+    color: rgba(220,230,242,0.92);
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    line-height: 1.45;
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 240px;
+    overflow: auto;
+}
 .tests-tree ul { list-style: none; margin: 0; padding-left: 14px; }
 .tests-tree ul.tree-root { padding-left: 0; }
 .tests-tree li { line-height: 1.6; white-space: nowrap; }
@@ -1879,29 +1981,47 @@ html, body {
 
 /* Config strip above the log body -- shows the pipeline's params at a glance
    so the viewer doesn't have to scroll to the top of the log to remember
-   what env / parallel / feature this run is. */
+   what env / parallel / feature this run is. Deliberately styled as a
+   distinct card so it doesn't visually blur into the log stream below. */
 .pipelines-view-config {
-    padding: 10px 16px;
-    border-bottom: 1px solid var(--divider);
-    background: rgba(255,255,255,0.018);
-    font-family: var(--font-mono);
-    font-size: 11.5px;
-    display: grid;
-    grid-template-columns: max-content 1fr;
-    gap: 4px 16px;
-    color: rgba(255,255,255,0.85);
+    margin: 12px 14px 0;
+    padding: 12px 14px 14px 18px;
+    background: var(--bg-card);
+    border: 1px solid var(--divider);
+    border-left: 3px solid var(--bronze);
+    border-radius: 6px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.25);
+    position: relative;
 }
 .pipelines-view-config[hidden] { display: none; }
-.pipelines-view-config strong {
-    color: rgba(255,255,255,0.45);
+.pipelines-view-config::before {
+    content: "Configuration";
+    display: block;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    letter-spacing: 1.5px;
+    text-transform: uppercase;
+    color: var(--bronze);
+    margin-bottom: 10px;
+}
+.pipelines-view-config-grid {
+    display: grid;
+    grid-template-columns: max-content 1fr;
+    gap: 6px 16px;
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    color: rgba(255,255,255,0.92);
+}
+.pipelines-view-config-grid strong {
+    color: rgba(255,255,255,0.42);
     font-weight: 500;
     font-size: 10px;
     text-transform: uppercase;
-    letter-spacing: 1.1px;
+    letter-spacing: 1.2px;
     align-self: center;
 }
-.pipelines-view-config span.val { word-break: break-all; }
-.pipelines-view-config .empty   { color: rgba(255,255,255,0.30); font-style: italic; }
+.pipelines-view-config-grid span.val { word-break: break-all; }
+.pipelines-view-config-grid .empty   { color: rgba(255,255,255,0.25); font-style: italic; }
 
 .pipelines-view-logs {
     flex: 1;
@@ -2977,12 +3097,14 @@ SPA_HTML = f"""<!DOCTYPE html>
                         ['started',      data.started_at || ''],
                         ['finished',     data.finished_at || ''],
                     ];
-                    cfg.innerHTML = rows.map(function(r) {{
-                        const v = (r[1] == null || r[1] === '')
-                            ? '<span class="empty">&mdash;</span>'
-                            : ('<span class="val">' + _testsEscape(String(r[1])) + '</span>');
-                        return '<strong>' + r[0] + '</strong>' + v;
-                    }}).join('');
+                    cfg.innerHTML = '<div class="pipelines-view-config-grid">'
+                        + rows.map(function(r) {{
+                            const v = (r[1] == null || r[1] === '')
+                                ? '<span class="empty">&mdash;</span>'
+                                : ('<span class="val">' + _testsEscape(String(r[1])) + '</span>');
+                            return '<strong>' + r[0] + '</strong>' + v;
+                        }}).join('')
+                        + '</div>';
                     cfg.hidden = false;
                 }}
                 if (logs) {{
@@ -3045,7 +3167,37 @@ SPA_HTML = f"""<!DOCTYPE html>
             try {{
                 const res = await fetch('/api/tests/tree');
                 if (!res.ok) {{
-                    panel.innerHTML = '<div class="tests-tree-error">Tree fetch failed: HTTP ' + res.status + '</div>';
+                    // 404 from server includes the configured path + the
+                    // candidate paths it searched. We also surface the
+                    // debug `ls -la` output so production operators can
+                    // see what's actually on disk without shell access.
+                    let body = 'Tree fetch failed: HTTP ' + res.status;
+                    try {{
+                        const data = await res.json();
+                        if (data && data.error) {{
+                            body = _testsEscape(data.error);
+                            if (data.configured) body += '<br><br>configured: <code>' + _testsEscape(data.configured) + '</code>';
+                            if (data.hint) body += '<br><br>' + _testsEscape(data.hint);
+                            if (Array.isArray(data.searched) && data.searched.length) {{
+                                body += '<br><br>searched paths:<br>'
+                                     + data.searched.map(function(s) {{
+                                         return '&nbsp;&nbsp;<code>' + _testsEscape(s) + '</code>';
+                                       }}).join('<br>');
+                            }}
+                            // TEMPORARY DEBUG: show `ls -la` of likely parents.
+                            if (Array.isArray(data.debug_ls) && data.debug_ls.length) {{
+                                body += '<hr class="tests-debug-sep"><div class="tests-debug-title">filesystem snapshot (temporary debug)</div>';
+                                data.debug_ls.forEach(function(item) {{
+                                    body += '<div class="tests-debug-target">$ ls -la '
+                                         + _testsEscape(item.target) + '</div>'
+                                         + '<pre class="tests-debug-output">'
+                                         + _testsEscape(item.output || '(empty)')
+                                         + '</pre>';
+                                }});
+                            }}
+                        }}
+                    }} catch (_e) {{ /* fall through */ }}
+                    panel.innerHTML = '<div class="tests-tree-error">' + body + '</div>';
                     return;
                 }}
                 const data = await res.json();
@@ -3951,10 +4103,23 @@ class _SpaHandler(http.server.BaseHTTPRequestHandler):
 
     def _handle_tests_tree(self):
         if not TESTS_DIR or not os.path.isdir(TESTS_DIR):
-            self._send_json(404, {"error": f"tests root not found at {TESTS_DIR}"})
+            # No configured path exists. Tell the operator exactly what was
+            # tried and how to fix it, so production deploys can self-diagnose.
+            # TEMPORARY DEBUG: also include the listing of common parent
+            # directories so the operator can see what's actually on disk
+            # from the SPA's process perspective. Remove once production
+            # deploys are stable.
+            self._send_json(404, {
+                "error":      "tests root not found",
+                "configured": TESTS_DIR,
+                "hint":       "set DOKIMOS_TESTS_DIR env var to the absolute path of NAS_components/InventoryForecasting",
+                "searched":   list(_TESTS_DIR_CANDIDATES),
+                "debug_ls":   _debug_filesystem_listings(),
+            })
             return
         tree = _build_tests_tree(TESTS_DIR)
         self._send_json(200, {"root": os.path.basename(TESTS_DIR.rstrip("/")) or "tests",
+                              "resolved": TESTS_DIR,
                               "tree": tree})
 
     def _handle_tests_file(self):
