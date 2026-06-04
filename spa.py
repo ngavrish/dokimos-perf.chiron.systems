@@ -227,6 +227,11 @@ _PIPELINE_STATUSES = ("scheduled", "running", "finished", "failed")
 # documents this exact tag as the canonical local build target.
 DOCKER_IMAGE = os.environ.get("DOKIMOS_DOCKER_IMAGE", "ifp-fcap-perf:latest")
 
+# Hard ceiling on a single pipeline run. A hung container (e.g. behavex
+# deadlock, stuck Report-Portal upload) would otherwise block the single-slot
+# queue forever, so the runner watchdog kills it and marks the pipeline failed.
+MAX_RUNTIME_SEC = int(os.environ.get("DOKIMOS_MAX_RUNTIME_SEC", "2700"))  # 45 min
+
 # Where in the InventoryForecasting tree the perf Dockerfile + README live.
 # We auto-discover by scanning, but this constant is the documented spot.
 _DOCKERFILE_BASENAMES = ("Dockerfile",)
@@ -311,7 +316,8 @@ def _build_docker_command(pipeline: dict, assets: dict) -> tuple:
     pass ENV / PARALLEL_THREADS / optional TESTS+BEHAVEX_EXTRA as env vars.
 
     Returns (argv, envrc_host_path | None)."""
-    argv = ["docker", "run", "--rm"]
+    # Stable container name so the runtime watchdog can `docker kill` it on timeout.
+    argv = ["docker", "run", "--rm", "--name", f"dokimos-{pipeline['id']}"]
     # Mount the local .envrc so secrets aren't echoed via -e flags.
     envrc_host = None
     if assets.get("rel_root"):
@@ -527,6 +533,7 @@ def _run_pipeline(pipeline_id: str) -> None:
     outermost try/except ensures even a bug here can't strand a record."""
     import shutil
     import subprocess
+    import threading
     import traceback
 
     final_status = None  # set by inner paths; the outer finally enforces it.
@@ -579,7 +586,7 @@ def _run_pipeline(pipeline_id: str) -> None:
         try:
             proc = subprocess.Popen(
                 argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, bufsize=1,
+                text=True, bufsize=1, close_fds=True,
             )
         except FileNotFoundError:
             _append_pipeline_log(
@@ -597,6 +604,27 @@ def _run_pipeline(pipeline_id: str) -> None:
             )
             final_status = "failed"
             return
+
+        # Runtime watchdog: a hung container (or a leaked stdout fd that never
+        # EOFs) would block this thread -- and thus the single-slot queue --
+        # forever. After MAX_RUNTIME_SEC, kill the container + docker client and
+        # close our read end so the loop below unblocks.
+        container_name = f"dokimos-{pipeline_id}"
+        timed_out = {"flag": False}
+        def _on_timeout():
+            timed_out["flag"] = True
+            try:
+                subprocess.run(["docker", "kill", container_name],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+            except Exception:
+                pass
+            try: proc.kill()
+            except Exception: pass
+            try: proc.stdout.close()   # unblocks a wedged readline in this thread
+            except Exception: pass
+        watchdog = threading.Timer(MAX_RUNTIME_SEC, _on_timeout)
+        watchdog.daemon = True
+        watchdog.start()
 
         image_missing_hint_emitted = False
         rp_url_found = None
@@ -637,6 +665,8 @@ def _run_pipeline(pipeline_id: str) -> None:
             )
             final_status = "failed"
 
+        watchdog.cancel()
+
         # Wait for the process even if streaming was interrupted.
         try:
             rc = proc.wait(timeout=30)
@@ -647,15 +677,24 @@ def _run_pipeline(pipeline_id: str) -> None:
                 pass
             rc = -1
 
-        # If we didn't already decide to fail (no exception above), use the
-        # process exit code to choose between finished and failed.
-        if final_status is None:
-            final_status = "finished" if rc == 0 else "failed"
-        _append_pipeline_log(
-            pipeline_id,
-            f"[{_now_iso()}] docker exited with code {rc} -- status: {final_status}",
-            status=final_status, finished_at=_now_iso(),
-        )
+        if timed_out["flag"]:
+            final_status = "failed"
+            _append_pipeline_log(
+                pipeline_id,
+                f"[{_now_iso()}] KILLED: exceeded max runtime ({MAX_RUNTIME_SEC}s); "
+                f"container {container_name} stopped. Marking failed so the queue advances.",
+                status="failed", finished_at=_now_iso(),
+            )
+        else:
+            # No timeout: use the process exit code (unless an earlier path
+            # already decided to fail) to choose between finished and failed.
+            if final_status is None:
+                final_status = "finished" if rc == 0 else "failed"
+            _append_pipeline_log(
+                pipeline_id,
+                f"[{_now_iso()}] docker exited with code {rc} -- status: {final_status}",
+                status=final_status, finished_at=_now_iso(),
+            )
 
     except Exception as exc:
         # Catch-all outer guard: anything weird (lock errors, JSON corruption,
