@@ -383,6 +383,58 @@ def _docker_image_exists(image: str) -> bool:
         return False
 
 
+def _ensure_base_submodule(pipeline_id: str, context: str) -> bool:
+    """Ensure the `Base` git submodule is checked out under the build context;
+    the perf image build needs it. On a fresh checkout it's uninitialised, so
+    init it (the runner is User=bober, so git uses bober's cached enterprise
+    token via the credential helper). Returns True if Base is present/ready
+    (or not registered as a submodule at all), False if an init was needed but
+    failed."""
+    import subprocess
+    try:
+        st = subprocess.run(
+            ["git", "-C", context, "submodule", "status", "Base"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        )
+    except Exception as exc:
+        _append_pipeline_log(
+            pipeline_id, f"[{_now_iso()}] WARN: Base submodule check failed: {exc}; continuing")
+        return True
+    line = (st.stdout or "").strip()
+    # `git submodule status` prefixes uninitialised entries with '-'. A checked-out
+    # one has ' ' or '+'. Empty output = no Base submodule registered -> nothing to do.
+    if not line or not line.startswith("-"):
+        return True
+
+    _append_pipeline_log(
+        pipeline_id, f"[{_now_iso()}] Base submodule not checked out -- initialising it")
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
+    try:
+        proc = subprocess.Popen(
+            ["git", "-C", context, "submodule", "update", "--init", "Base"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, env=env,
+        )
+        for raw in proc.stdout:
+            ln = raw.rstrip("\r\n")
+            if ln:
+                _append_pipeline_log(pipeline_id, ln)
+        rc = proc.wait()
+    except Exception as exc:
+        _append_pipeline_log(
+            pipeline_id,
+            f"[{_now_iso()}] ERROR: Base submodule init failed: {type(exc).__name__}: {exc}")
+        return False
+    if rc != 0:
+        _append_pipeline_log(
+            pipeline_id,
+            f"[{_now_iso()}] ERROR: Base submodule init failed (exit {rc}). Needs VPN + a "
+            f"cached github.twdcgrid.net token (git credential.helper).",
+        )
+        return False
+    _append_pipeline_log(pipeline_id, f"[{_now_iso()}] Base submodule checked out OK")
+    return True
+
+
 def _ensure_docker_image(pipeline_id: str, assets: dict) -> bool:
     """Guarantee DOCKER_IMAGE is available before running.
 
@@ -406,6 +458,16 @@ def _ensure_docker_image(pipeline_id: str, assets: dict) -> bool:
             pipeline_id,
             f"[{_now_iso()}] ERROR: image {DOCKER_IMAGE} missing and cannot build "
             f"(no Dockerfile/context discovered)",
+            status="failed", finished_at=_now_iso(),
+        )
+        return False
+
+    # The build context needs the Base submodule; auto-init it if a fresh
+    # checkout left it empty.
+    if not _ensure_base_submodule(pipeline_id, context):
+        _append_pipeline_log(
+            pipeline_id,
+            f"[{_now_iso()}] aborting: cannot build {DOCKER_IMAGE} without the Base submodule",
             status="failed", finished_at=_now_iso(),
         )
         return False
