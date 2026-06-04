@@ -232,6 +232,11 @@ DOCKER_IMAGE = os.environ.get("DOKIMOS_DOCKER_IMAGE", "ifp-fcap-perf:latest")
 # queue forever, so the runner watchdog kills it and marks the pipeline failed.
 MAX_RUNTIME_SEC = int(os.environ.get("DOKIMOS_MAX_RUNTIME_SEC", "2700"))  # 45 min
 
+# Cap per-pipeline log lines. The whole pipelines.json is re-serialised on every
+# append, so an unbounded `logs` array (chatty container) bloats the file and
+# slows every save. Keep the head (creation/context) + the most recent tail.
+MAX_LOG_LINES = int(os.environ.get("DOKIMOS_MAX_LOG_LINES", "4000"))
+
 # Where in the InventoryForecasting tree the perf Dockerfile + README live.
 # We auto-discover by scanning, but this constant is the documented spot.
 _DOCKERFILE_BASENAMES = ("Dockerfile",)
@@ -369,7 +374,12 @@ def _append_pipeline_log(pipeline_id: str, *lines: str, **mut) -> None:
         pipelines = _load_pipelines()
         for p in pipelines:
             if p.get("id") == pipeline_id:
-                p.setdefault("logs", []).extend(lines)
+                logs = p.setdefault("logs", [])
+                logs.extend(lines)
+                if len(logs) > MAX_LOG_LINES:
+                    head, tail = logs[:50], logs[-(MAX_LOG_LINES - 51):]
+                    dropped = len(logs) - len(head) - len(tail)
+                    p["logs"] = head + [f"[... {dropped} earlier log lines truncated ...]"] + tail
                 for k, v in mut.items():
                     p[k] = v
                 break
@@ -626,6 +636,19 @@ def _run_pipeline(pipeline_id: str) -> None:
         watchdog.daemon = True
         watchdog.start()
 
+        # Stream output, BATCHED. Writing pipelines.json per line is O(file size)
+        # each and degrades to O(n^2) on chatty containers -- the real cause of the
+        # runner grinding in json.dump and appearing wedged. Flush the buffer every
+        # ~40 lines or ~2s instead of once per line.
+        import time as _time
+        log_buf, pending_mut, last_flush = [], {}, [_time.monotonic()]
+        def _flush_logs(force=False):
+            if not log_buf and not pending_mut:
+                return
+            if force or len(log_buf) >= 40 or (_time.monotonic() - last_flush[0]) >= 2.0:
+                _append_pipeline_log(pipeline_id, *log_buf, **pending_mut)
+                log_buf.clear(); pending_mut.clear(); last_flush[0] = _time.monotonic()
+
         image_missing_hint_emitted = False
         rp_url_found = None
         try:
@@ -638,23 +661,28 @@ def _run_pipeline(pipeline_id: str) -> None:
                     "Unable to find image" in line or "pull access denied" in line
                 )):
                     image_missing_hint_emitted = True
-                    _append_pipeline_log(
-                        pipeline_id,
+                    log_buf.extend([
                         line,
                         f"[{_now_iso()}] HINT: build the image first --",
                         f"[{_now_iso()}]   cd {assets['rel_root']}",
                         f"[{_now_iso()}]   DOCKER_BUILDKIT=1 docker build -f {assets['dockerfile']} -t {DOCKER_IMAGE} .",
-                    )
+                    ])
+                    _flush_logs(force=True)
                     continue
                 # Capture the first Report Portal URL we see.
                 if rp_url_found is None:
                     m = _rp_url_re().search(line)
                     if m:
                         rp_url_found = m.group(1)
-                        _append_pipeline_log(pipeline_id, line, rp_url=rp_url_found)
+                        log_buf.append(line)
+                        pending_mut["rp_url"] = rp_url_found
+                        _flush_logs(force=True)
                         continue
-                _append_pipeline_log(pipeline_id, line)
+                log_buf.append(line)
+                _flush_logs()
+            _flush_logs(force=True)
         except Exception as exc:
+            _flush_logs(force=True)
             # Unexpected error while streaming output -- log it but make sure
             # we still drain + wait the process and mark the pipeline failed.
             _append_pipeline_log(
