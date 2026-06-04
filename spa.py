@@ -1845,6 +1845,18 @@ html, body {
 .pipeline-item.status-scheduled { border-left-color: #f59e0b; }
 .pipeline-item.status-finished  { border-left-color: #10b981; }
 .pipeline-item.status-failed    { border-left-color: var(--red); }
+.pipeline-item-actions { margin-top: 6px; }
+.pipeline-rerun-btn {
+    background: transparent;
+    color: var(--bronze);
+    border: 1px solid var(--bronze-dk);
+    border-radius: 6px;
+    padding: 3px 10px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    cursor: pointer;
+}
+.pipeline-rerun-btn:hover { background: rgba(205,127,50,0.18); color: var(--bronze-lt); }
 
 .pipelines-view {
     display: flex;
@@ -2986,11 +2998,21 @@ SPA_HTML = f"""<!DOCTYPE html>
             // Pulsing green dot for the running ones -- visible-at-a-glance
             // signal that something is actually in flight.
             const liveDot = (p.status === 'running') ? '<span class="live-dot" title="running"></span>' : '';
+            // Re-run button for terminal states. stopPropagation so clicking it
+            // doesn't also select/open the pipeline. Enqueues a fresh pipeline
+            // with the same config at the end of the queue.
+            const actions = (p.status === 'finished' || p.status === 'failed')
+                ? '<div class="pipeline-item-actions">'
+                +   '<button class="pipeline-rerun-btn" title="Re-run with the same configuration" '
+                +     'onclick="event.stopPropagation(); _rerunPipeline(\\'' + _testsEscape(p.id) + '\\')">&#8635; rerun</button>'
+                + '</div>'
+                : '';
             return '<div class="' + cls + '" onclick="_selectPipeline(\\'' + _testsEscape(p.id) + '\\')">'
                  +   '<div class="pipeline-item-name">' + liveDot + _testsEscape(p.name) + '</div>'
                  +   '<div class="pipeline-item-meta">' + _testsEscape(meta) + '</div>'
                  +   '<div class="pipeline-item-meta">' + _testsEscape(timing) + '</div>'
                  +   (rp ? '<div>' + rp + '</div>' : '')
+                 +   actions
                  + '</div>';
         }}
 
@@ -3032,6 +3054,17 @@ SPA_HTML = f"""<!DOCTYPE html>
                 const data = await res.json();
                 _renderPipelinesList(data.pipelines || []);
             }} catch (_e) {{ /* leave previous render */ }}
+        }}
+
+        async function _rerunPipeline(id) {{
+            try {{
+                const res = await fetch('/api/pipelines/' + encodeURIComponent(id) + '/rerun', {{ method: 'POST' }});
+                if (res.ok) {{
+                    const data = await res.json();
+                    if (data && data.pipeline) _selectedPipelineId = data.pipeline.id;
+                }}
+            }} catch (_e) {{ /* swallow; the refresh below reflects real state */ }}
+            await _refreshPipelines();
         }}
 
         async function _selectPipeline(id, opts) {{
@@ -4089,6 +4122,10 @@ class _SpaHandler(http.server.BaseHTTPRequestHandler):
         if path == "/api/pipelines":
             self._handle_pipeline_create()
             return
+        if path.startswith("/api/pipelines/") and path.endswith("/rerun"):
+            pid = path[len("/api/pipelines/"):-len("/rerun")]
+            self._handle_pipeline_rerun(pid)
+            return
         self._send(404, "text/plain; charset=utf-8", b"Not found")
 
     def _read_json_body(self, max_bytes: int = 100_000_000):
@@ -4173,6 +4210,33 @@ class _SpaHandler(http.server.BaseHTTPRequestHandler):
             if r.get("status") == "running":
                 _start_runner(r["id"])
         self._send_json(200, {"pipelines": records, "count": len(records)})
+
+    def _handle_pipeline_rerun(self, pid: str):
+        """Re-run a finished/failed pipeline with the same configuration:
+        build a fresh run config from the original record and create a new
+        pipeline, which appends it to the end of the queue and starts it like
+        a `run-now`. The original record is left untouched."""
+        pid = (pid or "").strip()
+        src = None
+        for p in _load_pipelines():
+            if p.get("id") == pid:
+                src = p
+                break
+        if src is None:
+            self._send_json(404, {"error": f"pipeline {pid!r} not found"})
+            return
+        cfg = {
+            "kind":     "now",
+            "name":     src.get("name") or "",
+            "env":      src.get("env") or "prod",
+            "parallel": src.get("parallel") or 2,
+            "feature":  src.get("feature") or "",
+            "tests":    src.get("tests") or "",
+        }
+        rec = _create_pipeline(cfg)
+        if rec.get("status") == "running":
+            _start_runner(rec["id"])
+        self._send_json(200, {"pipeline": rec, "rerun_of": pid})
 
     def _handle_pipeline_logs(self, pid: str):
         if not pid or not all(c.isalnum() or c in "-_" for c in pid):
