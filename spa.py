@@ -370,6 +370,91 @@ def _append_pipeline_log(pipeline_id: str, *lines: str, **mut) -> None:
         _save_pipelines(pipelines)
 
 
+def _docker_image_exists(image: str) -> bool:
+    """True if `image` is already present in the local Docker image store."""
+    import subprocess
+    try:
+        r = subprocess.run(
+            ["docker", "image", "inspect", image],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def _ensure_docker_image(pipeline_id: str, assets: dict) -> bool:
+    """Guarantee DOCKER_IMAGE is available before running.
+
+    If the image is **already built locally, reuse it as-is** (no rebuild).
+    Otherwise build it once from the discovered Dockerfile with the repo root
+    as context (BuildKit), streaming the build output into the pipeline log.
+    Returns True if the image is ready to run, False if the build failed (in
+    which case the pipeline has already been marked `failed`)."""
+    import subprocess
+    if _docker_image_exists(DOCKER_IMAGE):
+        _append_pipeline_log(
+            pipeline_id,
+            f"[{_now_iso()}] image {DOCKER_IMAGE} already built -- reusing it (no rebuild)",
+        )
+        return True
+
+    dockerfile = assets.get("dockerfile")
+    context = assets.get("rel_root")
+    if not dockerfile or not context:
+        _append_pipeline_log(
+            pipeline_id,
+            f"[{_now_iso()}] ERROR: image {DOCKER_IMAGE} missing and cannot build "
+            f"(no Dockerfile/context discovered)",
+            status="failed", finished_at=_now_iso(),
+        )
+        return False
+
+    build_argv = ["docker", "build", "-f", dockerfile, "-t", DOCKER_IMAGE, context]
+    _append_pipeline_log(
+        pipeline_id,
+        f"[{_now_iso()}] image {DOCKER_IMAGE} not found locally -- building it once",
+        f"[{_now_iso()}] (needs VPN for artifactory.prod.hulu.com + the Base submodule checked out)",
+        f"[{_now_iso()}] building: DOCKER_BUILDKIT=1 {' '.join(build_argv)}",
+    )
+    build_env = dict(os.environ, DOCKER_BUILDKIT="1")
+    try:
+        proc = subprocess.Popen(
+            build_argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1, env=build_env,
+        )
+    except Exception as exc:
+        _append_pipeline_log(
+            pipeline_id,
+            f"[{_now_iso()}] ERROR: failed to start docker build: "
+            f"{type(exc).__name__}: {exc}",
+            status="failed", finished_at=_now_iso(),
+        )
+        return False
+    try:
+        for raw in proc.stdout:
+            line = raw.rstrip("\r\n")
+            if line:
+                _append_pipeline_log(pipeline_id, line)
+    except Exception:
+        pass
+    rc = proc.wait()
+    if rc != 0:
+        _append_pipeline_log(
+            pipeline_id,
+            f"[{_now_iso()}] docker build failed (exit {rc}) -- see log above. "
+            f"Common causes: VPN down (artifactory unreachable) or Base submodule "
+            f"not checked out.",
+            status="failed", finished_at=_now_iso(),
+        )
+        return False
+    _append_pipeline_log(
+        pipeline_id,
+        f"[{_now_iso()}] image {DOCKER_IMAGE} built OK -- future runs reuse it",
+    )
+    return True
+
+
 def _run_pipeline(pipeline_id: str) -> None:
     """Execute a pipeline's docker container. Runs in a worker thread.
 
@@ -409,6 +494,11 @@ def _run_pipeline(pipeline_id: str) -> None:
                 f"[{_now_iso()}] install Docker Desktop (or colima) and retry.",
                 status="failed", finished_at=_now_iso(),
             )
+            final_status = "failed"
+            return
+
+        # Reuse the image if it's already built; otherwise build it once now.
+        if not _ensure_docker_image(pipeline_id, assets):
             final_status = "failed"
             return
 
