@@ -232,6 +232,56 @@ DOCKER_IMAGE = os.environ.get("DOKIMOS_DOCKER_IMAGE", "ifp-fcap-perf:latest")
 # queue forever, so the runner watchdog kills it and marks the pipeline failed.
 MAX_RUNTIME_SEC = int(os.environ.get("DOKIMOS_MAX_RUNTIME_SEC", "2700"))  # 45 min
 
+# Upper bound the operator can dial in from the Tests panel (minutes). The
+# DOKIMOS_MAX_RUNTIME_SEC env value remains the *default*; the per-run field
+# can only set something between 1 minute and this ceiling.
+MAX_RUNTIME_CEILING_MIN = int(os.environ.get("DOKIMOS_MAX_RUNTIME_CEILING_MIN", "240"))
+
+# Per-scenario retry budget passed through to the suite as IFP_SCENARIO_RETRY
+# (see environment.py: max attempts per scenario, 1 = run once). Default 3
+# mirrors the suite default; the Tests-panel field can dial it in [1, ceiling].
+SCENARIO_RETRY_DEFAULT = int(os.environ.get("DOKIMOS_SCENARIO_RETRY_DEFAULT", "3"))
+SCENARIO_RETRY_CEILING = int(os.environ.get("DOKIMOS_SCENARIO_RETRY_CEILING", "5"))
+
+# Rough per-scenario wall time (seconds) for the *pre-run* duration estimate on
+# the job-config panel. Calibrated from observed @perf runs (~15s/scenario for
+# the heavier forecast mix; SUMMARY-only calls are faster). This is only the
+# initial guess -- once a run starts, the panel shows a live rate-based ETA that
+# supersedes it. Override via env if the suite's profile changes.
+EST_SEC_PER_SCENARIO = float(os.environ.get("DOKIMOS_EST_SEC_PER_SCENARIO", "15"))
+
+
+def _clamp_scenario_retry(val) -> int:
+    """Translate the Tests-panel 'Retries' field into an IFP_SCENARIO_RETRY
+    value (max attempts per scenario; 1 = run once, no retry).
+
+    Blank/garbage -> 3 (the suite's environment.py default). Otherwise clamp
+    to [1, SCENARIO_RETRY_CEILING] so a typo can't spin every failing scenario
+    forever (each retry re-runs the scenario + backoff)."""
+    if val is None or (isinstance(val, str) and not val.strip()):
+        return SCENARIO_RETRY_DEFAULT
+    try:
+        n = int(val)
+    except (TypeError, ValueError):
+        return SCENARIO_RETRY_DEFAULT
+    return max(1, min(SCENARIO_RETRY_CEILING, n))
+
+
+def _clamp_max_runtime_sec(min_val) -> int:
+    """Translate the Tests-panel 'Max runtime (min)' field into seconds.
+
+    Blank/garbage -> the MAX_RUNTIME_SEC default. Anything supplied is clamped
+    to [1, MAX_RUNTIME_CEILING_MIN] minutes so a typo can't disable the
+    watchdog or pin the single-slot queue for days."""
+    if min_val is None or (isinstance(min_val, str) and not min_val.strip()):
+        return MAX_RUNTIME_SEC
+    try:
+        m = int(min_val)
+    except (TypeError, ValueError):
+        return MAX_RUNTIME_SEC
+    m = max(1, min(MAX_RUNTIME_CEILING_MIN, m))
+    return m * 60
+
 # Cap per-pipeline log lines. The whole pipelines.json is re-serialised on every
 # append, so an unbounded `logs` array (chatty container) bloats the file and
 # slows every save. Keep the head (creation/context) + the most recent tail.
@@ -337,8 +387,10 @@ def _build_docker_command(pipeline: dict, assets: dict) -> tuple:
 
     # Env vars from the pipeline config.
     env_pairs = [
-        ("ENV",              pipeline["env"]),
-        ("PARALLEL_THREADS", str(pipeline["parallel"])),
+        ("ENV",                pipeline["env"]),
+        ("PARALLEL_THREADS",   str(pipeline["parallel"])),
+        # Per-scenario retry budget, consumed by the suite's environment.py.
+        ("IFP_SCENARIO_RETRY", str(pipeline.get("scenario_retry") or SCENARIO_RETRY_DEFAULT)),
     ]
     if pipeline.get("feature"):
         env_pairs.append(("TESTS", pipeline["feature"]))
@@ -364,6 +416,17 @@ def _rp_url_re():
         import re as _re
         _RP_URL_RE = _re.compile(r"(https?://[^\s'\"]*report-portal[^\s'\"]*launches[^\s'\"]+)")
     return _RP_URL_RE
+
+
+# behavex/behave logs one line per scenario start: "... Running Scenario <name>".
+# We count distinct names to drive the live progress + ETA on the logs panel.
+_SCENARIO_MARKER_RE = None
+def _scenario_marker_re():
+    global _SCENARIO_MARKER_RE
+    if _SCENARIO_MARKER_RE is None:
+        import re as _re
+        _SCENARIO_MARKER_RE = _re.compile(r"Running Scenario\s+(.+?)\s*$")
+    return _SCENARIO_MARKER_RE
 
 
 def _append_pipeline_log(pipeline_id: str, *lines: str, **mut) -> None:
@@ -533,6 +596,141 @@ def _ensure_docker_image(pipeline_id: str, assets: dict) -> bool:
     return True
 
 
+# The perf entrypoint (NAS_components/.../perf/run_perf.sh) always runs
+# `behavex tests/api_tests --tags=@perf`, regardless of the UI feature/tests
+# filters. So the meaningful pre-run count is: total scenarios in api_tests vs
+# how many carry the @perf tag (= what actually executes).
+PERF_FEATURES_SUBDIR = os.path.join("tests", "api_tests")
+PERF_RUN_TAG = "@perf"
+
+
+def _scan_feature_file(path: str, select_tag: str):
+    """Static parse of one .feature file. Returns (total, selected) scenario
+    counts. A Scenario Outline contributes one per Examples data row (header
+    row excluded); a plain Scenario counts as one. `select_tag` is matched
+    against feature-level tags (inherited) + scenario-level tags, mirroring
+    behave's single-positive-tag semantics. Best-effort, not a behave parser."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return (0, 0)
+
+    feature_tags = set()
+    pending_tags = set()
+    blocks = []          # {tags:set, outline:bool, rows:int}
+    cur = None
+    in_examples = False
+    ex_header_seen = False
+
+    def _close():
+        if cur is not None:
+            blocks.append(cur)
+
+    for raw in lines:
+        s = raw.strip()
+        if not s or s.startswith("#"):
+            continue
+        if s.startswith("@"):
+            pending_tags.update(t for t in s.split() if t.startswith("@"))
+            continue
+        if s.startswith("Feature:"):
+            feature_tags = set(pending_tags)
+            pending_tags = set()
+            in_examples = False
+            continue
+        if s.startswith("Scenario Outline:") or s.startswith("Scenario:"):
+            _close()
+            cur = {"tags": set(pending_tags),
+                   "outline": s.startswith("Scenario Outline:"), "rows": 0}
+            pending_tags = set()
+            in_examples = False
+            ex_header_seen = False
+            continue
+        if s.startswith("Background:"):
+            pending_tags = set()
+            in_examples = False
+            continue
+        if s.startswith("Examples:"):
+            in_examples = True
+            ex_header_seen = False
+            continue
+        if in_examples and s.startswith("|"):
+            if not ex_header_seen:
+                ex_header_seen = True          # first row is the column header
+            elif cur is not None:
+                cur["rows"] += 1
+            continue
+        if in_examples:
+            in_examples = False                # any non-table line ends the block
+    _close()
+
+    total = selected = 0
+    for b in blocks:
+        n = b["rows"] if (b["outline"] and b["rows"] > 0) else 1
+        total += n
+        if select_tag in (feature_tags | b["tags"]):
+            selected += n
+    return (total, selected)
+
+
+def _discover_perf_scenarios():
+    """Pre-run, host-side discovery of what the perf container will execute.
+
+    Scans the @perf-runnable feature files (tests/api_tests) on disk and
+    returns a summary dict, or None if the tests dir isn't present on this
+    host. Pure static scan -- no behave import, no container, fast."""
+    api_dir = os.path.join(TESTS_DIR, PERF_FEATURES_SUBDIR)
+    if not os.path.isdir(api_dir):
+        return None
+    per_file, total, selected = [], 0, 0
+    for root, dirs, names in os.walk(api_dir):
+        dirs.sort()
+        for fn in sorted(names):
+            if not fn.endswith(".feature"):
+                continue
+            p = os.path.join(root, fn)
+            t, sdf = _scan_feature_file(p, PERF_RUN_TAG)
+            total += t
+            selected += sdf
+            per_file.append((os.path.relpath(p, TESTS_DIR), t, sdf))
+    return {
+        "dir": os.path.relpath(api_dir, TESTS_DIR),
+        "tag": PERF_RUN_TAG,
+        "files": len(per_file),
+        "total": total,
+        "selected": selected,
+        "per_file": per_file,
+    }
+
+
+def _log_scenario_discovery(pipeline_id: str) -> None:
+    """Emit the discovered-vs-running scenario summary at the start of a run."""
+    disco = _discover_perf_scenarios()
+    if disco is None:
+        _append_pipeline_log(
+            pipeline_id,
+            f"[{_now_iso()}] test discovery: tests dir not found on host "
+            f"({TESTS_DIR}) -- cannot pre-count scenarios; the container will "
+            f"discover them itself.",
+        )
+        return
+    selected_files = [f"{rel} ({sel})" for rel, _t, sel in disco["per_file"] if sel]
+    lines = [
+        f"[{_now_iso()}] test discovery: scanned {disco['files']} feature file(s) "
+        f"under {disco['dir']} -- found {disco['total']} scenario(s); "
+        f"{disco['selected']} tagged {disco['tag']} -> RUNNING {disco['selected']}.",
+    ]
+    if selected_files:
+        lines.append(
+            f"[{_now_iso()}]   {disco['tag']} scenarios in: {', '.join(selected_files)}")
+    else:
+        lines.append(
+            f"[{_now_iso()}]   no {disco['tag']}-tagged scenarios found -- this run "
+            f"will execute nothing and exit quickly.")
+    _append_pipeline_log(pipeline_id, *lines)
+
+
 def _run_pipeline(pipeline_id: str) -> None:
     """Execute a pipeline's docker container. Runs in a worker thread.
 
@@ -554,6 +752,10 @@ def _run_pipeline(pipeline_id: str) -> None:
             rec = next((p for p in pipelines if p.get("id") == pipeline_id), None)
         if rec is None:
             return
+
+        # Surface, at the top of the run log, how many scenarios were discovered
+        # and how many will actually execute (@perf) -- before the container starts.
+        _log_scenario_discovery(pipeline_id)
 
         assets = _discover_docker_assets()
         if not assets["dockerfile"]:
@@ -632,7 +834,8 @@ def _run_pipeline(pipeline_id: str) -> None:
             except Exception: pass
             try: proc.stdout.close()   # unblocks a wedged readline in this thread
             except Exception: pass
-        watchdog = threading.Timer(MAX_RUNTIME_SEC, _on_timeout)
+        run_timeout_sec = int(rec.get("max_runtime_sec") or MAX_RUNTIME_SEC)
+        watchdog = threading.Timer(run_timeout_sec, _on_timeout)
         watchdog.daemon = True
         watchdog.start()
 
@@ -649,6 +852,38 @@ def _run_pipeline(pipeline_id: str) -> None:
                 _append_pipeline_log(pipeline_id, *log_buf, **pending_mut)
                 log_buf.clear(); pending_mut.clear(); last_flush[0] = _time.monotonic()
 
+        # Live scenario progress: count distinct "Running Scenario <name>" lines
+        # and derive a rate-based ETA. `scenario_count` (the @perf total) is the
+        # denominator; if it's unknown we still report a running tally.
+        _scen_re = _scenario_marker_re()
+        _seen_scen = set()
+        _first_scen = [None]
+        _prog_total = rec.get("scenario_count")
+        def _update_progress(line):
+            m = _scen_re.search(line)
+            if not m:
+                return
+            name = m.group(1).strip()
+            if name in _seen_scen:
+                return
+            _seen_scen.add(name)
+            if _first_scen[0] is None:
+                _first_scen[0] = _time.monotonic()
+            done = len(_seen_scen)
+            elapsed = _time.monotonic() - _first_scen[0]
+            eta_sec = rate_pm = pct = None
+            if done > 0 and elapsed > 0:
+                rate = done / elapsed  # scenarios/sec
+                rate_pm = round(rate * 60, 1)
+                if _prog_total:
+                    pct = round(done / _prog_total * 100)
+                    eta_sec = int(max(0, _prog_total - done) / rate) if rate > 0 else None
+            pending_mut["progress"] = {
+                "done": done, "total": _prog_total, "pct": pct,
+                "eta_sec": eta_sec, "rate_per_min": rate_pm,
+                "updated_at": _now_iso(),
+            }
+
         image_missing_hint_emitted = False
         rp_url_found = None
         try:
@@ -656,6 +891,7 @@ def _run_pipeline(pipeline_id: str) -> None:
                 line = raw_line.rstrip("\r\n")
                 if not line:
                     continue
+                _update_progress(line)
                 # Surface a useful hint if Docker tells us the image isn't built.
                 if (not image_missing_hint_emitted and (
                     "Unable to find image" in line or "pull access denied" in line
@@ -709,7 +945,7 @@ def _run_pipeline(pipeline_id: str) -> None:
             final_status = "failed"
             _append_pipeline_log(
                 pipeline_id,
-                f"[{_now_iso()}] KILLED: exceeded max runtime ({MAX_RUNTIME_SEC}s); "
+                f"[{_now_iso()}] KILLED: exceeded max runtime ({run_timeout_sec}s); "
                 f"container {container_name} stopped. Marking failed so the queue advances.",
                 status="failed", finished_at=_now_iso(),
             )
@@ -718,10 +954,19 @@ def _run_pipeline(pipeline_id: str) -> None:
             # already decided to fail) to choose between finished and failed.
             if final_status is None:
                 final_status = "finished" if rc == 0 else "failed"
+            end_mut = {"status": final_status, "finished_at": _now_iso()}
+            # On a clean finish, peg the progress bar to 100% so it doesn't
+            # linger at e.g. 178/179 (the last scenario's marker may not flush).
+            if final_status == "finished" and _seen_scen:
+                tot = _prog_total or len(_seen_scen)
+                end_mut["progress"] = {
+                    "done": tot, "total": tot, "pct": 100,
+                    "eta_sec": 0, "rate_per_min": None, "updated_at": _now_iso(),
+                }
             _append_pipeline_log(
                 pipeline_id,
                 f"[{_now_iso()}] docker exited with code {rc} -- status: {final_status}",
-                status=final_status, finished_at=_now_iso(),
+                **end_mut,
             )
 
     except Exception as exc:
@@ -948,6 +1193,8 @@ def _create_pipeline(cfg: dict, iteration_index: int = 1, iteration_count: int =
         "parallel":      max(1, min(6, int(cfg.get("parallel") or 2))),
         "feature":       (cfg.get("feature") or "").strip(),
         "tests":         (cfg.get("tests") or "").strip(),
+        "max_runtime_sec": _clamp_max_runtime_sec(cfg.get("max_runtime_min")),
+        "scenario_retry": _clamp_scenario_retry(cfg.get("scenario_retry")),
         "created_at":    now.isoformat(timespec="seconds"),
         "scheduled_for": scheduled_for,
         "queued_at":     now.isoformat(timespec="seconds") if kind == "now" else None,
@@ -968,6 +1215,43 @@ def _create_pipeline(cfg: dict, iteration_index: int = 1, iteration_count: int =
         record["logs"].append(f"[{record['created_at']}] feature: {record['feature']}")
     if record["tests"]:
         record["logs"].append(f"[{record['created_at']}] tests filter: {record['tests']}")
+    record["logs"].append(
+        f"[{record['created_at']}] max runtime: {record['max_runtime_sec']}s "
+        f"({record['max_runtime_sec'] // 60} min) -- watchdog kills the run past this"
+    )
+    record["logs"].append(
+        f"[{record['created_at']}] scenario retries: {record['scenario_retry']} "
+        f"attempt(s) per scenario (IFP_SCENARIO_RETRY; 1 = no retry)"
+    )
+
+    # Pre-run discovery + a rough duration estimate for the job-config panel.
+    # @perf scenarios all live in one feature, and feature-scheme parallelism
+    # can't split one file, so effective parallelism is the number of distinct
+    # selected feature files (capped by the thread count) -- usually 1.
+    disco = _discover_perf_scenarios()
+    if disco:
+        files_with_sel = sum(1 for _rel, _t, sel in disco["per_file"] if sel)
+        eff_par = max(1, min(record["parallel"], files_with_sel or 1))
+        est_sec = int(-(-(disco["selected"] * EST_SEC_PER_SCENARIO) // eff_par))  # ceil
+        record["scenario_count"] = disco["selected"]
+        record["scenario_total"] = disco["total"]
+        record["scenario_files"] = files_with_sel
+        record["effective_parallel"] = eff_par
+        record["est_runtime_sec"] = est_sec
+        record["logs"].append(
+            f"[{record['created_at']}] discovered {disco['selected']} runnable "
+            f"scenario(s) (@perf, of {disco['total']} in api_tests) across "
+            f"{files_with_sel} file(s); effective parallelism {eff_par} -> "
+            f"est. runtime ~{max(1, round(est_sec / 60))} min "
+            f"(@~{EST_SEC_PER_SCENARIO:g}s/scenario, retries excluded)"
+        )
+    else:
+        record["scenario_count"] = None
+        record["scenario_total"] = None
+        record["scenario_files"] = None
+        record["effective_parallel"] = None
+        record["est_runtime_sec"] = None
+
     if status == "queued":
         record["logs"].append(
             f"[{record['created_at']}] state: queued (waiting for the run slot, FIFO)")
@@ -2970,6 +3254,18 @@ SPA_HTML = f"""<!DOCTYPE html>
                     <input type="number" id="testsIterations" min="1" max="50" value="1"
                            title="Number of identical pipelines to enqueue">
                 </div>
+                <div class="tests-control">
+                    <label>Max runtime (min)</label>
+                    <input type="number" id="testsMaxRuntime" min="1" max="{MAX_RUNTIME_CEILING_MIN}"
+                           value="{MAX_RUNTIME_SEC // 60}"
+                           title="Watchdog kills the run if it exceeds this many minutes">
+                </div>
+                <div class="tests-control">
+                    <label>Retries</label>
+                    <input type="number" id="testsRetries" min="1" max="{SCENARIO_RETRY_CEILING}"
+                           value="{SCENARIO_RETRY_DEFAULT}"
+                           title="Attempts per scenario (IFP_SCENARIO_RETRY); 1 = run once, no retry">
+                </div>
                 <div class="tests-control tests-control-grow">
                     <label>Name <span class="opt">(optional)</span></label>
                     <input type="text" id="testsName" placeholder="e.g. nightly-smoke-2026-06-03">
@@ -3015,6 +3311,7 @@ SPA_HTML = f"""<!DOCTYPE html>
                         <span class="pipelines-view-status" id="pipelinesViewStatus"></span>
                     </div>
                     <div class="pipelines-view-config" id="pipelinesViewConfig" hidden></div>
+                    <div class="pipelines-view-progress" id="pipelinesViewProgress" hidden></div>
                     <pre class="pipelines-view-logs" id="pipelinesViewLogs">No pipeline selected.</pre>
                 </main>
             </div>
@@ -3143,13 +3440,21 @@ SPA_HTML = f"""<!DOCTYPE html>
             let iters = parseInt(document.getElementById('testsIterations').value, 10);
             if (!Number.isFinite(iters) || iters < 1) iters = 1;
             if (iters > 50) iters = 50;
+            let maxrt = parseInt(document.getElementById('testsMaxRuntime').value, 10);
+            if (!Number.isFinite(maxrt) || maxrt < 1) maxrt = {MAX_RUNTIME_SEC // 60};
+            if (maxrt > {MAX_RUNTIME_CEILING_MIN}) maxrt = {MAX_RUNTIME_CEILING_MIN};
+            let retries = parseInt(document.getElementById('testsRetries').value, 10);
+            if (!Number.isFinite(retries) || retries < 1) retries = {SCENARIO_RETRY_DEFAULT};
+            if (retries > {SCENARIO_RETRY_CEILING}) retries = {SCENARIO_RETRY_CEILING};
             return {{
-                env:        document.getElementById('testsEnv').value,
-                parallel:   parseInt(document.getElementById('testsParallel').value, 10),
-                name:       document.getElementById('testsName').value.trim(),
-                feature:    document.getElementById('testsFeature').value.trim(),
-                tests:      document.getElementById('testsFilter').value.trim(),
-                iterations: iters,
+                env:            document.getElementById('testsEnv').value,
+                parallel:       parseInt(document.getElementById('testsParallel').value, 10),
+                name:           document.getElementById('testsName').value.trim(),
+                feature:        document.getElementById('testsFeature').value.trim(),
+                tests:          document.getElementById('testsFilter').value.trim(),
+                max_runtime_min: maxrt,
+                scenario_retry: retries,
+                iterations:     iters,
             }};
         }}
 
@@ -3424,6 +3729,15 @@ SPA_HTML = f"""<!DOCTYPE html>
                         ['kind',         data.kind],
                         ['feature',      data.feature || ''],
                         ['tests',        data.tests || ''],
+                        ['max runtime',  data.max_runtime_sec ? (Math.round(data.max_runtime_sec / 60) + ' min') : ''],
+                        ['retries',      data.scenario_retry != null ? String(data.scenario_retry) : ''],
+                        ['scenarios',    data.scenario_count != null
+                                            ? (data.scenario_count + ' @perf'
+                                               + (data.scenario_total ? ' (of ' + data.scenario_total + ')' : ''))
+                                            : ''],
+                        ['est. runtime', data.est_runtime_sec != null
+                                            ? ('~' + Math.max(1, Math.round(data.est_runtime_sec / 60)) + ' min')
+                                            : ''],
                         ['created',      data.created_at],
                         ['scheduled',    data.scheduled_for || ''],
                         ['started',      data.started_at || ''],
@@ -3438,6 +3752,44 @@ SPA_HTML = f"""<!DOCTYPE html>
                         }}).join('')
                         + '</div>';
                     cfg.hidden = false;
+                }}
+                // Live scenario progress + ETA, pinned above the log body.
+                const prog = document.getElementById('pipelinesViewProgress');
+                if (prog) {{
+                    const pr = data.progress;
+                    const total = (pr && pr.total != null) ? pr.total
+                                : (data.scenario_count != null ? data.scenario_count : null);
+                    const done  = (pr && pr.done != null) ? pr.done : 0;
+                    const hasProg = (pr && pr.done != null) || data.status === 'running';
+                    if (hasProg && total) {{
+                        const pct = (pr && pr.pct != null) ? pr.pct
+                                  : Math.min(100, Math.round(done / total * 100));
+                        let meta;
+                        if (data.status === 'running') {{
+                            const eta = (pr && pr.eta_sec != null)
+                                ? ('ETA ~' + Math.max(1, Math.round(pr.eta_sec / 60)) + ' min')
+                                : 'ETA --';
+                            const rate = (pr && pr.rate_per_min != null) ? (' &middot; ' + pr.rate_per_min + '/min') : '';
+                            meta = eta + rate;
+                        }} else {{
+                            meta = data.status + (data.est_runtime_sec != null
+                                ? (' &middot; est was ~' + Math.max(1, Math.round(data.est_runtime_sec / 60)) + ' min') : '');
+                        }}
+                        const barColor = data.status === 'running' ? '#3fb950'
+                                       : (data.status === 'finished' ? '#3fb950'
+                                       : (data.status === 'failed' ? '#f85149' : '#8b949e'));
+                        prog.innerHTML =
+                            '<div style="display:flex;justify-content:space-between;font:600 12px/1.6 ui-monospace,monospace;color:#c9d1d9">'
+                          +   '<span>Scenarios ' + done + ' / ' + total + ' (' + pct + '%)</span>'
+                          +   '<span style="color:#8b949e;font-weight:500">' + meta + '</span>'
+                          + '</div>'
+                          + '<div style="height:6px;background:#21262d;border-radius:3px;overflow:hidden;margin-top:4px">'
+                          +   '<div style="height:100%;width:' + pct + '%;background:' + barColor + ';transition:width .6s ease"></div>'
+                          + '</div>';
+                        prog.hidden = false;
+                    }} else {{
+                        prog.hidden = true;
+                    }}
                 }}
                 if (logs) {{
                     const text = (data.logs || []).join('\\n');
@@ -4530,6 +4882,10 @@ class _SpaHandler(http.server.BaseHTTPRequestHandler):
             "parallel": src.get("parallel") or 2,
             "feature":  src.get("feature") or "",
             "tests":    src.get("tests") or "",
+            # Preserve the original run's watchdog budget (seconds -> minutes;
+            # blank falls back to the default inside _clamp_max_runtime_sec).
+            "max_runtime_min": (src.get("max_runtime_sec") or MAX_RUNTIME_SEC) // 60,
+            "scenario_retry":  src.get("scenario_retry") or SCENARIO_RETRY_DEFAULT,
         }
         rec = _create_pipeline(cfg)
         _ensure_pipeline_scheduler()
@@ -4547,20 +4903,26 @@ class _SpaHandler(http.server.BaseHTTPRequestHandler):
                 # separate field, so the UI can render a config strip
                 # alongside the log tail without two round-trips.
                 self._send_json(200, {
-                    "id":            pid,
-                    "name":          p.get("name"),
-                    "status":        p.get("status"),
-                    "kind":          p.get("kind"),
-                    "env":           p.get("env"),
-                    "parallel":      p.get("parallel"),
-                    "feature":       p.get("feature"),
-                    "tests":         p.get("tests"),
-                    "created_at":    p.get("created_at"),
-                    "scheduled_for": p.get("scheduled_for"),
-                    "started_at":    p.get("started_at"),
-                    "finished_at":   p.get("finished_at"),
-                    "rp_url":        p.get("rp_url"),
-                    "logs":          p.get("logs") or [],
+                    "id":              pid,
+                    "name":            p.get("name"),
+                    "status":          p.get("status"),
+                    "kind":            p.get("kind"),
+                    "env":             p.get("env"),
+                    "parallel":        p.get("parallel"),
+                    "feature":         p.get("feature"),
+                    "tests":           p.get("tests"),
+                    "max_runtime_sec": p.get("max_runtime_sec"),
+                    "scenario_retry":  p.get("scenario_retry"),
+                    "scenario_count":  p.get("scenario_count"),
+                    "scenario_total":  p.get("scenario_total"),
+                    "est_runtime_sec": p.get("est_runtime_sec"),
+                    "progress":        p.get("progress"),
+                    "created_at":      p.get("created_at"),
+                    "scheduled_for":   p.get("scheduled_for"),
+                    "started_at":      p.get("started_at"),
+                    "finished_at":     p.get("finished_at"),
+                    "rp_url":          p.get("rp_url"),
+                    "logs":            p.get("logs") or [],
                 })
                 return
         self._send_json(404, {"error": "not found"})
