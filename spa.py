@@ -726,10 +726,72 @@ def _reconcile_orphan_pipelines() -> int:
         return n
 
 
+def _dispatch_tick() -> None:
+    """One scheduling pass. Enforces **a single running pipeline at a time**:
+
+    1. Promote any `scheduled` job whose time has come into the queue, marked
+       `priority` so it takes the *front* of the line (it was due to run, but a
+       currently-running job is never preempted).
+    2. If nothing is `running`, dequeue the next job and start it. Order:
+       priority (scheduled-that-came-due) first, then FIFO by enqueue time.
+
+    Safe to call from the dispatcher loop or inline after enqueuing (it holds
+    the persistence lock and starts at most one runner)."""
+    to_start = None
+    with _pipelines_lock():
+        pipelines = _load_pipelines()
+        now = datetime.now().astimezone()
+        changed = False
+
+        # 1. Scheduled -> queued (front) when due.
+        for p in pipelines:
+            if p.get("status") != "scheduled":
+                continue
+            sf = p.get("scheduled_for")
+            if not sf:
+                continue
+            try:
+                sf_dt = datetime.fromisoformat(sf.replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            if sf_dt <= now:
+                p["status"] = "queued"
+                p["priority"] = True
+                p["queued_at"] = _now_iso()
+                p.setdefault("logs", []).append(
+                    f"[{p['queued_at']}] scheduled time reached -> queued (front of line)")
+                changed = True
+
+        # 2. Start the next job only if the single run slot is free.
+        if not any(p.get("status") == "running" for p in pipelines):
+            queued = [p for p in pipelines if p.get("status") == "queued"]
+            if queued:
+                # Priority (scheduled-due) first; within each group FIFO by when
+                # the job entered the queue.
+                queued.sort(key=lambda p: (
+                    not p.get("priority", False),
+                    p.get("queued_at") or p.get("created_at") or "",
+                ))
+                nxt = queued[0]
+                nxt["status"] = "running"
+                nxt["started_at"] = _now_iso()
+                nxt.setdefault("logs", []).append(
+                    f"[{nxt['started_at']}] dequeued -> running (run slot acquired)")
+                to_start = nxt["id"]
+                changed = True
+
+        if changed:
+            _save_pipelines(pipelines)
+
+    if to_start:
+        _start_runner(to_start)
+
+
 _SCHEDULER_STARTED = False
 def _ensure_pipeline_scheduler() -> None:
-    """Start the singleton scheduler thread on first call. Picks up scheduled
-    pipelines whose `scheduled_for` has arrived and kicks off their runners."""
+    """Start the singleton dispatcher thread on first call. It enforces a single
+    running pipeline at a time and drains the queue in FIFO order (scheduled
+    jobs that come due jump to the front). See `_dispatch_tick`."""
     global _SCHEDULER_STARTED
     if _SCHEDULER_STARTED:
         return
@@ -740,38 +802,12 @@ def _ensure_pipeline_scheduler() -> None:
         import time as _time
         while True:
             try:
-                now = datetime.now().astimezone()
-                with _pipelines_lock():
-                    pipelines = _load_pipelines()
-                    changed = False
-                    to_launch = []
-                    for p in pipelines:
-                        if p.get("status") != "scheduled":
-                            continue
-                        sf = p.get("scheduled_for")
-                        if not sf:
-                            continue
-                        try:
-                            sf_dt = datetime.fromisoformat(sf.replace("Z", "+00:00"))
-                        except ValueError:
-                            continue
-                        if sf_dt <= now:
-                            p["status"] = "running"
-                            p["started_at"] = _now_iso()
-                            p.setdefault("logs", []).append(
-                                f"[{p['started_at']}] scheduler: due, launching docker"
-                            )
-                            to_launch.append(p["id"])
-                            changed = True
-                    if changed:
-                        _save_pipelines(pipelines)
-                for pid in to_launch:
-                    _start_runner(pid)
+                _dispatch_tick()
             except Exception:
                 pass
-            _time.sleep(15)
+            _time.sleep(2)
 
-    threading.Thread(target=loop, daemon=True, name="pipeline-scheduler").start()
+    threading.Thread(target=loop, daemon=True, name="pipeline-dispatcher").start()
 
 
 def _load_pipelines() -> list:
@@ -809,7 +845,9 @@ def _create_pipeline(cfg: dict, iteration_index: int = 1, iteration_count: int =
     kind = cfg.get("kind") if cfg.get("kind") in _PIPELINE_KINDS else "now"
     now = datetime.now().astimezone()
     if kind == "now":
-        status, started_at, scheduled_for = "running", now.isoformat(timespec="seconds"), None
+        # `now` jobs enter the queue immediately; the dispatcher promotes one to
+        # `running` when the single run slot is free (FIFO).
+        status, started_at, scheduled_for = "queued", None, None
     else:
         status, started_at = "scheduled", None
         # Honour a client-provided scheduled_for (from the datetime modal) if
@@ -845,6 +883,8 @@ def _create_pipeline(cfg: dict, iteration_index: int = 1, iteration_count: int =
         "tests":         (cfg.get("tests") or "").strip(),
         "created_at":    now.isoformat(timespec="seconds"),
         "scheduled_for": scheduled_for,
+        "queued_at":     now.isoformat(timespec="seconds") if kind == "now" else None,
+        "priority":      False,
         "started_at":    started_at,
         "finished_at":   None,
         "rp_url":        None,
@@ -861,8 +901,9 @@ def _create_pipeline(cfg: dict, iteration_index: int = 1, iteration_count: int =
         record["logs"].append(f"[{record['created_at']}] feature: {record['feature']}")
     if record["tests"]:
         record["logs"].append(f"[{record['created_at']}] tests filter: {record['tests']}")
-    if status == "running":
-        record["logs"].append(f"[{record['created_at']}] state: running (waiting for runner)")
+    if status == "queued":
+        record["logs"].append(
+            f"[{record['created_at']}] state: queued (waiting for the run slot, FIFO)")
     else:
         record["logs"].append(
             f"[{record['created_at']}] state: scheduled for {scheduled_for}"
@@ -1994,6 +2035,7 @@ html, body {
 }
 .pipeline-item .rp-link:hover { color: #ffa867; }
 .pipeline-item.status-running   { border-left-color: #60a5fa; }
+.pipeline-item.status-queued    { border-left-color: #a78bfa; }
 .pipeline-item.status-scheduled { border-left-color: #f59e0b; }
 .pipeline-item.status-finished  { border-left-color: #10b981; }
 .pipeline-item.status-failed    { border-left-color: var(--red); }
@@ -2042,6 +2084,7 @@ html, body {
     color: var(--white-soft);
 }
 .pipelines-view-status .status-running   { background: rgba(96,165,250,0.25); color: #93c5fd; }
+.pipelines-view-status .status-queued    { background: rgba(167,139,250,0.20); color: #c4b5fd; }
 .pipelines-view-status .status-scheduled { background: rgba(245,158,11,0.20); color: #fcd34d; }
 .pipelines-view-status .status-finished  { background: rgba(16,185,129,0.22); color: #6ee7b7; }
 .pipelines-view-status .status-failed    { background: rgba(226,101,101,0.22); color: #fca5a5; }
@@ -3138,6 +3181,8 @@ SPA_HTML = f"""<!DOCTYPE html>
             ].join(' · ');
             const timing = (p.status === 'scheduled')
                 ? 'scheduled for ' + _humanWhen(p.scheduled_for)
+                : (p.status === 'queued')
+                    ? ('queued ' + _humanWhen(p.queued_at || p.created_at) + (p.priority ? ' · priority' : ''))
                 : (p.status === 'finished')
                     ? 'finished ' + _humanWhen(p.finished_at)
                     : (p.status === 'running')
@@ -3171,12 +3216,18 @@ SPA_HTML = f"""<!DOCTYPE html>
         function _renderPipelinesList(pipelines) {{
             const panel = document.getElementById('pipelinesListPanel');
             if (!panel) return;
-            const buckets = {{ running: [], scheduled: [], finished: [], failed: [] }};
+            const buckets = {{ running: [], queued: [], scheduled: [], finished: [], failed: [] }};
             (pipelines || []).forEach(function(p) {{
                 (buckets[p.status] || (buckets.finished)).push(p);
             }});
             // Sort: running by start desc, scheduled by scheduled_for asc, finished by finished_at desc.
             buckets.running.sort(function(a, b) {{ return (b.started_at || '').localeCompare(a.started_at || ''); }});
+            // Queued in execution order: priority (scheduled-due) first, then FIFO by enqueue time.
+            buckets.queued.sort(function(a, b) {{
+                const pa = a.priority ? 0 : 1, pb = b.priority ? 0 : 1;
+                if (pa !== pb) return pa - pb;
+                return (a.queued_at || a.created_at || '').localeCompare(b.queued_at || b.created_at || '');
+            }});
             buckets.scheduled.sort(function(a, b) {{ return (a.scheduled_for || '').localeCompare(b.scheduled_for || ''); }});
             buckets.finished.sort(function(a, b) {{ return (b.finished_at || b.created_at || '').localeCompare(a.finished_at || a.created_at || ''); }});
             buckets.failed.sort(function(a, b) {{ return (b.finished_at || b.created_at || '').localeCompare(a.finished_at || a.created_at || ''); }});
@@ -3194,6 +3245,7 @@ SPA_HTML = f"""<!DOCTYPE html>
             }}
             panel.innerHTML =
                   section('Running',   buckets.running)
+                + section('Queued',    buckets.queued)
                 + section('Scheduled', buckets.scheduled)
                 + section('Finished',  buckets.finished)
                 + section('Failed',    buckets.failed);
@@ -4356,18 +4408,17 @@ class _SpaHandler(http.server.BaseHTTPRequestHandler):
         for i in range(iterations):
             rec = _create_pipeline(payload, iteration_index=i + 1, iteration_count=iterations)
             records.append(rec)
-        # Kick off `run-now` pipelines immediately. `scheduled` ones get
-        # picked up by the scheduler thread when their time arrives.
-        for r in records:
-            if r.get("status") == "running":
-                _start_runner(r["id"])
+        # `now` jobs are now `queued`; the single-slot dispatcher starts the next
+        # one when the slot is free. Nudge it so a free slot fills immediately.
+        _ensure_pipeline_scheduler()
+        _dispatch_tick()
         self._send_json(200, {"pipelines": records, "count": len(records)})
 
     def _handle_pipeline_rerun(self, pid: str):
         """Re-run a finished/failed pipeline with the same configuration:
         build a fresh run config from the original record and create a new
-        pipeline, which appends it to the end of the queue and starts it like
-        a `run-now`. The original record is left untouched."""
+        pipeline, which is appended to the **end of the queue** (FIFO) and run
+        by the single-slot dispatcher. The original record is left untouched."""
         pid = (pid or "").strip()
         src = None
         for p in _load_pipelines():
@@ -4386,8 +4437,8 @@ class _SpaHandler(http.server.BaseHTTPRequestHandler):
             "tests":    src.get("tests") or "",
         }
         rec = _create_pipeline(cfg)
-        if rec.get("status") == "running":
-            _start_runner(rec["id"])
+        _ensure_pipeline_scheduler()
+        _dispatch_tick()
         self._send_json(200, {"pipeline": rec, "rerun_of": pid})
 
     def _handle_pipeline_logs(self, pid: str):
