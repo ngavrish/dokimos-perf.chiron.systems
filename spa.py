@@ -3231,6 +3231,33 @@ SPA_HTML = f"""<!DOCTYPE html>
         let _selectedPipelineId = null;
         let _pipelinesPollTimer = null;
         let _logsPollTimer      = null;
+        let _medianRunSec = 0;   // updated each render from past run durations
+
+        function _computeMedianRunSec(pipelines) {{
+            const durs = [];
+            (pipelines || []).forEach(function(p) {{
+                if (p.started_at && p.finished_at) {{
+                    const d = (new Date(p.finished_at) - new Date(p.started_at)) / 1000;
+                    if (d > 10 && d < 3 * 3600) durs.push(d);
+                }}
+            }});
+            if (!durs.length) return 0;
+            durs.sort(function(a, b) {{ return a - b; }});
+            return durs[Math.floor(durs.length / 2)];
+        }}
+
+        function _etaText(p) {{
+            // Estimated finish for a running pipeline, from the median past duration.
+            if (p.status !== 'running' || !p.started_at || _medianRunSec <= 0) return '';
+            const started = new Date(p.started_at).getTime();
+            if (isNaN(started)) return '';
+            const etaMs = started + _medianRunSec * 1000;
+            const remMin = Math.round((etaMs - Date.now()) / 60000);
+            const clock = new Date(etaMs).toLocaleTimeString();
+            return remMin > 0
+                ? (' · ~' + remMin + ' min left (est. finish ' + clock + ')')
+                : ' · past estimate, finishing…';
+        }}
 
         function _humanWhen(iso) {{
             if (!iso) return '';
@@ -3253,7 +3280,7 @@ SPA_HTML = f"""<!DOCTYPE html>
                 : (p.status === 'finished')
                     ? 'finished ' + _humanWhen(p.finished_at)
                     : (p.status === 'running')
-                        ? 'started ' + _humanWhen(p.started_at || p.created_at)
+                        ? ('started ' + _humanWhen(p.started_at || p.created_at) + _etaText(p))
                         : 'created ' + _humanWhen(p.created_at);
             const rp = p.rp_url
                 ? '<a class="rp-link" href="' + _testsEscape(p.rp_url) + '" target="_blank" rel="noopener noreferrer" onclick="event.stopPropagation()">Report Portal &rarr;</a>'
@@ -3283,6 +3310,7 @@ SPA_HTML = f"""<!DOCTYPE html>
         function _renderPipelinesList(pipelines) {{
             const panel = document.getElementById('pipelinesListPanel');
             if (!panel) return;
+            _medianRunSec = _computeMedianRunSec(pipelines);
             const buckets = {{ running: [], queued: [], scheduled: [], finished: [], failed: [] }};
             (pipelines || []).forEach(function(p) {{
                 (buckets[p.status] || (buckets.finished)).push(p);
