@@ -1390,6 +1390,7 @@ def _run_group_report(group_id: str, urls: list) -> None:
     with _pipelines_lock():
         g0 = _load_groups().get(group_id) or {}
     dbx_dir = g0.get("report_dbx_dir") or None
+    dbx_temp = bool(g0.get("report_dbx_temp"))
     try:
         if not deduped:
             raise RuntimeError(
@@ -1417,6 +1418,19 @@ def _run_group_report(group_id: str, urls: list) -> None:
                 g["report_status"] = "failed"
                 g["report_error"] = f"{type(exc).__name__}: {exc}"
                 _save_groups(groups)
+    finally:
+        # Remove the materialized upload tempdir and clear the marker so a later
+        # auto-regen doesn't point at a deleted dir.
+        if dbx_temp and dbx_dir:
+            import shutil
+            shutil.rmtree(dbx_dir, ignore_errors=True)
+            with _pipelines_lock():
+                groups = _load_groups()
+                g = groups.get(group_id)
+                if g is not None and g.get("report_dbx_temp"):
+                    g["report_dbx_dir"] = None
+                    g["report_dbx_temp"] = False
+                    _save_groups(groups)
 
 
 def _cleanup_pipelines(statuses=("failed",)) -> dict:
@@ -3016,48 +3030,90 @@ html, body {
 .group-count { opacity: 0.6; font-size: 12px; }
 .group-badge { font-size: 11px; opacity: 0.75; margin-left: auto; }
 .group-badge-done { color: #3fb950; opacity: 0.95; }
-.pipelines-view-group { flex: 1; overflow: auto; padding: 16px; }
-.group-section-title { font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: .04em;
-    opacity: 0.65; margin: 18px 0 8px; }
-.group-section-title:first-child { margin-top: 0; }
-.group-counts { font-weight: 400; text-transform: none; opacity: 0.8; }
-.group-progress-head { display: flex; justify-content: space-between; font: 600 13px var(--font-mono); color: #c9d1d9; }
-.group-eta { color: #8b949e; font-weight: 500; }
-.group-progress-track { height: 8px; background: #21262d; border-radius: 4px; overflow: hidden; margin: 5px 0 4px; }
-.group-progress-fill { height: 100%; background: #3fb950; transition: width .6s ease; }
-.group-iters { display: flex; flex-direction: column; gap: 4px; margin-top: 6px; }
-.group-iter { display: flex; align-items: center; gap: 10px; padding: 5px 8px; border-radius: 5px;
-    background: rgba(255,255,255,0.02); cursor: pointer; font-size: 12px; }
-.group-iter:hover { background: rgba(255,255,255,0.06); }
-.group-iter-idx { font-family: var(--font-mono); opacity: 0.7; min-width: 28px; }
-.group-iter-status { min-width: 64px; font-size: 11px; }
-.group-iter-status.status-finished { color: #3fb950; }
-.group-iter-status.status-failed { color: #f85149; }
-.group-iter-status.status-running { color: #58a6ff; }
-.group-iter-bar { flex: 1; height: 6px; background: #21262d; border-radius: 3px; overflow: hidden; }
-.group-iter-bar > span { display: block; height: 100%; transition: width .6s ease; }
-.group-iter-num { font-family: var(--font-mono); opacity: 0.7; min-width: 56px; text-align: right; }
-.group-report { margin-top: 4px; padding: 12px 14px; border-radius: 8px; background: rgba(255,255,255,0.03);
-    font-size: 13px; }
-.group-report-ready { border: 1px solid rgba(63,185,80,0.4); }
-.group-report-failed { border: 1px solid rgba(248,81,73,0.4); }
-.group-report-title { font-weight: 600; margin-bottom: 8px; }
-.group-report-err { font-family: var(--font-mono); font-size: 12px; color: #f85149; margin-bottom: 10px; word-break: break-word; }
-.group-report .btn-primary { display: inline-block; margin: 4px 0; text-decoration: none; }
-.group-report-actions { display: flex; gap: 8px; align-items: center; margin: 6px 0 2px; flex-wrap: wrap; }
-.group-dbx-input { flex: 1; min-width: 260px; font-family: var(--font-mono); font-size: 12px;
-    padding: 6px 8px; border-radius: 5px; border: 1px solid rgba(255,255,255,0.15);
-    background: var(--bg-dark, #0d1117); color: #e6edf3; }
-#groupReportBtn.regen { background: #3fb950; border-color: #3fb950; }
-.group-dbx-hint { font-size: 11px; opacity: 0.6; margin-bottom: 4px; }
-.group-report-pw { margin-top: 12px; }
-.group-report-pw label { display: block; font-size: 12px; opacity: 0.75; margin-bottom: 4px; }
-.group-report-pw-row { display: flex; gap: 8px; }
-.group-report-pw-row input { flex: 1; font-family: var(--font-mono); padding: 6px 8px; border-radius: 5px;
-    border: 1px solid rgba(255,255,255,0.15); background: var(--bg-dark, #0d1117); color: #e6edf3; }
-.group-report-pw-gone { margin-top: 12px; font-size: 12px; opacity: 0.8; }
-.group-report-busy .live-dot { vertical-align: middle; }
-.group-error { padding: 16px; color: #f85149; }
+/* ----- Group view (right panel): hero ring + cards ----- */
+.pipelines-view-group { flex: 1; overflow: auto; padding: 20px 22px; }
+/* Fill 100% of the logs panel: left (config/iterations) + right (report) columns. */
+.gv { display: flex; flex-direction: row; align-items: flex-start; gap: 18px; width: 100%; }
+.gv-main { flex: 1 1 0; min-width: 0; display: flex; flex-direction: column; gap: 16px; }
+.gv-side { flex: 1 1 0; min-width: 0; position: sticky; top: 0; display: flex; flex-direction: column; gap: 16px; }
+.gv-side .gv-card { margin: 0; }
+@media (max-width: 900px) {
+    .gv { flex-direction: column; }
+    .gv-main, .gv-side { flex: 1 1 auto; width: 100%; position: static; }
+}
+.gv-hero { display: flex; align-items: center; gap: 20px; padding: 18px 20px; border-radius: 14px;
+    background: linear-gradient(135deg, rgba(176,141,87,0.12), rgba(255,255,255,0.015));
+    border: 1px solid rgba(176,141,87,0.28); }
+.gv-ring { width: 86px; height: 86px; border-radius: 50%; flex: 0 0 auto; display: flex;
+    align-items: center; justify-content: center; transition: background .6s ease; }
+.gv-ring-in { width: 64px; height: 64px; border-radius: 50%; background: var(--bg-dark, #0d1117);
+    display: flex; align-items: center; justify-content: center; }
+.gv-ring-pct { font: 700 21px var(--font-mono); color: #e6edf3; }
+.gv-hero-meta { display: flex; flex-direction: column; gap: 7px; min-width: 0; }
+.gv-hero-h1 { font-size: 24px; font-weight: 700; color: #e6edf3; }
+.gv-hero-h2 { font-size: 16px; color: #9aa4af; }
+.gv-chips { display: flex; gap: 7px; flex-wrap: wrap; margin-top: 4px; }
+.gv-chip { font-size: 13px; font-weight: 600; padding: 3px 12px; border-radius: 999px;
+    background: rgba(255,255,255,0.07); color: #c9d1d9; }
+.gv-chip-running { background: rgba(88,166,255,0.18); color: #79b8ff; }
+.gv-chip-finished { background: rgba(63,185,80,0.18); color: #56d364; }
+.gv-chip-failed { background: rgba(248,81,73,0.18); color: #f85149; }
+.gv-chip-queued, .gv-chip-scheduled { background: rgba(176,141,87,0.20); color: #d6b98a; }
+.gv-card { padding: 14px 16px; border-radius: 12px; background: rgba(255,255,255,0.025);
+    border: 1px solid rgba(255,255,255,0.07); }
+.gv-card-h { font-size: 13px; font-weight: 700; text-transform: uppercase; letter-spacing: .07em;
+    color: #9aa4af; margin-bottom: 12px; }
+.gv-card-sub { font-weight: 400; text-transform: none; letter-spacing: 0; opacity: 0.7; margin-left: 6px; }
+.gv .pipelines-view-config-grid { font-size: 14px; row-gap: 9px; }
+.gv .pipelines-view-config-grid strong { font-size: 13px; }
+.gv-iters { display: flex; flex-direction: column; gap: 6px; }
+.gv-iter { display: flex; align-items: center; gap: 12px; padding: 10px 12px; border-radius: 8px;
+    background: rgba(255,255,255,0.02); cursor: pointer; font-size: 14px; transition: background .15s; }
+.gv-iter:hover { background: rgba(255,255,255,0.07); }
+.gv-iter-idx { font-family: var(--font-mono); font-size: 14px; opacity: 0.6; min-width: 34px; }
+.gv-iter-status { min-width: 78px; font-size: 13px; font-weight: 600; text-transform: capitalize; }
+.gv-st-finished { color: #3fb950; } .gv-st-failed { color: #f85149; }
+.gv-st-running { color: #58a6ff; } .gv-st-queued, .gv-st-scheduled { color: #d6b98a; }
+.gv-iter-bar { flex: 1; height: 6px; background: #21262d; border-radius: 3px; overflow: hidden; }
+.gv-iter-bar > span { display: block; height: 100%; transition: width .6s ease; }
+.gv-iter-num { font-family: var(--font-mono); font-size: 14px; opacity: 0.65; min-width: 58px; text-align: right; }
+.gv-iter-norp { opacity: 0.4; font-size: 13px; min-width: 64px; text-align: right; }
+/* report card */
+.gv-report-ready { border-color: rgba(63,185,80,0.38); background: rgba(63,185,80,0.05); }
+.gv-report-failed { border-color: rgba(248,81,73,0.38); background: rgba(248,81,73,0.05); }
+.gv-report-badge { display: inline-block; font-size: 13px; font-weight: 700; padding: 2px 10px;
+    border-radius: 999px; background: rgba(63,185,80,0.22); color: #56d364; margin-right: 8px; }
+.gv-report-meta { font-size: 16px; color: #d6dde5; margin-bottom: 14px; }
+.gv-report-busy { font-size: 15px; color: #9aa4af; display: flex; align-items: center; gap: 8px; }
+.gv-report-wait { font-size: 15px; color: #9aa4af; }
+.gv-report-err { font-family: var(--font-mono); font-size: 13px; color: #f85149; margin-bottom: 12px; word-break: break-word; }
+.gv-report-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.gv-dbx { flex: 1; min-width: 240px; font-family: var(--font-mono); font-size: 14px; padding: 10px 12px;
+    border-radius: 8px; border: 1px solid rgba(255,255,255,0.15); background: var(--bg-dark, #0d1117); color: #e6edf3; }
+.gv-dbx:focus { outline: none; border-color: rgba(176,141,87,0.65); }
+.gv-dbx-hint { font-size: 13px; opacity: 0.6; margin-top: 8px; }
+.gv-dbx-section { margin: 4px 0 12px; }
+.gv-dbx-section .dbx-dropzone { margin: 0; }
+.gv-btn { font-family: var(--font-mono); font-size: 13px; font-weight: 700; letter-spacing: 0.06em;
+    text-transform: uppercase; padding: 10px 18px; border-radius: 8px; cursor: pointer;
+    border: 1px solid transparent; text-decoration: none; display: inline-flex; align-items: center; gap: 6px;
+    white-space: nowrap; transition: background .12s, color .12s, border-color .12s; }
+.gv-btn-primary { background: var(--bronze); color: var(--bg-dark); border-color: var(--bronze); }
+.gv-btn-primary:hover { background: var(--bronze-lt); border-color: var(--bronze-lt); }
+/* "Generate report" (regen) state stays in the gold palette, just brighter. */
+.gv-btn-primary.regen { background: var(--bronze-lt); border-color: var(--bronze-lt); }
+.gv-btn-primary.regen:hover { background: var(--bronze); border-color: var(--bronze); }
+.gv-btn-ghost { background: transparent; color: var(--bronze-lt); border-color: var(--bronze-dk); }
+.gv-btn-ghost:hover { background: rgba(205,127,50,0.15); color: var(--bronze-lt); border-color: var(--bronze); }
+.gv-pw { margin-top: 16px; }
+.gv-pw label { display: block; font-size: 14px; color: #c9d1d9; margin-bottom: 7px; }
+.gv-pw-warn { color: #d29922; font-weight: 500; }
+.gv-pw-row { display: flex; gap: 8px; max-width: 480px; }
+.gv-pw-row input { flex: 1; font-family: var(--font-mono); font-size: 15px; letter-spacing: 1px;
+    padding: 10px 12px; border-radius: 8px; border: 1px solid rgba(210,153,34,0.4);
+    background: rgba(210,153,34,0.08); color: #f0d999; }
+.gv-pw-gone { margin-top: 16px; font-size: 14px; opacity: 0.85; }
+.group-error { padding: 18px; color: #f85149; }
 .pipelines-cleanup-btn {
     float: right; font-size: 11px; cursor: pointer; padding: 1px 8px; border-radius: 4px;
     border: 1px solid rgba(248,81,73,0.45); background: transparent; color: #f85149;
@@ -4191,23 +4247,26 @@ SPA_HTML = f"""<!DOCTYPE html>
                      + '</div>';
             }}
             const failedAction = buckets.failed.length
-                ? '<button class="pipelines-cleanup-btn" title="Remove all failed pipelines" onclick="event.stopPropagation(); _cleanupFailed()">clear all</button>'
+                ? '<button class="pipelines-cleanup-btn" title="Remove all failed pipelines" onclick="event.stopPropagation(); _cleanupStatus(\\'failed\\')">clear all</button>'
+                : '';
+            const finishedAction = buckets.finished.length
+                ? '<button class="pipelines-cleanup-btn" title="Remove all finished pipelines" onclick="event.stopPropagation(); _cleanupStatus(\\'finished\\')">clear all</button>'
                 : '';
             panel.innerHTML =
                   section('Running',   buckets.running)
                 + section('Queued',    buckets.queued)
                 + section('Scheduled', buckets.scheduled)
-                + section('Finished',  buckets.finished)
+                + section('Finished',  buckets.finished, finishedAction)
                 + section('Failed',    buckets.failed, failedAction);
         }}
 
-        async function _cleanupFailed() {{
-            if (!window.confirm('Remove all failed pipelines? This cannot be undone.')) return;
+        async function _cleanupStatus(status) {{
+            if (!window.confirm('Remove all ' + status + ' pipelines? This cannot be undone.')) return;
             try {{
                 const res = await fetch('/api/pipelines/cleanup', {{
                     method: 'POST',
                     headers: {{'Content-Type': 'application/json'}},
-                    body: JSON.stringify({{statuses: ['failed']}}),
+                    body: JSON.stringify({{statuses: [status]}}),
                 }});
                 if (res.ok) {{
                     // If the open pipeline was just removed, reset the view.
@@ -4319,88 +4378,107 @@ SPA_HTML = f"""<!DOCTYPE html>
 
         function _groupReportHtml(g) {{
             const st = g.report_status;
+            let inner, cls = 'gv-card gv-report';
             if (st === 'generating') {{
-                return '<div class="group-report group-report-busy"><span class="live-dot"></span> Generating performance report from '
-                     + (g.status_counts ? '' : '') + 'the run launches&hellip;</div>';
-            }}
-            if (st === 'failed') {{
-                return '<div class="group-report group-report-failed">'
-                     + '<div class="group-report-title">Report generation failed</div>'
-                     + '<div class="group-report-err">' + _testsEscape(g.report_error || 'unknown error') + '</div>'
-                     + '<button class="btn-primary" onclick="_groupGenerate(\\'' + _testsEscape(g.id) + '\\')">Generate report</button>'
-                     + '</div>';
-            }}
-            if (st === 'ready' && g.report) {{
+                inner = '<div class="gv-report-busy"><span class="live-dot"></span> Generating performance report from the run launches&hellip;</div>';
+            }} else if (st === 'failed') {{
+                cls += ' gv-report-failed';
+                inner = '<div class="gv-report-err">' + _testsEscape(g.report_error || 'unknown error') + '</div>'
+                      + '<button class="gv-btn gv-btn-primary" onclick="_groupGenerate(\\'' + _testsEscape(g.id) + '\\')">&#8635; Generate report</button>';
+            }} else if (st === 'ready' && g.report) {{
+                cls += ' gv-report-ready';
                 const r = g.report;
                 const link = r.share_url || r.url || '#';
-                const dropped = r.dropped_launches ? (' &middot; ' + r.dropped_launches + ' extra launch(es) omitted') : '';
-                const dbxNote = r.has_databricks ? ' &middot; includes Databricks logs' : '';
-                let pwBlock;
+                const meta = '<span class="gv-report-badge">&#10003; ready</span> '
+                    + (r.num_launches || 0) + ' launch(es)'
+                    + (r.dropped_launches ? ' &middot; ' + r.dropped_launches + ' omitted' : '')
+                    + (r.has_databricks ? ' &middot; + Databricks logs' : '');
+                let pw;
                 if (g.report_password) {{
-                    pwBlock = '<div class="group-report-pw">'
-                        + '<label>One-time password (shown once &mdash; destroyed when you leave this view):</label>'
-                        + '<div class="group-report-pw-row">'
+                    pw = '<div class="gv-pw">'
+                        + '<label>One-time password <span class="gv-pw-warn">&mdash; shown once, destroyed when you leave this view</span></label>'
+                        + '<div class="gv-pw-row">'
                         +   '<input type="text" id="groupReportPw" readonly value="' + _testsEscape(g.report_password) + '">'
-                        +   '<button class="btn-secondary" onclick="_copyGroupPassword()">Copy</button>'
+                        +   '<button class="gv-btn gv-btn-ghost" onclick="_copyGroupPassword()">Copy</button>'
                         + '</div></div>';
                 }} else {{
-                    pwBlock = '<div class="group-report-pw-gone">Password already revealed and destroyed. '
-                        + '<button class="btn-secondary" onclick="_groupGenerate(\\'' + _testsEscape(g.id) + '\\')">Regenerate for a new password</button></div>';
+                    pw = '<div class="gv-pw-gone">Password was revealed and destroyed. '
+                        + '<button class="gv-btn gv-btn-ghost" onclick="_groupGenerate(\\'' + _testsEscape(g.id) + '\\')">Regenerate for a new password</button></div>';
                 }}
-                // Open the existing report, OR fold in Databricks logs by path and
-                // regenerate (the button switches to "Generate report" once a path
-                // is entered). data-* carry the id/link so the re-render is stateless.
-                return '<div class="group-report group-report-ready">'
-                     + '<div class="group-report-title">Performance report ready &mdash; ' + (r.num_launches || 0) + ' launch(es)' + dropped + dbxNote + '</div>'
-                     + '<div class="group-report-actions">'
-                     +   '<input type="text" id="groupDbxPath" class="group-dbx-input" '
-                     +     'placeholder="optional: path to a Databricks logs dir (log4j-*, stdout, stderr)" '
-                     +     'oninput="_onGroupDbxInput()">'
-                     +   '<button id="groupReportBtn" class="btn-primary" '
-                     +     'data-gid="' + _testsEscape(g.id) + '" data-link="' + _testsEscape(link) + '" '
-                     +     'onclick="_groupReportBtnClick()">Open report &rarr;</button>'
-                     + '</div>'
-                     + '<div class="group-dbx-hint">Enter a path to Databricks job logs to regenerate the report with them folded in.</div>'
-                     + pwBlock
-                     + '</div>';
+                // Open the existing report, OR drop Databricks logs to fold them in
+                // and regenerate (the button flips to "Generate report" once files
+                // are staged). _gvDbxWire() re-attaches handlers after each re-render.
+                inner = '<div class="gv-report-meta">' + meta + '</div>'
+                      + '<div class="gv-dbx-section">'
+                      +   '<div class="dbx-dropzone" id="gvDbxDropzone" tabindex="0" '
+                      +     'onclick="document.getElementById(\\'gvDbxFileInput\\').click()" '
+                      +     'onkeydown="if(event.key===\\'Enter\\'||event.key===\\' \\'){{event.preventDefault();document.getElementById(\\'gvDbxFileInput\\').click();}}">'
+                      +     '<input type="file" id="gvDbxFileInput" multiple accept=".log,.gz,.txt" style="display:none">'
+                      +     '<input type="file" id="gvDbxFolderInput" multiple webkitdirectory directory style="display:none">'
+                      +     '<div class="dbx-dropzone-cta">Drop files or a folder here, or click to browse</div>'
+                      +     '<div class="dbx-dropzone-hint">'
+                      +       '<a href="#" class="dbx-folder-link" onclick="event.preventDefault();event.stopPropagation();document.getElementById(\\'gvDbxFolderInput\\').click();">Pick a folder instead</a>'
+                      +       '&nbsp;&middot;&nbsp; Accepts <code>log4j-*.log[.gz]</code>, <code>stdout*.txt</code>, <code>stderr*.txt</code>. Other files are ignored.'
+                      +     '</div>'
+                      +   '</div>'
+                      +   '<div class="dbx-file-list" id="gvDbxFileList"></div>'
+                      + '</div>'
+                      + '<div class="gv-report-actions">'
+                      +   '<button id="groupReportBtn" class="gv-btn gv-btn-primary" '
+                      +     'data-gid="' + _testsEscape(g.id) + '" data-link="' + _testsEscape(link) + '" '
+                      +     'onclick="_groupReportBtnClick()">Open report &rarr;</button>'
+                      + '</div>'
+                      + pw;
+            }} else {{
+                inner = '<div class="gv-report-wait">Generates automatically once every iteration finishes.</div>';
             }}
-            // none
-            return '<div class="group-report">Performance report will generate automatically once every iteration finishes.</div>';
+            return '<div class="' + cls + '"><div class="gv-card-h">Performance report</div>' + inner + '</div>';
         }}
 
         function _groupViewHtml(g) {{
             const pct = g.pct || 0;
-            const eta = (g.eta_sec != null) ? ('ETA ~' + Math.max(1, Math.round(g.eta_sec / 60)) + ' min') : (g.all_done ? 'complete' : 'ETA --');
+            const eta = (g.eta_sec != null) ? ('~' + Math.max(1, Math.round(g.eta_sec / 60)) + ' min') : (g.all_done ? 'done' : '--');
             const sc = g.status_counts || {{}};
-            const countsLine = ['finished', 'failed', 'running', 'queued', 'scheduled']
+            const chips = ['running', 'queued', 'scheduled', 'finished', 'failed']
                 .filter(function(s) {{ return sc[s]; }})
-                .map(function(s) {{ return sc[s] + ' ' + s; }}).join(' &middot; ');
+                .map(function(s) {{ return '<span class="gv-chip gv-chip-' + s + '">' + sc[s] + ' ' + s + '</span>'; }}).join('');
+            const ringColor = g.all_done ? (sc.failed ? '#f85149' : '#3fb950') : '#58a6ff';
             const members = (g.members || []).map(function(m) {{
                 const mp = m.progress || {{}};
-                // Prefer the live/actual progress total (accurate, filter-aware)
-                // over the member's pre-run scenario_count estimate.
+                // Prefer the live/actual progress total (filter-aware) over the estimate.
                 const tot = (mp.total != null ? mp.total : (m.scenario_count || 0));
                 const mdone = mp.done || 0;
                 const mpct = tot ? Math.min(100, Math.round(mdone / tot * 100)) : (m.status === 'finished' || m.status === 'failed' ? 100 : 0);
-                const color = m.status === 'finished' ? '#3fb950' : (m.status === 'failed' ? '#f85149' : (m.status === 'running' ? '#3fb950' : '#8b949e'));
-                const rp = m.rp_url ? '<a class="rp-link" href="' + _testsEscape(m.rp_url) + '" target="_blank" rel="noopener noreferrer">RP &rarr;</a>' : '';
-                return '<div class="group-iter" onclick="_selectPipeline(\\'' + _testsEscape(m.id) + '\\')">'
-                     +   '<span class="group-iter-idx">#' + (m.iteration_index || '?') + '</span>'
-                     +   '<span class="group-iter-status status-' + m.status + '">' + m.status + '</span>'
-                     +   '<span class="group-iter-bar"><span style="width:' + mpct + '%;background:' + color + '"></span></span>'
-                     +   '<span class="group-iter-num">' + mdone + '/' + tot + '</span>'
+                const color = m.status === 'finished' ? '#3fb950' : (m.status === 'failed' ? '#f85149' : (m.status === 'running' ? '#58a6ff' : '#8b949e'));
+                const rp = m.rp_url
+                    ? '<a class="rp-link" href="' + _testsEscape(m.rp_url) + '" target="_blank" rel="noopener noreferrer" onclick="event.stopPropagation()">RP &rarr;</a>'
+                    : '<span class="gv-iter-norp">no launch</span>';
+                return '<div class="gv-iter" onclick="_selectPipeline(\\'' + _testsEscape(m.id) + '\\')">'
+                     +   '<span class="gv-iter-idx">#' + (m.iteration_index || '?') + '</span>'
+                     +   '<span class="gv-iter-status gv-st-' + m.status + '">' + m.status + '</span>'
+                     +   '<span class="gv-iter-bar"><span style="width:' + mpct + '%;background:' + color + '"></span></span>'
+                     +   '<span class="gv-iter-num">' + mdone + '/' + tot + '</span>'
                      +   rp
                      + '</div>';
             }}).join('');
-            return '<div class="group-section-title">Configuration (shared by all iterations)</div>'
-                 + _groupConfigRows(g.config)
-                 + '<div class="group-section-title">Progress &mdash; ' + g.iterations_done + ' / ' + g.iteration_count + ' iterations'
-                 +   (countsLine ? ' <span class="group-counts">(' + countsLine + ')</span>' : '') + '</div>'
-                 + '<div class="group-progress-head"><span>Scenarios ' + g.scenarios_done + ' / ' + g.scenarios_total + ' (' + pct + '%)</span><span class="group-eta">' + eta + '</span></div>'
-                 + '<div class="group-progress-track"><div class="group-progress-fill" style="width:' + pct + '%"></div></div>'
-                 + '<div class="group-iters">' + members + '</div>'
-                 + '<div class="group-section-title">Performance report</div>'
-                 + _groupReportHtml(g);
+            return '<div class="gv">'
+                 +   '<div class="gv-main">'
+                 +     '<div class="gv-hero">'
+                 +       '<div class="gv-ring" style="background: conic-gradient(' + ringColor + ' ' + pct + '%, rgba(255,255,255,0.07) ' + pct + '%)">'
+                 +         '<div class="gv-ring-in"><span class="gv-ring-pct">' + pct + '%</span></div>'
+                 +       '</div>'
+                 +       '<div class="gv-hero-meta">'
+                 +         '<div class="gv-hero-h1">' + g.iterations_done + ' / ' + g.iteration_count + ' iterations</div>'
+                 +         '<div class="gv-hero-h2">' + g.scenarios_done + ' / ' + g.scenarios_total + ' scenarios &middot; ETA ' + eta + '</div>'
+                 +         (chips ? '<div class="gv-chips">' + chips + '</div>' : '')
+                 +       '</div>'
+                 +     '</div>'
+                 +     '<div class="gv-card"><div class="gv-card-h">Configuration <span class="gv-card-sub">shared by all iterations</span></div>'
+                 +       _groupConfigRows(g.config) + '</div>'
+                 +     '<div class="gv-card"><div class="gv-card-h">Iterations</div><div class="gv-iters">' + members + '</div></div>'
+                 +   '</div>'
+                 +   '<div class="gv-side">' + _groupReportHtml(g) + '</div>'
+                 + '</div>';
         }}
 
         async function _refreshGroupView() {{
@@ -4418,42 +4496,35 @@ SPA_HTML = f"""<!DOCTYPE html>
                     const label = g.all_done ? (g.report_status === 'ready' ? 'report ready' : 'complete') : (g.iterations_done + '/' + g.iteration_count);
                     status.innerHTML = live + '<span class="status-pill">' + label + '</span>';
                 }}
-                // Preserve a Databricks path the user is mid-typing across the 4s poll re-render.
-                const _prevDbx = document.getElementById('groupDbxPath');
-                const _dbxVal = _prevDbx ? _prevDbx.value : '';
                 if (gv) gv.innerHTML = _groupViewHtml(g);
-                const _newDbx = document.getElementById('groupDbxPath');
-                if (_newDbx && _dbxVal) {{ _newDbx.value = _dbxVal; _onGroupDbxInput(); }}
+                // Re-attach the Databricks dropzone + restore its staged files
+                // after the poll replaced the report card's DOM.
+                _gvDbxWire();
             }} catch (_e) {{ /* keep last render */ }}
         }}
 
-        function _onGroupDbxInput() {{
-            const inp = document.getElementById('groupDbxPath');
+        async function _groupReportBtnClick() {{
             const btn = document.getElementById('groupReportBtn');
-            if (!inp || !btn) return;
-            if (inp.value.trim()) {{ btn.textContent = 'Generate report'; btn.classList.add('regen'); }}
-            else {{ btn.innerHTML = 'Open report &rarr;'; btn.classList.remove('regen'); }}
-        }}
-
-        function _groupReportBtnClick() {{
-            const btn = document.getElementById('groupReportBtn');
-            const inp = document.getElementById('groupDbxPath');
             if (!btn) return;
-            const path = inp ? inp.value.trim() : '';
-            if (path) {{
-                _groupGenerate(btn.getAttribute('data-gid'), path);
+            const accepted = _gvDbxAccepted();
+            if (accepted.length) {{
+                btn.disabled = true; btn.textContent = 'Reading files\\u2026';
+                let files = [];
+                try {{ files = await _readDbxFilesAsBase64(null, _gvDbxFiles); }} catch (_e) {{}}
+                _groupGenerate(btn.getAttribute('data-gid'), files);
             }} else {{
                 window.open(btn.getAttribute('data-link'), '_blank', 'noopener');
             }}
         }}
 
-        async function _groupGenerate(gid, dbxPath) {{
+        async function _groupGenerate(gid, dbxFiles) {{
             const opts = {{method: 'POST'}};
-            if (dbxPath) {{
+            if (dbxFiles && dbxFiles.length) {{
                 opts.headers = {{'Content-Type': 'application/json'}};
-                opts.body = JSON.stringify({{databricks_log_dir: dbxPath}});
+                opts.body = JSON.stringify({{databricks_files: dbxFiles}});
             }}
             try {{ await fetch('/api/groups/' + encodeURIComponent(gid) + '/generate', opts); }} catch (_e) {{}}
+            _gvDbxFiles.length = 0;   // clear staged uploads once generation is kicked off
             _refreshGroupView();
         }}
 
@@ -4880,8 +4951,8 @@ SPA_HTML = f"""<!DOCTYPE html>
         // progress bar in the busy overlay. For typical Databricks log sets
         // (~20 files, a few MB total) the time-to-base64 is sub-second
         // anyway, but a 100 MB upload feels much better with progress.
-        function _readDbxFilesAsBase64(onProgress) {{
-            const accepted = _dbxFiles.filter(function(f) {{ return _dbxAccept(f.name); }});
+        function _readDbxFilesAsBase64(onProgress, filesArr) {{
+            const accepted = (filesArr || _dbxFiles).filter(function(f) {{ return _dbxAccept(f.name); }});
             if (!accepted.length) return Promise.resolve([]);
             const out = [];
             let i = 0;
@@ -4975,6 +5046,75 @@ SPA_HTML = f"""<!DOCTYPE html>
                     _dbxAddFiles(dt.files);
                 }}
             }});
+        }}
+
+        // ----- Group view: its own Databricks dropzone (re-wired after each poll
+        // re-render; file state persists in _gvDbxFiles). Reuses the New-tab
+        // helpers (_dbxAccept, _humanBytes, _escapeHtml, _walkEntry, _readDbxFilesAsBase64). -----
+        const _gvDbxFiles = [];
+        function _gvDbxAccepted() {{ return _gvDbxFiles.filter(function(f) {{ return _dbxAccept(f.name); }}); }}
+        function _gvDbxAddFiles(fileList) {{
+            const seen = new Set(_gvDbxFiles.map(function(f) {{ return f.name + ':' + f.size; }}));
+            for (const f of fileList) {{
+                const k = f.name + ':' + f.size;
+                if (!seen.has(k)) {{ seen.add(k); _gvDbxFiles.push(f); }}
+            }}
+            _gvDbxRender();
+        }}
+        function _gvDbxRemove(idx) {{ if (idx >= 0 && idx < _gvDbxFiles.length) {{ _gvDbxFiles.splice(idx, 1); _gvDbxRender(); }} }}
+        function _gvDbxRender() {{
+            const list = document.getElementById('gvDbxFileList');
+            const btn = document.getElementById('groupReportBtn');
+            const accepted = _gvDbxAccepted();
+            if (list) {{
+                const rejected = _gvDbxFiles.filter(function(f) {{ return !_dbxAccept(f.name); }});
+                const chips = _gvDbxFiles.map(function(f, idx) {{
+                    const ok = _dbxAccept(f.name);
+                    return '<span class="dbx-file-chip' + (ok ? '' : ' invalid') + '">'
+                        + _escapeHtml(f.name)
+                        + '<span class="dbx-file-chip-size">' + _humanBytes(f.size) + '</span>'
+                        + '<button type="button" class="dbx-file-chip-remove" title="Remove" onclick="_gvDbxRemove(' + idx + ')">&times;</button>'
+                        + '</span>';
+                }}).join('');
+                let summary = '';
+                if (accepted.length) {{
+                    const tot = accepted.reduce(function(a, f) {{ return a + f.size; }}, 0);
+                    summary = accepted.length + ' file' + (accepted.length === 1 ? '' : 's') + ' ready &middot; '
+                        + _humanBytes(tot) + ' total' + (rejected.length ? ' &middot; ' + rejected.length + ' ignored' : '');
+                }} else if (rejected.length) {{ summary = 'No recognized files yet'; }}
+                list.innerHTML = chips + (summary ? '<div class="dbx-file-summary">' + summary + '</div>' : '');
+            }}
+            if (btn) {{
+                if (accepted.length) {{ btn.textContent = 'Generate report'; btn.classList.add('regen'); }}
+                else {{ btn.innerHTML = 'Open report &rarr;'; btn.classList.remove('regen'); }}
+            }}
+        }}
+        function _gvDbxWire() {{
+            const dz = document.getElementById('gvDbxDropzone');
+            if (!dz) return;
+            if (!dz.dataset.wired) {{
+                dz.dataset.wired = '1';
+                const inp = document.getElementById('gvDbxFileInput');
+                const dirInp = document.getElementById('gvDbxFolderInput');
+                if (inp) inp.addEventListener('change', function(e) {{ _gvDbxAddFiles(e.target.files || []); inp.value = ''; }});
+                if (dirInp) dirInp.addEventListener('change', function(e) {{ _gvDbxAddFiles(e.target.files || []); dirInp.value = ''; }});
+                ['dragenter', 'dragover'].forEach(function(t) {{
+                    dz.addEventListener(t, function(e) {{ e.preventDefault(); e.stopPropagation(); dz.classList.add('dragover'); }});
+                }});
+                ['dragleave', 'drop'].forEach(function(t) {{
+                    dz.addEventListener(t, function(e) {{ e.preventDefault(); e.stopPropagation(); dz.classList.remove('dragover'); }});
+                }});
+                dz.addEventListener('drop', function(e) {{
+                    const dt = e.dataTransfer; if (!dt) return;
+                    const items = dt.items;
+                    if (items && items.length && typeof items[0].webkitGetAsEntry === 'function') {{
+                        const entries = [];
+                        for (let i = 0; i < items.length; i++) {{ const ent = items[i].webkitGetAsEntry && items[i].webkitGetAsEntry(); if (ent) entries.push(ent); }}
+                        Promise.all(entries.map(_walkEntry)).then(function(arrs) {{ const files = [].concat.apply([], arrs); if (files.length) _gvDbxAddFiles(files); }});
+                    }} else if (dt.files && dt.files.length) {{ _gvDbxAddFiles(dt.files); }}
+                }});
+            }}
+            _gvDbxRender();   // restore chips + button label after a re-render
         }}
 
         async function generateReport() {{
@@ -5850,30 +5990,44 @@ class _SpaHandler(http.server.BaseHTTPRequestHandler):
         Databricks logs folded in (empty/absent -> a plain regenerate)."""
         gid = (gid or "").strip()
         payload, _err = self._read_json_body()
-        dbx_dir = None
+        # Validate the group is regeneratable BEFORE materializing any uploads,
+        # so a bad request never leaks a temp dir.
+        with _pipelines_lock():
+            g = _load_groups().get(gid)
+            if not g:
+                self._send_json(404, {"error": "not found"})
+                return
+            by_id = {p.get("id"): p for p in _load_pipelines()}
+            members = [m for m in (by_id.get(mid) for mid in g.get("member_ids", [])) if m]
+            if not members or not all(
+                    m.get("status") in ("finished", "failed") for m in members):
+                self._send_json(409, {"error": "group still has running/queued iterations"})
+                return
+        # Optional Databricks logs: uploaded files (preferred) or a server path.
+        dbx_dir, dbx_temp = None, False
         if isinstance(payload, dict):
-            d = (payload.get("databricks_log_dir") or "").strip()
-            if d:
-                if not os.path.isdir(d):
+            files = payload.get("databricks_files")
+            if isinstance(files, list) and files:
+                materialized = _materialize_databricks_uploads(files)
+                if materialized:
+                    dbx_dir, dbx_temp = materialized, True
+            if not dbx_dir:
+                d = (payload.get("databricks_log_dir") or "").strip()
+                if d and os.path.isdir(d):
+                    dbx_dir = os.path.realpath(d)
+                elif d:
                     self._send_json(400, {"error": f"Databricks log dir not found: {d}"})
                     return
-                dbx_dir = os.path.realpath(d)
         with _pipelines_lock():
             groups = _load_groups()
             g = groups.get(gid)
             if not g:
                 self._send_json(404, {"error": "not found"})
                 return
-            by_id = {p.get("id"): p for p in _load_pipelines()}
-            members = [by_id.get(mid) for mid in g.get("member_ids", [])]
-            members = [m for m in members if m]
-            if not members or not all(
-                    m.get("status") in ("finished", "failed") for m in members):
-                self._send_json(409, {"error": "group still has running/queued iterations"})
-                return
             g["report_status"] = "none"
             g["report_error"] = None
-            g["report_dbx_dir"] = dbx_dir   # consumed by _run_group_report
+            g["report_dbx_dir"] = dbx_dir      # consumed by _run_group_report
+            g["report_dbx_temp"] = dbx_temp     # rmtree'd after generation if True
             _save_groups(groups)
         _group_report_passwords.pop(gid, None)
         _check_group_completions()
