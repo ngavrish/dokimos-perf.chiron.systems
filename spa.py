@@ -418,6 +418,44 @@ def _rp_url_re():
     return _RP_URL_RE
 
 
+# The IFP suite never prints a clickable Report Portal URL -- it prints
+# "ReportPortal Launch ID: <uuid>" and "ReportPortal launch_info: {... 'id': N ...}"
+# (see Base/Misc/ReportPortalAgent.py). We build the launch deep-link ourselves
+# from the launch id + the known RP endpoint/project. Both are env-overridable.
+RP_ENDPOINT = os.environ.get(
+    "DOKIMOS_RP_ENDPOINT", "https://ads-report-portal.staging.hulu.com").rstrip("/")
+RP_PROJECT = os.environ.get("DOKIMOS_RP_PROJECT", "ad-apps-automation")
+
+_RP_LAUNCH_INFO_RE = None
+_RP_LAUNCH_ID_RE = None
+def _extract_rp_url(line: str):
+    """Find a Report Portal launch URL in (or derivable from) `line`.
+
+    Returns ``(url, is_numeric)`` or ``None``. ``is_numeric`` is True when the
+    URL uses Report Portal's numeric launch id (the form the UI deep-link
+    actually resolves) rather than the launch UUID -- the suite prints the UUID
+    (`ReportPortal Launch ID:`) *before* the numeric id (`launch_info: {... 'id': N ...}`),
+    so the caller uses this flag to upgrade a provisional UUID link to the numeric one.
+
+    Preference: a full printed URL > numeric launch_info id > UUID Launch ID."""
+    m = _rp_url_re().search(line)
+    if m:
+        return (m.group(1), True)
+    global _RP_LAUNCH_INFO_RE, _RP_LAUNCH_ID_RE
+    if _RP_LAUNCH_INFO_RE is None:
+        import re as _re
+        _RP_LAUNCH_INFO_RE = _re.compile(r"launch_info:.*?['\"]id['\"]\s*:\s*(\d+)")
+        _RP_LAUNCH_ID_RE = _re.compile(r"ReportPortal Launch ID:\s*(\S+)")
+    m = _RP_LAUNCH_INFO_RE.search(line)
+    if m:
+        return (f"{RP_ENDPOINT}/ui/#{RP_PROJECT}/launches/all/{m.group(1)}", True)
+    m = _RP_LAUNCH_ID_RE.search(line)
+    if m and m.group(1).lower() != "none":
+        tok = m.group(1)
+        return (f"{RP_ENDPOINT}/ui/#{RP_PROJECT}/launches/all/{tok}", tok.isdigit())
+    return None
+
+
 # behavex/behave logs one line per scenario start: "... Running Scenario <name>".
 # We count distinct names to drive the live progress + ETA on the logs panel.
 _SCENARIO_MARKER_RE = None
@@ -886,6 +924,7 @@ def _run_pipeline(pipeline_id: str) -> None:
 
         image_missing_hint_emitted = False
         rp_url_found = None
+        rp_url_locked = False   # True once we have the authoritative numeric-id URL
         try:
             for raw_line in proc.stdout:
                 line = raw_line.rstrip("\r\n")
@@ -905,14 +944,22 @@ def _run_pipeline(pipeline_id: str) -> None:
                     ])
                     _flush_logs(force=True)
                     continue
-                # Capture the first Report Portal URL we see.
-                if rp_url_found is None:
-                    m = _rp_url_re().search(line)
-                    if m:
-                        rp_url_found = m.group(1)
-                        log_buf.append(line)
-                        pending_mut["rp_url"] = rp_url_found
-                        _flush_logs(force=True)
+                # Capture the Report Portal launch link. The suite prints a launch
+                # id rather than a URL, so _extract_rp_url builds the deep-link. The
+                # UUID line prints before the numeric one, so accept a provisional
+                # UUID link and upgrade to the numeric id when it arrives, then lock.
+                if not rp_url_locked:
+                    rp_res = _extract_rp_url(line)
+                    if rp_res:
+                        cand, is_numeric = rp_res
+                        if is_numeric or rp_url_found is None:
+                            rp_url_found = cand
+                            pending_mut["rp_url"] = cand
+                            log_buf.append(line)
+                            log_buf.append(f"[{_now_iso()}] Report Portal launch: {cand}")
+                            _flush_logs(force=True)
+                        if is_numeric:
+                            rp_url_locked = True
                         continue
                 log_buf.append(line)
                 _flush_logs()
