@@ -259,6 +259,11 @@ SCENARIO_RETRY_CEILING = int(os.environ.get("DOKIMOS_SCENARIO_RETRY_CEILING", "5
 # initial guess -- once a run starts, the panel shows a live rate-based ETA that
 # supersedes it. Override via env if the suite's profile changes.
 EST_SEC_PER_SCENARIO = float(os.environ.get("DOKIMOS_EST_SEC_PER_SCENARIO", "15"))
+# Fixed per-iteration overhead (seconds) that happens regardless of scenario
+# count: container start, behave import, the before_feature Report Portal launch,
+# and teardown. Without it, a 1-scenario run is wildly underestimated. NOT
+# divided by parallelism (it's paid once per container run).
+EST_FIXED_OVERHEAD_SEC = float(os.environ.get("DOKIMOS_EST_FIXED_OVERHEAD_SEC", "40"))
 
 
 def _clamp_scenario_retry(val) -> int:
@@ -1382,14 +1387,18 @@ def _run_group_report(group_id: str, urls: list) -> None:
             deduped.append(u)
     dropped = max(0, len(deduped) - GROUP_REPORT_MAX_LAUNCHES)
     deduped = deduped[:GROUP_REPORT_MAX_LAUNCHES]
+    with _pipelines_lock():
+        g0 = _load_groups().get(group_id) or {}
+    dbx_dir = g0.get("report_dbx_dir") or None
     try:
         if not deduped:
             raise RuntimeError(
                 "no Report Portal launches were produced by this group's runs "
                 "(RP disabled / token missing, or no run reached a launch)")
-        result = _run_generation(deduped)        # dict incl. report_password
+        result = _run_generation(deduped, databricks_log_dir=dbx_dir)  # dict incl. report_password
         password = result.pop("report_password", None)
         result["dropped_launches"] = dropped
+        result["has_databricks"] = bool(dbx_dir)
         with _pipelines_lock():
             groups = _load_groups()
             g = groups.get(group_id)
@@ -1555,7 +1564,9 @@ def _create_pipeline(cfg: dict, iteration_index: int = 1, iteration_count: int =
         run_n = disco["running"]
         files_with_sel = sum(1 for _rel, _perf, run in disco["per_file"] if run)
         eff_par = max(1, min(record["parallel"], files_with_sel or 1))
-        est_sec = int(-(-(run_n * EST_SEC_PER_SCENARIO) // eff_par)) if run_n else 0  # ceil
+        # Fixed per-iteration overhead + scenario time spread across the effective
+        # parallelism (scenarios divide, overhead doesn't).
+        est_sec = int(EST_FIXED_OVERHEAD_SEC + -(-(run_n * EST_SEC_PER_SCENARIO) // eff_par)) if run_n else 0
         record["scenario_count"] = run_n            # filter-aware: what actually runs
         record["scenario_total"] = disco["total"]
         record["scenario_files"] = files_with_sel
@@ -2988,20 +2999,23 @@ html, body {
     word-break: break-word;
 }
 
-/* ----- Iteration groups ----- */
-.pipeline-group {
-    padding: 8px 10px; margin: 2px 0; border-radius: 6px; cursor: pointer;
-    border-left: 3px solid var(--bronze, #b08d57); background: rgba(255,255,255,0.02);
+/* ----- Iteration groups (visual wrapper around member pipelines) ----- */
+.pipeline-group-wrap {
+    border: 1px solid rgba(176,141,87,0.5); border-radius: 8px; margin: 8px 0;
+    background: rgba(176,141,87,0.06); overflow: hidden;
 }
-.pipeline-group:hover { background: rgba(255,255,255,0.05); }
-.pipeline-group.active { background: var(--bg-card-hi, rgba(255,255,255,0.07)); }
-.pipeline-group-head { display: flex; align-items: center; gap: 6px; }
-.group-caret { cursor: pointer; opacity: 0.7; padding: 0 4px; font-size: 11px; }
-.group-caret:hover { opacity: 1; }
+.pipeline-group-head {
+    display: flex; align-items: center; gap: 8px; padding: 8px 10px; cursor: pointer;
+    font-weight: 600; background: rgba(176,141,87,0.12);
+    border-bottom: 1px solid rgba(176,141,87,0.25);
+}
+.pipeline-group-head:hover { background: rgba(176,141,87,0.20); }
+.pipeline-group-head.active { background: rgba(176,141,87,0.32); }
+.pipeline-group-members { padding: 4px 6px 6px 12px; }
+.pipeline-group-members .pipeline-item { margin: 3px 0; }
 .group-count { opacity: 0.6; font-size: 12px; }
-.group-badge { font-size: 11px; opacity: 0.7; }
-.group-badge-done { color: #3fb950; opacity: 0.9; }
-.pipeline-group-children { margin: 2px 0 6px 16px; padding-left: 6px; border-left: 1px dashed rgba(255,255,255,0.12); }
+.group-badge { font-size: 11px; opacity: 0.75; margin-left: auto; }
+.group-badge-done { color: #3fb950; opacity: 0.95; }
 .pipelines-view-group { flex: 1; overflow: auto; padding: 16px; }
 .group-section-title { font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: .04em;
     opacity: 0.65; margin: 18px 0 8px; }
@@ -3030,6 +3044,12 @@ html, body {
 .group-report-title { font-weight: 600; margin-bottom: 8px; }
 .group-report-err { font-family: var(--font-mono); font-size: 12px; color: #f85149; margin-bottom: 10px; word-break: break-word; }
 .group-report .btn-primary { display: inline-block; margin: 4px 0; text-decoration: none; }
+.group-report-actions { display: flex; gap: 8px; align-items: center; margin: 6px 0 2px; flex-wrap: wrap; }
+.group-dbx-input { flex: 1; min-width: 260px; font-family: var(--font-mono); font-size: 12px;
+    padding: 6px 8px; border-radius: 5px; border: 1px solid rgba(255,255,255,0.15);
+    background: var(--bg-dark, #0d1117); color: #e6edf3; }
+#groupReportBtn.regen { background: #3fb950; border-color: #3fb950; }
+.group-dbx-hint { font-size: 11px; opacity: 0.6; margin-bottom: 4px; }
 .group-report-pw { margin-top: 12px; }
 .group-report-pw label { display: block; font-size: 12px; opacity: 0.75; margin-bottom: 4px; }
 .group-report-pw-row { display: flex; gap: 8px; }
@@ -3043,6 +3063,12 @@ html, body {
     border: 1px solid rgba(248,81,73,0.45); background: transparent; color: #f85149;
 }
 .pipelines-cleanup-btn:hover { background: rgba(248,81,73,0.14); }
+.pipeline-kill-btn {
+    font-size: 11px; cursor: pointer; padding: 1px 8px; border-radius: 4px;
+    border: 1px solid rgba(248,81,73,0.5); background: transparent; color: #f85149;
+}
+.pipeline-kill-btn:hover { background: rgba(248,81,73,0.16); }
+.group-rerun-btn { margin-left: 8px; }
 
 /* ----- Cards (Dokimos "std_card") ----- */
 .card {
@@ -4050,12 +4076,18 @@ SPA_HTML = f"""<!DOCTYPE html>
             // Re-run button for terminal states. stopPropagation so clicking it
             // doesn't also select/open the pipeline. Enqueues a fresh pipeline
             // with the same config at the end of the queue.
-            const actions = (p.status === 'finished' || p.status === 'failed')
-                ? '<div class="pipeline-item-actions">'
-                +   '<button class="pipeline-rerun-btn" title="Re-run with the same configuration" '
-                +     'onclick="event.stopPropagation(); _rerunPipeline(\\'' + _testsEscape(p.id) + '\\')">&#8635; rerun</button>'
-                + '</div>'
-                : '';
+            let actions = '';
+            if (p.status === 'finished' || p.status === 'failed') {{
+                actions = '<div class="pipeline-item-actions">'
+                    +   '<button class="pipeline-rerun-btn" title="Re-run with the same configuration" '
+                    +     'onclick="event.stopPropagation(); _rerunPipeline(\\'' + _testsEscape(p.id) + '\\')">&#8635; rerun</button>'
+                    + '</div>';
+            }} else if (p.status === 'running') {{
+                actions = '<div class="pipeline-item-actions">'
+                    +   '<button class="pipeline-kill-btn" title="Kill this running pipeline" '
+                    +     'onclick="event.stopPropagation(); _killPipeline(\\'' + _testsEscape(p.id) + '\\')">&#10005; kill</button>'
+                    + '</div>';
+            }}
             return '<div class="' + cls + '" onclick="_selectPipeline(\\'' + _testsEscape(p.id) + '\\')">'
                  +   '<div class="pipeline-item-name">' + liveDot + _testsEscape(p.name) + '</div>'
                  +   '<div class="pipeline-item-meta">' + _testsEscape(meta) + '</div>'
@@ -4066,62 +4098,89 @@ SPA_HTML = f"""<!DOCTYPE html>
         }}
 
         function _groupRowHtml(gid, info) {{
-            // Summary row only -- the individual iterations still live in their
-            // own status sections below, so we do NOT nest them here.
-            const members = info.members;
+            // A visual wrapper box: a clickable group header (-> aggregate group
+            // view) with the individual iteration pipelines nested inside (each
+            // still clickable -> its own logs).
+            const members = info.members.slice().sort(function(a, b) {{
+                return (a.iteration_index || 0) - (b.iteration_index || 0);
+            }});
             const total = members.length;
             const done = members.filter(function(m) {{ return m.status === 'finished' || m.status === 'failed'; }}).length;
             const running = members.some(function(m) {{ return m.status === 'running'; }});
             const allDone = done === total && total > 0;
             const liveDot = running ? '<span class="live-dot" title="running"></span>' : '';
             const tag = allDone
-                ? '<span class="group-badge group-badge-done">done &middot; open for report</span>'
-                : '<span class="group-badge">' + done + '/' + total + ' iterations done</span>';
-            const cls = 'pipeline-group' + (gid === _selectedGroupId ? ' active' : '');
-            return '<div class="' + cls + '" onclick="_selectGroup(\\'' + _testsEscape(gid) + '\\')">'
-                 +   '<div class="pipeline-group-head">'
+                ? '<span class="group-badge group-badge-done">done &middot; open report</span>'
+                : '<span class="group-badge">' + done + '/' + total + ' done</span>';
+            const headCls = 'pipeline-group-head' + (gid === _selectedGroupId ? ' active' : '');
+            // Re-run the whole group once it's terminal (enqueues a fresh group).
+            const rerun = allDone
+                ? '<button class="pipeline-rerun-btn group-rerun-btn" title="Re-run the whole group" '
+                +   'onclick="event.stopPropagation(); _rerunGroup(\\'' + _testsEscape(gid) + '\\')">&#8635; rerun group</button>'
+                : '';
+            return '<div class="pipeline-group-wrap">'
+                 +   '<div class="' + headCls + '" onclick="_selectGroup(\\'' + _testsEscape(gid) + '\\')">'
                  +     '<span class="pipeline-item-name">' + liveDot + _testsEscape(info.name) + '</span>'
                  +     '<span class="group-count">&times;' + total + '</span>'
+                 +     tag + rerun
                  +   '</div>'
-                 +   '<div class="pipeline-item-meta">' + tag + ' &middot; open for the aggregate report</div>'
+                 +   '<div class="pipeline-group-members">'
+                 +     members.map(_pipelineItemHtml).join('')
+                 +   '</div>'
                  + '</div>';
+        }}
+
+        // A group's aggregate status decides which status section it sits in,
+        // alongside single pipelines (running wins, then queued/scheduled, then
+        // failed if any failed, else finished).
+        function _groupAggStatus(members) {{
+            if (members.some(function(m) {{ return m.status === 'running'; }})) return 'running';
+            if (members.some(function(m) {{ return m.status === 'queued'; }})) return 'queued';
+            if (members.some(function(m) {{ return m.status === 'scheduled'; }})) return 'scheduled';
+            if (members.some(function(m) {{ return m.status === 'failed'; }})) return 'failed';
+            return 'finished';
         }}
 
         function _renderPipelinesList(pipelines) {{
             const panel = document.getElementById('pipelinesListPanel');
             if (!panel) return;
             _medianRunSec = _computeMedianRunSec(pipelines);
-            // Pull grouped iterations into their own collapsible group rows; the
-            // status buckets below show only ungrouped (single) pipelines.
-            // Build a groups summary (for the Groups section) but ALSO keep every
-            // pipeline -- grouped or not -- in its normal status section, so the
-            // individual iterations remain visible exactly as before. The group
-            // row is an additional summary + entry point to the group view.
-            const groups = {{}};   // gid -> {{name, members:[]}}
+            // Each entry is either a single pipeline or a whole group wrapper, and
+            // is filed into the SAME status section it belongs to. Grouped
+            // iterations render inside their group wrapper (not as loose rows).
+            const groups = {{}};   // gid -> {{name, members:[], created}}
+            const singles = [];
             (pipelines || []).forEach(function(p) {{
                 if (p.group_id) {{
                     (groups[p.group_id] || (groups[p.group_id] = {{name: p.group_name || p.group_id, members: [], created: p.created_at}})).members.push(p);
+                }} else {{
+                    singles.push(p);
                 }}
             }});
             const buckets = {{ running: [], queued: [], scheduled: [], finished: [], failed: [] }};
-            (pipelines || []).forEach(function(p) {{
-                (buckets[p.status] || (buckets.finished)).push(p);
+            singles.forEach(function(p) {{
+                const e = {{kind: 'single', p: p, ts: (p.finished_at || p.started_at || p.queued_at || p.created_at || '')}};
+                (buckets[p.status] || buckets.finished).push(e);
             }});
-            // Sort: running by start desc, scheduled by scheduled_for asc, finished by finished_at desc.
-            buckets.running.sort(function(a, b) {{ return (b.started_at || '').localeCompare(a.started_at || ''); }});
-            // Queued in execution order: priority (scheduled-due) first, then FIFO by enqueue time.
-            buckets.queued.sort(function(a, b) {{
-                const pa = a.priority ? 0 : 1, pb = b.priority ? 0 : 1;
-                if (pa !== pb) return pa - pb;
-                return (a.queued_at || a.created_at || '').localeCompare(b.queued_at || b.created_at || '');
+            Object.keys(groups).forEach(function(gid) {{
+                const info = groups[gid];
+                const st = _groupAggStatus(info.members);
+                const tss = info.members.map(function(m) {{ return (m.finished_at || m.started_at || m.queued_at || m.created_at || ''); }}).sort();
+                buckets[st].push({{kind: 'group', gid: gid, info: info, ts: tss[tss.length - 1] || info.created || ''}});
             }});
-            buckets.scheduled.sort(function(a, b) {{ return (a.scheduled_for || '').localeCompare(b.scheduled_for || ''); }});
-            buckets.finished.sort(function(a, b) {{ return (b.finished_at || b.created_at || '').localeCompare(a.finished_at || a.created_at || ''); }});
-            buckets.failed.sort(function(a, b) {{ return (b.finished_at || b.created_at || '').localeCompare(a.finished_at || a.created_at || ''); }});
+            // Sort each section: scheduled ascending (soonest first), others most-recent first.
+            Object.keys(buckets).forEach(function(st) {{
+                buckets[st].sort(function(a, b) {{
+                    return st === 'scheduled' ? a.ts.localeCompare(b.ts) : b.ts.localeCompare(a.ts);
+                }});
+            }});
 
+            function renderEntry(e) {{
+                return e.kind === 'group' ? _groupRowHtml(e.gid, e.info) : _pipelineItemHtml(e.p);
+            }}
             function section(label, items, action) {{
                 const body = items.length
-                    ? items.map(_pipelineItemHtml).join('')
+                    ? items.map(renderEntry).join('')
                     : '<div class="pipelines-list-empty">none</div>';
                 return '<div class="pipelines-list-section">'
                      +   '<div class="pipelines-list-section-title">' + label
@@ -4134,20 +4193,8 @@ SPA_HTML = f"""<!DOCTYPE html>
             const failedAction = buckets.failed.length
                 ? '<button class="pipelines-cleanup-btn" title="Remove all failed pipelines" onclick="event.stopPropagation(); _cleanupFailed()">clear all</button>'
                 : '';
-            // Groups section (most recent first), then the single-pipeline status sections.
-            const gids = Object.keys(groups).sort(function(a, b) {{
-                return (groups[b].created || '').localeCompare(groups[a].created || '');
-            }});
-            let groupsHtml = '';
-            if (gids.length) {{
-                groupsHtml = '<div class="pipelines-list-section">'
-                    + '<div class="pipelines-list-section-title">Groups <span class="count">' + gids.length + '</span></div>'
-                    + gids.map(function(gid) {{ return _groupRowHtml(gid, groups[gid]); }}).join('')
-                    + '</div>';
-            }}
             panel.innerHTML =
-                  groupsHtml
-                + section('Running',   buckets.running)
+                  section('Running',   buckets.running)
                 + section('Queued',    buckets.queued)
                 + section('Scheduled', buckets.scheduled)
                 + section('Finished',  buckets.finished)
@@ -4192,6 +4239,24 @@ SPA_HTML = f"""<!DOCTYPE html>
                     if (data && data.pipeline) _selectedPipelineId = data.pipeline.id;
                 }}
             }} catch (_e) {{ /* swallow; the refresh below reflects real state */ }}
+            await _refreshPipelines();
+        }}
+
+        async function _killPipeline(id) {{
+            if (!window.confirm('Kill this running pipeline? The run will be marked failed.')) return;
+            try {{ await fetch('/api/pipelines/' + encodeURIComponent(id) + '/kill', {{ method: 'POST' }}); }} catch (_e) {{}}
+            await _refreshPipelines();
+            if (_selectedPipelineId === id) await _refreshLogs();
+        }}
+
+        async function _rerunGroup(gid) {{
+            try {{
+                const res = await fetch('/api/groups/' + encodeURIComponent(gid) + '/rerun', {{ method: 'POST' }});
+                if (res.ok) {{
+                    const data = await res.json();
+                    if (data && data.group_id) await _selectGroup(data.group_id);
+                }}
+            }} catch (_e) {{}}
             await _refreshPipelines();
         }}
 
@@ -4268,7 +4333,8 @@ SPA_HTML = f"""<!DOCTYPE html>
             if (st === 'ready' && g.report) {{
                 const r = g.report;
                 const link = r.share_url || r.url || '#';
-                const dropped = r.dropped_launches ? (' &middot; ' + r.dropped_launches + ' extra launch(es) omitted (max ' + ' reached)') : '';
+                const dropped = r.dropped_launches ? (' &middot; ' + r.dropped_launches + ' extra launch(es) omitted') : '';
+                const dbxNote = r.has_databricks ? ' &middot; includes Databricks logs' : '';
                 let pwBlock;
                 if (g.report_password) {{
                     pwBlock = '<div class="group-report-pw">'
@@ -4281,9 +4347,20 @@ SPA_HTML = f"""<!DOCTYPE html>
                     pwBlock = '<div class="group-report-pw-gone">Password already revealed and destroyed. '
                         + '<button class="btn-secondary" onclick="_groupGenerate(\\'' + _testsEscape(g.id) + '\\')">Regenerate for a new password</button></div>';
                 }}
+                // Open the existing report, OR fold in Databricks logs by path and
+                // regenerate (the button switches to "Generate report" once a path
+                // is entered). data-* carry the id/link so the re-render is stateless.
                 return '<div class="group-report group-report-ready">'
-                     + '<div class="group-report-title">Performance report ready &mdash; ' + (r.num_launches || 0) + ' launch(es)' + dropped + '</div>'
-                     + '<a class="btn-primary" href="' + _testsEscape(link) + '" target="_blank" rel="noopener noreferrer">Open report &rarr;</a>'
+                     + '<div class="group-report-title">Performance report ready &mdash; ' + (r.num_launches || 0) + ' launch(es)' + dropped + dbxNote + '</div>'
+                     + '<div class="group-report-actions">'
+                     +   '<input type="text" id="groupDbxPath" class="group-dbx-input" '
+                     +     'placeholder="optional: path to a Databricks logs dir (log4j-*, stdout, stderr)" '
+                     +     'oninput="_onGroupDbxInput()">'
+                     +   '<button id="groupReportBtn" class="btn-primary" '
+                     +     'data-gid="' + _testsEscape(g.id) + '" data-link="' + _testsEscape(link) + '" '
+                     +     'onclick="_groupReportBtnClick()">Open report &rarr;</button>'
+                     + '</div>'
+                     + '<div class="group-dbx-hint">Enter a path to Databricks job logs to regenerate the report with them folded in.</div>'
                      + pwBlock
                      + '</div>';
             }}
@@ -4300,7 +4377,9 @@ SPA_HTML = f"""<!DOCTYPE html>
                 .map(function(s) {{ return sc[s] + ' ' + s; }}).join(' &middot; ');
             const members = (g.members || []).map(function(m) {{
                 const mp = m.progress || {{}};
-                const tot = m.scenario_count || mp.total || 0;
+                // Prefer the live/actual progress total (accurate, filter-aware)
+                // over the member's pre-run scenario_count estimate.
+                const tot = (mp.total != null ? mp.total : (m.scenario_count || 0));
                 const mdone = mp.done || 0;
                 const mpct = tot ? Math.min(100, Math.round(mdone / tot * 100)) : (m.status === 'finished' || m.status === 'failed' ? 100 : 0);
                 const color = m.status === 'finished' ? '#3fb950' : (m.status === 'failed' ? '#f85149' : (m.status === 'running' ? '#3fb950' : '#8b949e'));
@@ -4339,12 +4418,42 @@ SPA_HTML = f"""<!DOCTYPE html>
                     const label = g.all_done ? (g.report_status === 'ready' ? 'report ready' : 'complete') : (g.iterations_done + '/' + g.iteration_count);
                     status.innerHTML = live + '<span class="status-pill">' + label + '</span>';
                 }}
+                // Preserve a Databricks path the user is mid-typing across the 4s poll re-render.
+                const _prevDbx = document.getElementById('groupDbxPath');
+                const _dbxVal = _prevDbx ? _prevDbx.value : '';
                 if (gv) gv.innerHTML = _groupViewHtml(g);
+                const _newDbx = document.getElementById('groupDbxPath');
+                if (_newDbx && _dbxVal) {{ _newDbx.value = _dbxVal; _onGroupDbxInput(); }}
             }} catch (_e) {{ /* keep last render */ }}
         }}
 
-        async function _groupGenerate(gid) {{
-            try {{ await fetch('/api/groups/' + encodeURIComponent(gid) + '/generate', {{method: 'POST'}}); }} catch (_e) {{}}
+        function _onGroupDbxInput() {{
+            const inp = document.getElementById('groupDbxPath');
+            const btn = document.getElementById('groupReportBtn');
+            if (!inp || !btn) return;
+            if (inp.value.trim()) {{ btn.textContent = 'Generate report'; btn.classList.add('regen'); }}
+            else {{ btn.innerHTML = 'Open report &rarr;'; btn.classList.remove('regen'); }}
+        }}
+
+        function _groupReportBtnClick() {{
+            const btn = document.getElementById('groupReportBtn');
+            const inp = document.getElementById('groupDbxPath');
+            if (!btn) return;
+            const path = inp ? inp.value.trim() : '';
+            if (path) {{
+                _groupGenerate(btn.getAttribute('data-gid'), path);
+            }} else {{
+                window.open(btn.getAttribute('data-link'), '_blank', 'noopener');
+            }}
+        }}
+
+        async function _groupGenerate(gid, dbxPath) {{
+            const opts = {{method: 'POST'}};
+            if (dbxPath) {{
+                opts.headers = {{'Content-Type': 'application/json'}};
+                opts.body = JSON.stringify({{databricks_log_dir: dbxPath}});
+            }}
+            try {{ await fetch('/api/groups/' + encodeURIComponent(gid) + '/generate', opts); }} catch (_e) {{}}
             _refreshGroupView();
         }}
 
@@ -5476,11 +5585,18 @@ class _SpaHandler(http.server.BaseHTTPRequestHandler):
             pid = path[len("/api/pipelines/"):-len("/rerun")]
             self._handle_pipeline_rerun(pid)
             return
+        if path.startswith("/api/pipelines/") and path.endswith("/kill"):
+            pid = path[len("/api/pipelines/"):-len("/kill")]
+            self._handle_pipeline_kill(pid)
+            return
         if path.startswith("/api/groups/") and path.endswith("/forget-password"):
             self._handle_group_forget_password(path[len("/api/groups/"):-len("/forget-password")])
             return
         if path.startswith("/api/groups/") and path.endswith("/generate"):
             self._handle_group_generate(path[len("/api/groups/"):-len("/generate")])
+            return
+        if path.startswith("/api/groups/") and path.endswith("/rerun"):
+            self._handle_group_rerun(path[len("/api/groups/"):-len("/rerun")])
             return
         self._send(404, "text/plain; charset=utf-8", b"Not found")
 
@@ -5729,8 +5845,19 @@ class _SpaHandler(http.server.BaseHTTPRequestHandler):
 
     def _handle_group_generate(self, gid: str):
         """Manual (re)generate: re-arm the group so the dispatcher regenerates
-        its report. Only valid once every iteration is terminal."""
+        its report. Only valid once every iteration is terminal. An optional
+        body {"databricks_log_dir": "<path>"} regenerates the report WITH those
+        Databricks logs folded in (empty/absent -> a plain regenerate)."""
         gid = (gid or "").strip()
+        payload, _err = self._read_json_body()
+        dbx_dir = None
+        if isinstance(payload, dict):
+            d = (payload.get("databricks_log_dir") or "").strip()
+            if d:
+                if not os.path.isdir(d):
+                    self._send_json(400, {"error": f"Databricks log dir not found: {d}"})
+                    return
+                dbx_dir = os.path.realpath(d)
         with _pipelines_lock():
             groups = _load_groups()
             g = groups.get(gid)
@@ -5746,10 +5873,67 @@ class _SpaHandler(http.server.BaseHTTPRequestHandler):
                 return
             g["report_status"] = "none"
             g["report_error"] = None
+            g["report_dbx_dir"] = dbx_dir   # consumed by _run_group_report
             _save_groups(groups)
         _group_report_passwords.pop(gid, None)
         _check_group_completions()
         self._send_json(200, {"ok": True, "report_status": "generating"})
+
+    def _handle_group_rerun(self, gid: str):
+        """Re-run an entire group: enqueue a fresh group with the same config and
+        iteration count (a new group_id). The original group is left untouched."""
+        gid = (gid or "").strip()
+        with _pipelines_lock():
+            g = _load_groups().get(gid)
+        if not g:
+            self._send_json(404, {"error": "not found"})
+            return
+        cfg = dict(g.get("config") or {})
+        run_cfg = {
+            "kind": "now",
+            "env": cfg.get("env") or "prod",
+            "parallel": cfg.get("parallel") or 2,
+            "feature": cfg.get("feature") or "",
+            "tests": cfg.get("tests") or "",
+            "max_runtime_min": (cfg.get("max_runtime_sec") or MAX_RUNTIME_SEC) // 60,
+            "scenario_retry": cfg.get("scenario_retry") or SCENARIO_RETRY_DEFAULT,
+        }
+        n = max(1, int(g.get("iteration_count") or len(g.get("member_ids") or []) or 1))
+        new_gid = _new_group_id()
+        new_name = g.get("name") or "group"
+        records = [_create_pipeline(run_cfg, iteration_index=i + 1, iteration_count=n,
+                                    group_id=new_gid, group_name=new_name) for i in range(n)]
+        _create_group_record(new_gid, new_name, records)
+        _ensure_pipeline_scheduler()
+        _dispatch_tick()
+        self._send_json(200, {"group_id": new_gid, "count": len(records)})
+
+    def _handle_pipeline_kill(self, pid: str):
+        """Kill a running pipeline's container. The runner's stream loop then
+        sees the container exit and marks the pipeline failed."""
+        pid = (pid or "").strip()
+        if not pid or not all(c.isalnum() or c in "-_" for c in pid):
+            self._send_json(404, {"error": "not found"})
+            return
+        with _pipelines_lock():
+            p = next((x for x in _load_pipelines() if x.get("id") == pid), None)
+        if not p:
+            self._send_json(404, {"error": "not found"})
+            return
+        if p.get("status") != "running":
+            self._send_json(409, {"error": "pipeline is not running"})
+            return
+        import subprocess
+        container = f"dokimos-{pid}"
+        try:
+            subprocess.run(["docker", "kill", container],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+        except Exception:
+            pass
+        _append_pipeline_log(
+            pid, f"[{_now_iso()}] KILL requested by operator -- stopping container "
+                 f"{container}; the run will be marked failed.")
+        self._send_json(200, {"ok": True})
 
     def _handle_generate(self):
         payload, err = self._read_json_body()
