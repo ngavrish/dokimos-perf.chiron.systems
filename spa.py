@@ -652,21 +652,20 @@ PERF_FEATURES_SUBDIR = os.path.join("tests", "api_tests")
 PERF_RUN_TAG = "@perf"
 
 
-def _scan_feature_file(path: str, select_tag: str):
-    """Static parse of one .feature file. Returns (total, selected) scenario
-    counts. A Scenario Outline contributes one per Examples data row (header
-    row excluded); a plain Scenario counts as one. `select_tag` is matched
-    against feature-level tags (inherited) + scenario-level tags, mirroring
-    behave's single-positive-tag semantics. Best-effort, not a behave parser."""
+def _scan_feature_file(path: str):
+    """Static parse of one .feature file -> a list of scenario dicts
+    ``{name, tags(set, feature tags inherited), count}``. A Scenario Outline
+    contributes one per Examples data row (header excluded); a plain Scenario
+    counts as one. Best-effort, not a full behave parser."""
     try:
         with open(path, encoding="utf-8", errors="replace") as fh:
             lines = fh.read().splitlines()
     except OSError:
-        return (0, 0)
+        return []
 
     feature_tags = set()
     pending_tags = set()
-    blocks = []          # {tags:set, outline:bool, rows:int}
+    blocks = []          # {tags, outline, rows, name}
     cur = None
     in_examples = False
     ex_header_seen = False
@@ -689,8 +688,9 @@ def _scan_feature_file(path: str, select_tag: str):
             continue
         if s.startswith("Scenario Outline:") or s.startswith("Scenario:"):
             _close()
-            cur = {"tags": set(pending_tags),
-                   "outline": s.startswith("Scenario Outline:"), "rows": 0}
+            label = "Scenario Outline:" if s.startswith("Scenario Outline:") else "Scenario:"
+            cur = {"tags": set(pending_tags), "outline": label.startswith("Scenario Outline"),
+                   "rows": 0, "name": s[len(label):].strip()}
             pending_tags = set()
             in_examples = False
             ex_header_seen = False
@@ -713,48 +713,126 @@ def _scan_feature_file(path: str, select_tag: str):
             in_examples = False                # any non-table line ends the block
     _close()
 
-    total = selected = 0
+    out = []
     for b in blocks:
         n = b["rows"] if (b["outline"] and b["rows"] > 0) else 1
-        total += n
-        if select_tag in (feature_tags | b["tags"]):
-            selected += n
-    return (total, selected)
+        out.append({"name": b["name"], "tags": feature_tags | b["tags"], "count": n})
+    return out
 
 
-def _discover_perf_scenarios():
+def _parse_tests_filter(s):
+    """Pull behave ``--name`` regexes and ``--tags`` expressions out of the
+    free-form Tests-filter string (the SPA's `tests`/BEHAVEX_EXTRA field).
+    Returns (name_patterns, tag_values). Unknown tokens are ignored."""
+    import shlex
+    try:
+        toks = shlex.split(s or "")
+    except ValueError:
+        toks = (s or "").split()
+    names, tags, i = [], [], 0
+    while i < len(toks):
+        t = toks[i]
+        if t in ("--name", "-n") and i + 1 < len(toks):
+            names.append(toks[i + 1]); i += 2; continue
+        if t.startswith("--name="):
+            names.append(t[len("--name="):]); i += 1; continue
+        if t in ("--tags", "-t") and i + 1 < len(toks):
+            tags.append(toks[i + 1]); i += 2; continue
+        if t.startswith("--tags="):
+            tags.append(t[len("--tags="):]); i += 1; continue
+        i += 1
+    return names, tags
+
+
+def _name_match(name, patterns):
+    """True if `name` matches any --name pattern (behave uses regex search)."""
+    if not patterns:
+        return True
+    import re as _re
+    for p in patterns:
+        try:
+            if _re.search(p, name):
+                return True
+        except _re.error:
+            if p in name:        # fall back to substring on a bad regex
+                return True
+    return False
+
+
+def _tag_match(tags, tag_values):
+    """True if the scenario's tag set satisfies every --tags value (ANDed
+    across values; comma within one value is OR; ~/not negates a tag)."""
+    if not tag_values:
+        return True
+    def _norm(t):
+        return t if t.startswith("@") else "@" + t
+    for val in tag_values:
+        ok = False
+        for part in val.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            neg = False
+            if part.startswith("~"):
+                neg, part = True, part[1:]
+            elif part.lower().startswith("not "):
+                neg, part = True, part[4:].strip()
+            present = _norm(part) in tags
+            if present != neg:
+                ok = True
+                break
+        if not ok:
+            return False
+    return True
+
+
+def _discover_perf_scenarios(tests_filter=None):
     """Pre-run, host-side discovery of what the perf container will execute.
 
-    Scans the @perf-runnable feature files (tests/api_tests) on disk and
-    returns a summary dict, or None if the tests dir isn't present on this
-    host. Pure static scan -- no behave import, no container, fast."""
+    Scans tests/api_tests and, for each scenario, counts it as @perf if tagged,
+    and as *running* if it also satisfies the Tests filter (--name / --tags).
+    Returns counts {total, perf, running, has_filter, per_file:[(rel, perf, run)]}
+    or None if the tests dir isn't present. Pure static scan, fast."""
     api_dir = os.path.join(TESTS_DIR, PERF_FEATURES_SUBDIR)
     if not os.path.isdir(api_dir):
         return None
-    per_file, total, selected = [], 0, 0
-    for root, dirs, names in os.walk(api_dir):
+    names, tags = _parse_tests_filter(tests_filter)
+    has_filter = bool(names or tags)
+    per_file, total, perf, running = [], 0, 0, 0
+    for root, dirs, fnames in os.walk(api_dir):
         dirs.sort()
-        for fn in sorted(names):
+        for fn in sorted(fnames):
             if not fn.endswith(".feature"):
                 continue
             p = os.path.join(root, fn)
-            t, sdf = _scan_feature_file(p, PERF_RUN_TAG)
-            total += t
-            selected += sdf
-            per_file.append((os.path.relpath(p, TESTS_DIR), t, sdf))
+            f_perf = f_run = 0
+            for sc in _scan_feature_file(p):
+                total += sc["count"]
+                if PERF_RUN_TAG in sc["tags"]:
+                    f_perf += sc["count"]
+                    if _name_match(sc["name"], names) and _tag_match(sc["tags"], tags):
+                        f_run += sc["count"]
+            perf += f_perf
+            running += f_run
+            per_file.append((os.path.relpath(p, TESTS_DIR), f_perf, f_run))
     return {
         "dir": os.path.relpath(api_dir, TESTS_DIR),
         "tag": PERF_RUN_TAG,
         "files": len(per_file),
         "total": total,
-        "selected": selected,
+        "perf": perf,
+        "running": running,
+        "has_filter": has_filter,
         "per_file": per_file,
     }
 
 
 def _log_scenario_discovery(pipeline_id: str) -> None:
     """Emit the discovered-vs-running scenario summary at the start of a run."""
-    disco = _discover_perf_scenarios()
+    with _pipelines_lock():
+        rec = next((p for p in _load_pipelines() if p.get("id") == pipeline_id), None)
+    tests_filter = (rec or {}).get("tests") or None
+    disco = _discover_perf_scenarios(tests_filter)
     if disco is None:
         _append_pipeline_log(
             pipeline_id,
@@ -763,19 +841,21 @@ def _log_scenario_discovery(pipeline_id: str) -> None:
             f"discover them itself.",
         )
         return
-    selected_files = [f"{rel} ({sel})" for rel, _t, sel in disco["per_file"] if sel]
+    filt = (f" matching the Tests filter [{tests_filter}]"
+            if disco["has_filter"] else "")
+    running_files = [f"{rel} ({run})" for rel, _perf, run in disco["per_file"] if run]
     lines = [
         f"[{_now_iso()}] test discovery: scanned {disco['files']} feature file(s) "
         f"under {disco['dir']} -- found {disco['total']} scenario(s); "
-        f"{disco['selected']} tagged {disco['tag']} -> RUNNING {disco['selected']}.",
+        f"{disco['perf']} tagged {disco['tag']} -> RUNNING {disco['running']}{filt}.",
     ]
-    if selected_files:
+    if running_files:
         lines.append(
-            f"[{_now_iso()}]   {disco['tag']} scenarios in: {', '.join(selected_files)}")
+            f"[{_now_iso()}]   running scenarios in: {', '.join(running_files)}")
     else:
         lines.append(
-            f"[{_now_iso()}]   no {disco['tag']}-tagged scenarios found -- this run "
-            f"will execute nothing and exit quickly.")
+            f"[{_now_iso()}]   nothing matches -- this run will execute nothing "
+            f"and exit quickly.")
     _append_pipeline_log(pipeline_id, *lines)
 
 
@@ -1012,12 +1092,14 @@ def _run_pipeline(pipeline_id: str) -> None:
             if final_status is None:
                 final_status = "finished" if rc == 0 else "failed"
             end_mut = {"status": final_status, "finished_at": _now_iso()}
-            # On a clean finish, peg the progress bar to 100% so it doesn't
-            # linger at e.g. 178/179 (the last scenario's marker may not flush).
+            # On a clean finish, peg the bar to 100% using the ACTUAL number of
+            # scenarios that ran (distinct "Running Scenario" markers), not the
+            # pre-run @perf estimate -- a Tests filter (e.g. --name) can narrow a
+            # run to a single scenario, and we want 1/1, not 1/179.
             if final_status == "finished" and _seen_scen:
-                tot = _prog_total or len(_seen_scen)
+                actual = len(_seen_scen)
                 end_mut["progress"] = {
-                    "done": tot, "total": tot, "pct": 100,
+                    "done": actual, "total": actual, "pct": 100,
                     "eta_sec": 0, "rate_per_min": None, "updated_at": _now_iso(),
                 }
             _append_pipeline_log(
@@ -1328,6 +1410,38 @@ def _run_group_report(group_id: str, urls: list) -> None:
                 _save_groups(groups)
 
 
+def _cleanup_pipelines(statuses=("failed",)) -> dict:
+    """Remove pipelines in the given terminal statuses (default: failed). Never
+    removes a running/queued/scheduled job. Prunes group member refs and drops
+    groups left with no members. Returns counts."""
+    statuses = tuple(s for s in statuses if s in ("failed", "finished"))
+    if not statuses:
+        return {"removed": 0, "groups_removed": 0}
+    with _pipelines_lock():
+        pipelines = _load_pipelines()
+        keep = [p for p in pipelines if p.get("status") not in statuses]
+        removed = len(pipelines) - len(keep)
+        if removed:
+            _save_pipelines(keep)
+        live_ids = {p.get("id") for p in keep}
+        groups = _load_groups()
+        groups_removed = 0
+        changed = False
+        for gid in list(groups.keys()):
+            mids = [m for m in groups[gid].get("member_ids", []) if m in live_ids]
+            if not mids:
+                del groups[gid]
+                _group_report_passwords.pop(gid, None)
+                groups_removed += 1
+                changed = True
+            elif len(mids) != len(groups[gid].get("member_ids", [])):
+                groups[gid]["member_ids"] = mids
+                changed = True
+        if changed:
+            _save_groups(groups)
+    return {"removed": removed, "groups_removed": groups_removed}
+
+
 def _reconcile_orphan_groups() -> int:
     """A group left 'generating' at boot lost its worker thread on restart.
     Flip it back to 'none' so the dispatcher regenerates (its members are
@@ -1436,19 +1550,21 @@ def _create_pipeline(cfg: dict, iteration_index: int = 1, iteration_count: int =
     # @perf scenarios all live in one feature, and feature-scheme parallelism
     # can't split one file, so effective parallelism is the number of distinct
     # selected feature files (capped by the thread count) -- usually 1.
-    disco = _discover_perf_scenarios()
+    disco = _discover_perf_scenarios(record["tests"])
     if disco:
-        files_with_sel = sum(1 for _rel, _t, sel in disco["per_file"] if sel)
+        run_n = disco["running"]
+        files_with_sel = sum(1 for _rel, _perf, run in disco["per_file"] if run)
         eff_par = max(1, min(record["parallel"], files_with_sel or 1))
-        est_sec = int(-(-(disco["selected"] * EST_SEC_PER_SCENARIO) // eff_par))  # ceil
-        record["scenario_count"] = disco["selected"]
+        est_sec = int(-(-(run_n * EST_SEC_PER_SCENARIO) // eff_par)) if run_n else 0  # ceil
+        record["scenario_count"] = run_n            # filter-aware: what actually runs
         record["scenario_total"] = disco["total"]
         record["scenario_files"] = files_with_sel
         record["effective_parallel"] = eff_par
         record["est_runtime_sec"] = est_sec
+        filt = " (Tests filter applied)" if disco["has_filter"] else ""
         record["logs"].append(
-            f"[{record['created_at']}] discovered {disco['selected']} runnable "
-            f"scenario(s) (@perf, of {disco['total']} in api_tests) across "
+            f"[{record['created_at']}] discovered {disco['perf']} @perf scenario(s) "
+            f"(of {disco['total']} in api_tests); RUNNING {run_n}{filt} across "
             f"{files_with_sel} file(s); effective parallelism {eff_par} -> "
             f"est. runtime ~{max(1, round(est_sec / 60))} min "
             f"(@~{EST_SEC_PER_SCENARIO:g}s/scenario, retries excluded)"
@@ -2922,6 +3038,11 @@ html, body {
 .group-report-pw-gone { margin-top: 12px; font-size: 12px; opacity: 0.8; }
 .group-report-busy .live-dot { vertical-align: middle; }
 .group-error { padding: 16px; color: #f85149; }
+.pipelines-cleanup-btn {
+    float: right; font-size: 11px; cursor: pointer; padding: 1px 8px; border-radius: 4px;
+    border: 1px solid rgba(248,81,73,0.45); background: transparent; color: #f85149;
+}
+.pipelines-cleanup-btn:hover { background: rgba(248,81,73,0.14); }
 
 /* ----- Cards (Dokimos "std_card") ----- */
 .card {
@@ -3945,33 +4066,25 @@ SPA_HTML = f"""<!DOCTYPE html>
         }}
 
         function _groupRowHtml(gid, info) {{
-            // Aggregate the member iterations into a single collapsible row.
-            const members = info.members.slice().sort(function(a, b) {{
-                return (a.iteration_index || 0) - (b.iteration_index || 0);
-            }});
+            // Summary row only -- the individual iterations still live in their
+            // own status sections below, so we do NOT nest them here.
+            const members = info.members;
             const total = members.length;
             const done = members.filter(function(m) {{ return m.status === 'finished' || m.status === 'failed'; }}).length;
             const running = members.some(function(m) {{ return m.status === 'running'; }});
             const allDone = done === total && total > 0;
-            const expanded = _expandedGroups.has(gid);
             const liveDot = running ? '<span class="live-dot" title="running"></span>' : '';
             const tag = allDone
                 ? '<span class="group-badge group-badge-done">done &middot; open for report</span>'
-                : '<span class="group-badge">' + done + '/' + total + ' done</span>';
+                : '<span class="group-badge">' + done + '/' + total + ' iterations done</span>';
             const cls = 'pipeline-group' + (gid === _selectedGroupId ? ' active' : '');
-            const caret = '<span class="group-caret" onclick="event.stopPropagation(); _toggleGroup(\\'' + _testsEscape(gid) + '\\')">'
-                        + (expanded ? '&#9662;' : '&#9656;') + '</span>';
-            const children = expanded
-                ? '<div class="pipeline-group-children">' + members.map(_pipelineItemHtml).join('') + '</div>'
-                : '';
             return '<div class="' + cls + '" onclick="_selectGroup(\\'' + _testsEscape(gid) + '\\')">'
-                 +   '<div class="pipeline-group-head">' + caret
+                 +   '<div class="pipeline-group-head">'
                  +     '<span class="pipeline-item-name">' + liveDot + _testsEscape(info.name) + '</span>'
                  +     '<span class="group-count">&times;' + total + '</span>'
                  +   '</div>'
-                 +   '<div class="pipeline-item-meta">' + tag + '</div>'
-                 + '</div>'
-                 + children;
+                 +   '<div class="pipeline-item-meta">' + tag + ' &middot; open for the aggregate report</div>'
+                 + '</div>';
         }}
 
         function _renderPipelinesList(pipelines) {{
@@ -3980,17 +4093,18 @@ SPA_HTML = f"""<!DOCTYPE html>
             _medianRunSec = _computeMedianRunSec(pipelines);
             // Pull grouped iterations into their own collapsible group rows; the
             // status buckets below show only ungrouped (single) pipelines.
+            // Build a groups summary (for the Groups section) but ALSO keep every
+            // pipeline -- grouped or not -- in its normal status section, so the
+            // individual iterations remain visible exactly as before. The group
+            // row is an additional summary + entry point to the group view.
             const groups = {{}};   // gid -> {{name, members:[]}}
-            const singles = [];
             (pipelines || []).forEach(function(p) {{
                 if (p.group_id) {{
                     (groups[p.group_id] || (groups[p.group_id] = {{name: p.group_name || p.group_id, members: [], created: p.created_at}})).members.push(p);
-                }} else {{
-                    singles.push(p);
                 }}
             }});
             const buckets = {{ running: [], queued: [], scheduled: [], finished: [], failed: [] }};
-            singles.forEach(function(p) {{
+            (pipelines || []).forEach(function(p) {{
                 (buckets[p.status] || (buckets.finished)).push(p);
             }});
             // Sort: running by start desc, scheduled by scheduled_for asc, finished by finished_at desc.
@@ -4005,17 +4119,21 @@ SPA_HTML = f"""<!DOCTYPE html>
             buckets.finished.sort(function(a, b) {{ return (b.finished_at || b.created_at || '').localeCompare(a.finished_at || a.created_at || ''); }});
             buckets.failed.sort(function(a, b) {{ return (b.finished_at || b.created_at || '').localeCompare(a.finished_at || a.created_at || ''); }});
 
-            function section(label, items) {{
+            function section(label, items, action) {{
                 const body = items.length
                     ? items.map(_pipelineItemHtml).join('')
                     : '<div class="pipelines-list-empty">none</div>';
                 return '<div class="pipelines-list-section">'
                      +   '<div class="pipelines-list-section-title">' + label
                      +     ' <span class="count">' + items.length + '</span>'
+                     +     (action || '')
                      +   '</div>'
                      +   body
                      + '</div>';
             }}
+            const failedAction = buckets.failed.length
+                ? '<button class="pipelines-cleanup-btn" title="Remove all failed pipelines" onclick="event.stopPropagation(); _cleanupFailed()">clear all</button>'
+                : '';
             // Groups section (most recent first), then the single-pipeline status sections.
             const gids = Object.keys(groups).sort(function(a, b) {{
                 return (groups[b].created || '').localeCompare(groups[a].created || '');
@@ -4033,7 +4151,28 @@ SPA_HTML = f"""<!DOCTYPE html>
                 + section('Queued',    buckets.queued)
                 + section('Scheduled', buckets.scheduled)
                 + section('Finished',  buckets.finished)
-                + section('Failed',    buckets.failed);
+                + section('Failed',    buckets.failed, failedAction);
+        }}
+
+        async function _cleanupFailed() {{
+            if (!window.confirm('Remove all failed pipelines? This cannot be undone.')) return;
+            try {{
+                const res = await fetch('/api/pipelines/cleanup', {{
+                    method: 'POST',
+                    headers: {{'Content-Type': 'application/json'}},
+                    body: JSON.stringify({{statuses: ['failed']}}),
+                }});
+                if (res.ok) {{
+                    // If the open pipeline was just removed, reset the view.
+                    _selectedPipelineId = null;
+                    const logs = document.getElementById('pipelinesViewLogs');
+                    if (logs) {{ logs.hidden = false; logs.textContent = 'No pipeline selected.'; }}
+                    ['pipelinesViewConfig', 'pipelinesViewProgress'].forEach(function(id) {{
+                        const el = document.getElementById(id); if (el) el.hidden = true;
+                    }});
+                }}
+            }} catch (_e) {{}}
+            await _refreshPipelines();
         }}
 
         async function _refreshPipelines() {{
@@ -5330,6 +5469,9 @@ class _SpaHandler(http.server.BaseHTTPRequestHandler):
         if path == "/api/pipelines":
             self._handle_pipeline_create()
             return
+        if path == "/api/pipelines/cleanup":
+            self._handle_pipeline_cleanup()
+            return
         if path.startswith("/api/pipelines/") and path.endswith("/rerun"):
             pid = path[len("/api/pipelines/"):-len("/rerun")]
             self._handle_pipeline_rerun(pid)
@@ -5435,6 +5577,16 @@ class _SpaHandler(http.server.BaseHTTPRequestHandler):
         self._send_json(200, {"pipelines": records, "count": len(records),
                               "group_id": group_id})
 
+    def _handle_pipeline_cleanup(self):
+        """Remove terminal pipelines (default: failed). Body may set
+        {"statuses": ["failed", "finished"]}; running/queued are never touched."""
+        payload, _err = self._read_json_body()
+        statuses = ("failed",)
+        if isinstance(payload, dict) and isinstance(payload.get("statuses"), list):
+            statuses = tuple(payload["statuses"])
+        result = _cleanup_pipelines(statuses)
+        self._send_json(200, result)
+
     def _handle_pipeline_rerun(self, pid: str):
         """Re-run a finished/failed pipeline with the same configuration:
         build a fresh run config from the original record and create a new
@@ -5531,7 +5683,10 @@ class _SpaHandler(http.server.BaseHTTPRequestHandler):
             status_counts[st] = status_counts.get(st, 0) + 1
             prog = m.get("progress") or {}
             scen_done += int(prog.get("done") or 0)
-            scen_total += int(m.get("scenario_count") or 0)
+            # Prefer the live/actual total from progress (accurate once a run has
+            # started or finished -- and correct for Tests-filtered runs); fall
+            # back to the pre-run @perf estimate only before a run produces any.
+            scen_total += int(prog.get("total") or m.get("scenario_count") or 0)
             # Single-slot sequential model: the running iteration contributes its
             # live ETA; not-yet-started iterations contribute their full estimate.
             if st == "running":
