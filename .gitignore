@@ -34,3 +34,6 @@ reports/2026-05-27_2026-06-10/*
 
 # runtime state -- not source; tracking it caused live-data loss
 pipelines.json
+groups.json
+# Report Portal log caches written by the analyzer at generation time
+logs/
