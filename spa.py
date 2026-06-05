@@ -99,6 +99,16 @@ PACKAGE_DIR    = os.path.dirname(os.path.abspath(__file__))
 REPORTS_DIR    = os.path.join(PACKAGE_DIR, "reports")
 ASSETS_DIR     = os.path.join(PACKAGE_DIR, "assets")
 PIPELINES_FILE = os.path.join(PACKAGE_DIR, "pipelines.json")
+# Iteration groups: an N-iteration burst is one "report package". Group records
+# live here; the per-iteration pipelines stay in pipelines.json linked by group_id.
+GROUPS_FILE    = os.path.join(PACKAGE_DIR, "groups.json")
+# The report generator (generate_report_for_urls) compares up to this many
+# launches; a group with more iterations than this caps its report inputs.
+GROUP_REPORT_MAX_LAUNCHES = int(os.environ.get("DOKIMOS_GROUP_REPORT_MAX_LAUNCHES", "20"))
+# group_id -> one-time report password. IN MEMORY ONLY, never written to disk:
+# revealed once in the group view and dropped when the user leaves it (or on
+# process restart), matching the "shown once, never recoverable" report model.
+_group_report_passwords: dict = {}
 
 # Root for the Tests tab's file browser. Resolution order:
 #   1. DOKIMOS_TESTS_DIR env var (explicit override, prod uses this)
@@ -1164,6 +1174,10 @@ def _ensure_pipeline_scheduler() -> None:
                 _dispatch_tick()
             except Exception:
                 pass
+            try:
+                _check_group_completions()
+            except Exception:
+                pass
             _time.sleep(2)
 
     threading.Thread(target=loop, daemon=True, name="pipeline-dispatcher").start()
@@ -1192,15 +1206,156 @@ def _new_pipeline_id() -> str:
     return "pl_" + secrets.token_urlsafe(8).replace("-", "").replace("_", "")[:10]
 
 
+def _new_group_id() -> str:
+    return "grp_" + secrets.token_urlsafe(8).replace("-", "").replace("_", "")[:10]
+
+
+def _load_groups() -> dict:
+    if not os.path.isfile(GROUPS_FILE):
+        return {}
+    try:
+        with open(GROUPS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_groups(groups: dict) -> None:
+    """Atomic write (mirrors _save_pipelines). Guard with _pipelines_lock()."""
+    tmp = GROUPS_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(groups, f, indent=2)
+    os.replace(tmp, GROUPS_FILE)
+
+
+def _create_group_record(group_id: str, group_name: str, member_records: list) -> None:
+    """Persist a group record linking the N iteration pipelines. The shared
+    config snapshot drives the group view's config strip (all iterations share
+    the same config)."""
+    sample = member_records[0]
+    with _pipelines_lock():
+        groups = _load_groups()
+        groups[group_id] = {
+            "id":              group_id,
+            "name":            group_name,
+            "created_at":      _now_iso(),
+            "iteration_count": len(member_records),
+            "member_ids":      [r["id"] for r in member_records],
+            "config": {k: sample.get(k) for k in (
+                "env", "parallel", "feature", "tests", "max_runtime_sec",
+                "scenario_retry", "scenario_count", "scenario_total", "est_runtime_sec")},
+            "report_status":   "none",   # none | generating | ready | failed
+            "report":          None,
+            "report_error":    None,
+        }
+        _save_groups(groups)
+
+
+def _check_group_completions() -> None:
+    """Detect iteration groups whose every member reached a terminal state and
+    auto-generate the aggregated perf report exactly once. Called by the
+    dispatcher loop; the expensive generation runs in a worker thread."""
+    to_generate = []
+    with _pipelines_lock():
+        groups = _load_groups()
+        if not groups:
+            return
+        by_id = {p.get("id"): p for p in _load_pipelines()}
+        changed = False
+        for gid, g in groups.items():
+            if g.get("report_status") != "none":
+                continue
+            members = [by_id.get(mid) for mid in g.get("member_ids", [])]
+            members = [m for m in members if m]
+            if not members or not all(
+                    m.get("status") in ("finished", "failed") for m in members):
+                continue
+            g["report_status"] = "generating"
+            g["report_error"] = None
+            changed = True
+            to_generate.append((gid, [m.get("rp_url") for m in members if m.get("rp_url")]))
+        if changed:
+            _save_groups(groups)
+    for gid, urls in to_generate:
+        _start_group_report(gid, urls)
+
+
+def _start_group_report(group_id: str, urls: list) -> None:
+    import threading
+    threading.Thread(target=_run_group_report, args=(group_id, list(urls)),
+                     daemon=True, name=f"group-report-{group_id}").start()
+
+
+def _run_group_report(group_id: str, urls: list) -> None:
+    """Generate the aggregated password-protected perf report for a finished
+    group from its members' Report Portal launch links. Worker thread (the
+    generation does network I/O to Report Portal). Reuses _run_generation, so
+    the report is AES-256-GCM encrypted and stored under reports/ exactly like
+    a manual Generate-tab report. The one-time password is kept in memory."""
+    seen, deduped = set(), []
+    for u in urls:
+        if u and u not in seen:
+            seen.add(u)
+            deduped.append(u)
+    dropped = max(0, len(deduped) - GROUP_REPORT_MAX_LAUNCHES)
+    deduped = deduped[:GROUP_REPORT_MAX_LAUNCHES]
+    try:
+        if not deduped:
+            raise RuntimeError(
+                "no Report Portal launches were produced by this group's runs "
+                "(RP disabled / token missing, or no run reached a launch)")
+        result = _run_generation(deduped)        # dict incl. report_password
+        password = result.pop("report_password", None)
+        result["dropped_launches"] = dropped
+        with _pipelines_lock():
+            groups = _load_groups()
+            g = groups.get(group_id)
+            if g is not None:
+                g["report_status"] = "ready"
+                g["report"] = result
+                g["report_error"] = None
+                _save_groups(groups)
+        if password:
+            _group_report_passwords[group_id] = password
+    except Exception as exc:
+        with _pipelines_lock():
+            groups = _load_groups()
+            g = groups.get(group_id)
+            if g is not None:
+                g["report_status"] = "failed"
+                g["report_error"] = f"{type(exc).__name__}: {exc}"
+                _save_groups(groups)
+
+
+def _reconcile_orphan_groups() -> int:
+    """A group left 'generating' at boot lost its worker thread on restart.
+    Flip it back to 'none' so the dispatcher regenerates (its members are
+    already terminal). Any in-memory password died with the old process."""
+    with _pipelines_lock():
+        groups = _load_groups()
+        n = 0
+        for g in groups.values():
+            if g.get("report_status") == "generating":
+                g["report_status"] = "none"
+                n += 1
+        if n:
+            _save_groups(groups)
+        return n
+
+
 def _now_iso() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
 
 
-def _create_pipeline(cfg: dict, iteration_index: int = 1, iteration_count: int = 1) -> dict:
+def _create_pipeline(cfg: dict, iteration_index: int = 1, iteration_count: int = 1,
+                     group_id: Optional[str] = None,
+                     group_name: Optional[str] = None) -> dict:
     """Build a new pipeline record from the run config posted by the SPA,
     persist it, and return the full record. When part of a multi-iteration
     burst, ``iteration_index`` / ``iteration_count`` drive name suffixing
-    (e.g. ``nightly-smoke-1``, ``nightly-smoke-2``)."""
+    (e.g. ``nightly-smoke-1``, ``nightly-smoke-2``) and ``group_id`` links the
+    iterations into one report package (see [groups.json])."""
     kind = cfg.get("kind") if cfg.get("kind") in _PIPELINE_KINDS else "now"
     now = datetime.now().astimezone()
     if kind == "now":
@@ -1222,7 +1377,9 @@ def _create_pipeline(cfg: dict, iteration_index: int = 1, iteration_count: int =
         if not scheduled_for:
             scheduled_for = (now + timedelta(hours=1)).isoformat(timespec="seconds")
 
-    name = (cfg.get("name") or "").strip()
+    # For grouped bursts use the caller-provided stable group_name as the base
+    # so every iteration shares one prefix; otherwise fall back to cfg/default.
+    name = (group_name or cfg.get("name") or "").strip()
     if not name:
         # Generate a sensible default name.
         name = f"{kind}-{now.strftime('%Y%m%d-%H%M%S')}"
@@ -1242,6 +1399,10 @@ def _create_pipeline(cfg: dict, iteration_index: int = 1, iteration_count: int =
         "tests":         (cfg.get("tests") or "").strip(),
         "max_runtime_sec": _clamp_max_runtime_sec(cfg.get("max_runtime_min")),
         "scenario_retry": _clamp_scenario_retry(cfg.get("scenario_retry")),
+        "group_id":      group_id,
+        "group_name":    group_name,
+        "iteration_index": iteration_index,
+        "iteration_count": iteration_count,
         "created_at":    now.isoformat(timespec="seconds"),
         "scheduled_for": scheduled_for,
         "queued_at":     now.isoformat(timespec="seconds") if kind == "now" else None,
@@ -1909,8 +2070,77 @@ def _generate_report_password() -> str:
     return secrets.token_urlsafe(12)
 
 
+# Credential keys the report generator needs; sourced from tests/.envrc when
+# absent from the SPA process env (systemd services don't inherit the shell env,
+# so RP_TOKEN -- which the test suite keeps in .envrc -- isn't present here).
+_RP_ENVRC_KEYS = ("RP_TOKEN", "RP_API_BASE", "DISNEY_DD_API_KEY", "DISNEY_DD_APP_KEY")
+
+
+def _rp_envrc_path() -> Optional[str]:
+    override = os.environ.get("DOKIMOS_PERF_ENVRC")
+    if override and os.path.isfile(override):
+        return override
+    if TESTS_DIR:
+        cand = os.path.join(TESTS_DIR, "tests", ".envrc")
+        if os.path.isfile(cand):
+            return cand
+    return None
+
+
+def _parse_envrc(path: str) -> dict:
+    """Best-effort parse of `export KEY=value` lines for the RP/DD credential
+    keys. Pure text parsing -- never executes the file. Skips values that need
+    shell evaluation ($(...), backticks, ${...})."""
+    import re as _re
+    out = {}
+    pat = _re.compile(r"^\s*(?:export\s+)?([A-Z_][A-Z0-9_]*)\s*=\s*(.*?)\s*$")
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if line.lstrip().startswith("#"):
+                    continue
+                m = pat.match(line)
+                if not m or m.group(1) not in _RP_ENVRC_KEYS:
+                    continue
+                v = m.group(2)
+                if v[:1] in ("\"", "'") and v[-1:] == v[:1]:
+                    v = v[1:-1]
+                if "$(" in v or "`" in v or v.startswith("$"):
+                    continue
+                out[m.group(1)] = v
+    except OSError:
+        return {}
+    return out
+
+
+def _ensure_rp_credentials() -> None:
+    """Make RP_TOKEN (+ RP_API_BASE, optional Datadog keys) available to the
+    report generator. The SPA runs as a systemd service that does NOT inherit
+    the shell env, so RP_TOKEN isn't present even though the test suite uses it
+    constantly -- it lives in tests/.envrc (owned/readable by this user). Load
+    it from there when missing, into BOTH os.environ and the analyzer module
+    globals (analyzer.py binds TOKEN/API_BASE at import time)."""
+    if not os.environ.get("RP_TOKEN"):
+        path = _rp_envrc_path()
+        if path:
+            vals = _parse_envrc(path)
+            for k in _RP_ENVRC_KEYS:
+                if vals.get(k) and not os.environ.get(k):
+                    os.environ[k] = vals[k]
+    import sys as _sys
+    mod = _sys.modules.get("rp_perf_report.analyzer") or _sys.modules.get("analyzer")
+    if mod is not None:
+        for env_key, attr in (("RP_TOKEN", "TOKEN"), ("RP_API_BASE", "API_BASE"),
+                              ("DISNEY_DD_API_KEY", "DD_API_KEY"),
+                              ("DISNEY_DD_APP_KEY", "DD_APP_KEY")):
+            val = os.environ.get(env_key)
+            if val and hasattr(mod, attr):
+                setattr(mod, attr, val)
+
+
 def _run_generation(urls: list, payload_key: Optional[str] = None,
                     databricks_log_dir: Optional[str] = None) -> dict:
+    _ensure_rp_credentials()
     report_password = _generate_report_password()
     html, meta = generate_report_for_urls(
         urls,
@@ -2642,6 +2872,57 @@ html, body {
     word-break: break-word;
 }
 
+/* ----- Iteration groups ----- */
+.pipeline-group {
+    padding: 8px 10px; margin: 2px 0; border-radius: 6px; cursor: pointer;
+    border-left: 3px solid var(--bronze, #b08d57); background: rgba(255,255,255,0.02);
+}
+.pipeline-group:hover { background: rgba(255,255,255,0.05); }
+.pipeline-group.active { background: var(--bg-card-hi, rgba(255,255,255,0.07)); }
+.pipeline-group-head { display: flex; align-items: center; gap: 6px; }
+.group-caret { cursor: pointer; opacity: 0.7; padding: 0 4px; font-size: 11px; }
+.group-caret:hover { opacity: 1; }
+.group-count { opacity: 0.6; font-size: 12px; }
+.group-badge { font-size: 11px; opacity: 0.7; }
+.group-badge-done { color: #3fb950; opacity: 0.9; }
+.pipeline-group-children { margin: 2px 0 6px 16px; padding-left: 6px; border-left: 1px dashed rgba(255,255,255,0.12); }
+.pipelines-view-group { flex: 1; overflow: auto; padding: 16px; }
+.group-section-title { font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: .04em;
+    opacity: 0.65; margin: 18px 0 8px; }
+.group-section-title:first-child { margin-top: 0; }
+.group-counts { font-weight: 400; text-transform: none; opacity: 0.8; }
+.group-progress-head { display: flex; justify-content: space-between; font: 600 13px var(--font-mono); color: #c9d1d9; }
+.group-eta { color: #8b949e; font-weight: 500; }
+.group-progress-track { height: 8px; background: #21262d; border-radius: 4px; overflow: hidden; margin: 5px 0 4px; }
+.group-progress-fill { height: 100%; background: #3fb950; transition: width .6s ease; }
+.group-iters { display: flex; flex-direction: column; gap: 4px; margin-top: 6px; }
+.group-iter { display: flex; align-items: center; gap: 10px; padding: 5px 8px; border-radius: 5px;
+    background: rgba(255,255,255,0.02); cursor: pointer; font-size: 12px; }
+.group-iter:hover { background: rgba(255,255,255,0.06); }
+.group-iter-idx { font-family: var(--font-mono); opacity: 0.7; min-width: 28px; }
+.group-iter-status { min-width: 64px; font-size: 11px; }
+.group-iter-status.status-finished { color: #3fb950; }
+.group-iter-status.status-failed { color: #f85149; }
+.group-iter-status.status-running { color: #58a6ff; }
+.group-iter-bar { flex: 1; height: 6px; background: #21262d; border-radius: 3px; overflow: hidden; }
+.group-iter-bar > span { display: block; height: 100%; transition: width .6s ease; }
+.group-iter-num { font-family: var(--font-mono); opacity: 0.7; min-width: 56px; text-align: right; }
+.group-report { margin-top: 4px; padding: 12px 14px; border-radius: 8px; background: rgba(255,255,255,0.03);
+    font-size: 13px; }
+.group-report-ready { border: 1px solid rgba(63,185,80,0.4); }
+.group-report-failed { border: 1px solid rgba(248,81,73,0.4); }
+.group-report-title { font-weight: 600; margin-bottom: 8px; }
+.group-report-err { font-family: var(--font-mono); font-size: 12px; color: #f85149; margin-bottom: 10px; word-break: break-word; }
+.group-report .btn-primary { display: inline-block; margin: 4px 0; text-decoration: none; }
+.group-report-pw { margin-top: 12px; }
+.group-report-pw label { display: block; font-size: 12px; opacity: 0.75; margin-bottom: 4px; }
+.group-report-pw-row { display: flex; gap: 8px; }
+.group-report-pw-row input { flex: 1; font-family: var(--font-mono); padding: 6px 8px; border-radius: 5px;
+    border: 1px solid rgba(255,255,255,0.15); background: var(--bg-dark, #0d1117); color: #e6edf3; }
+.group-report-pw-gone { margin-top: 12px; font-size: 12px; opacity: 0.8; }
+.group-report-busy .live-dot { vertical-align: middle; }
+.group-error { padding: 16px; color: #f85149; }
+
 /* ----- Cards (Dokimos "std_card") ----- */
 .card {
     position: relative;
@@ -3360,6 +3641,7 @@ SPA_HTML = f"""<!DOCTYPE html>
                     <div class="pipelines-view-config" id="pipelinesViewConfig" hidden></div>
                     <div class="pipelines-view-progress" id="pipelinesViewProgress" hidden></div>
                     <pre class="pipelines-view-logs" id="pipelinesViewLogs">No pipeline selected.</pre>
+                    <div class="pipelines-view-group" id="pipelinesViewGroup" hidden></div>
                 </main>
             </div>
         </section>
@@ -3439,6 +3721,7 @@ SPA_HTML = f"""<!DOCTYPE html>
             document.querySelectorAll('.tab-panel').forEach(function(p) {{
                 p.classList.toggle('active', p.getAttribute('data-panel') === name);
             }});
+            if (name !== 'pipelines') _leaveGroupView();
             if (name === 'reports') refreshReports();
             if (name === 'tests') {{ _loadTestsTree(); _loadTestsEnvs(); }}
             if (name === 'pipelines') {{ _enterPipelinesTab(); }}
@@ -3581,6 +3864,8 @@ SPA_HTML = f"""<!DOCTYPE html>
 
         // ----- Pipelines tab -----
         let _selectedPipelineId = null;
+        let _selectedGroupId    = null;   // when set, the right panel shows the group view (no logs)
+        let _expandedGroups     = new Set();
         let _pipelinesPollTimer = null;
         let _logsPollTimer      = null;
         let _medianRunSec = 0;   // updated each render from past run durations
@@ -3659,12 +3944,53 @@ SPA_HTML = f"""<!DOCTYPE html>
                  + '</div>';
         }}
 
+        function _groupRowHtml(gid, info) {{
+            // Aggregate the member iterations into a single collapsible row.
+            const members = info.members.slice().sort(function(a, b) {{
+                return (a.iteration_index || 0) - (b.iteration_index || 0);
+            }});
+            const total = members.length;
+            const done = members.filter(function(m) {{ return m.status === 'finished' || m.status === 'failed'; }}).length;
+            const running = members.some(function(m) {{ return m.status === 'running'; }});
+            const allDone = done === total && total > 0;
+            const expanded = _expandedGroups.has(gid);
+            const liveDot = running ? '<span class="live-dot" title="running"></span>' : '';
+            const tag = allDone
+                ? '<span class="group-badge group-badge-done">done &middot; open for report</span>'
+                : '<span class="group-badge">' + done + '/' + total + ' done</span>';
+            const cls = 'pipeline-group' + (gid === _selectedGroupId ? ' active' : '');
+            const caret = '<span class="group-caret" onclick="event.stopPropagation(); _toggleGroup(\\'' + _testsEscape(gid) + '\\')">'
+                        + (expanded ? '&#9662;' : '&#9656;') + '</span>';
+            const children = expanded
+                ? '<div class="pipeline-group-children">' + members.map(_pipelineItemHtml).join('') + '</div>'
+                : '';
+            return '<div class="' + cls + '" onclick="_selectGroup(\\'' + _testsEscape(gid) + '\\')">'
+                 +   '<div class="pipeline-group-head">' + caret
+                 +     '<span class="pipeline-item-name">' + liveDot + _testsEscape(info.name) + '</span>'
+                 +     '<span class="group-count">&times;' + total + '</span>'
+                 +   '</div>'
+                 +   '<div class="pipeline-item-meta">' + tag + '</div>'
+                 + '</div>'
+                 + children;
+        }}
+
         function _renderPipelinesList(pipelines) {{
             const panel = document.getElementById('pipelinesListPanel');
             if (!panel) return;
             _medianRunSec = _computeMedianRunSec(pipelines);
-            const buckets = {{ running: [], queued: [], scheduled: [], finished: [], failed: [] }};
+            // Pull grouped iterations into their own collapsible group rows; the
+            // status buckets below show only ungrouped (single) pipelines.
+            const groups = {{}};   // gid -> {{name, members:[]}}
+            const singles = [];
             (pipelines || []).forEach(function(p) {{
+                if (p.group_id) {{
+                    (groups[p.group_id] || (groups[p.group_id] = {{name: p.group_name || p.group_id, members: [], created: p.created_at}})).members.push(p);
+                }} else {{
+                    singles.push(p);
+                }}
+            }});
+            const buckets = {{ running: [], queued: [], scheduled: [], finished: [], failed: [] }};
+            singles.forEach(function(p) {{
                 (buckets[p.status] || (buckets.finished)).push(p);
             }});
             // Sort: running by start desc, scheduled by scheduled_for asc, finished by finished_at desc.
@@ -3690,8 +4016,20 @@ SPA_HTML = f"""<!DOCTYPE html>
                      +   body
                      + '</div>';
             }}
+            // Groups section (most recent first), then the single-pipeline status sections.
+            const gids = Object.keys(groups).sort(function(a, b) {{
+                return (groups[b].created || '').localeCompare(groups[a].created || '');
+            }});
+            let groupsHtml = '';
+            if (gids.length) {{
+                groupsHtml = '<div class="pipelines-list-section">'
+                    + '<div class="pipelines-list-section-title">Groups <span class="count">' + gids.length + '</span></div>'
+                    + gids.map(function(gid) {{ return _groupRowHtml(gid, groups[gid]); }}).join('')
+                    + '</div>';
+            }}
             panel.innerHTML =
-                  section('Running',   buckets.running)
+                  groupsHtml
+                + section('Running',   buckets.running)
                 + section('Queued',    buckets.queued)
                 + section('Scheduled', buckets.scheduled)
                 + section('Finished',  buckets.finished)
@@ -3718,10 +4056,172 @@ SPA_HTML = f"""<!DOCTYPE html>
             await _refreshPipelines();
         }}
 
+        function _leaveGroupView() {{
+            // Switching away from a group view destroys its one-time report
+            // password (server-side + DOM), per the "shown once" model.
+            if (_selectedGroupId) {{
+                const gid = _selectedGroupId;
+                try {{ fetch('/api/groups/' + encodeURIComponent(gid) + '/forget-password', {{method: 'POST'}}); }} catch (_e) {{}}
+            }}
+            _selectedGroupId = null;
+            const gv = document.getElementById('pipelinesViewGroup');
+            if (gv) {{ gv.hidden = true; gv.innerHTML = ''; }}
+            const logs = document.getElementById('pipelinesViewLogs');
+            if (logs) logs.hidden = false;
+        }}
+
+        function _toggleGroup(gid) {{
+            if (_expandedGroups.has(gid)) _expandedGroups.delete(gid);
+            else _expandedGroups.add(gid);
+            _refreshPipelines();
+        }}
+
+        async function _selectGroup(gid, opts) {{
+            if (_selectedGroupId && _selectedGroupId !== gid) _leaveGroupView();
+            _selectedGroupId = gid;
+            _selectedPipelineId = null;
+            // Group view replaces the per-pipeline panels (no logs for a group).
+            ['pipelinesViewConfig', 'pipelinesViewProgress', 'pipelinesViewLogs'].forEach(function(id) {{
+                const el = document.getElementById(id); if (el) el.hidden = true;
+            }});
+            const gv = document.getElementById('pipelinesViewGroup'); if (gv) gv.hidden = false;
+            document.querySelectorAll('.pipeline-item.active, .pipeline-group.active').forEach(function(e) {{ e.classList.remove('active'); }});
+            document.querySelectorAll('.pipeline-group').forEach(function(e) {{
+                if (e.getAttribute('onclick') && e.getAttribute('onclick').indexOf(gid) >= 0) e.classList.add('active');
+            }});
+            await _refreshGroupView();
+            if (_logsPollTimer) clearInterval(_logsPollTimer);
+            _logsPollTimer = setInterval(_refreshGroupView, 4000);
+            if (!opts || !opts.fromPop) {{
+                const target = '/groups/' + gid;
+                if (window.location.pathname !== target) history.pushState({{tab: 'pipelines', gid: gid}}, '', target);
+            }}
+        }}
+
+        function _groupConfigRows(c) {{
+            if (!c) return '';
+            const rows = [
+                ['env', c.env], ['parallel', c.parallel],
+                ['retries', c.scenario_retry], ['max runtime', c.max_runtime_sec ? (Math.round(c.max_runtime_sec / 60) + ' min') : ''],
+                ['scenarios/iter', c.scenario_count != null ? (c.scenario_count + (c.scenario_total ? ' @perf (of ' + c.scenario_total + ')' : '')) : ''],
+                ['est/iter', c.est_runtime_sec != null ? ('~' + Math.max(1, Math.round(c.est_runtime_sec / 60)) + ' min') : ''],
+                ['feature', c.feature || ''], ['tests', c.tests || ''],
+            ];
+            return '<div class="pipelines-view-config-grid">' + rows.map(function(r) {{
+                const v = (r[1] == null || r[1] === '') ? '<span class="empty">&mdash;</span>' : ('<span class="val">' + _testsEscape(String(r[1])) + '</span>');
+                return '<strong>' + r[0] + '</strong>' + v;
+            }}).join('') + '</div>';
+        }}
+
+        function _groupReportHtml(g) {{
+            const st = g.report_status;
+            if (st === 'generating') {{
+                return '<div class="group-report group-report-busy"><span class="live-dot"></span> Generating performance report from '
+                     + (g.status_counts ? '' : '') + 'the run launches&hellip;</div>';
+            }}
+            if (st === 'failed') {{
+                return '<div class="group-report group-report-failed">'
+                     + '<div class="group-report-title">Report generation failed</div>'
+                     + '<div class="group-report-err">' + _testsEscape(g.report_error || 'unknown error') + '</div>'
+                     + '<button class="btn-primary" onclick="_groupGenerate(\\'' + _testsEscape(g.id) + '\\')">Generate report</button>'
+                     + '</div>';
+            }}
+            if (st === 'ready' && g.report) {{
+                const r = g.report;
+                const link = r.share_url || r.url || '#';
+                const dropped = r.dropped_launches ? (' &middot; ' + r.dropped_launches + ' extra launch(es) omitted (max ' + ' reached)') : '';
+                let pwBlock;
+                if (g.report_password) {{
+                    pwBlock = '<div class="group-report-pw">'
+                        + '<label>One-time password (shown once &mdash; destroyed when you leave this view):</label>'
+                        + '<div class="group-report-pw-row">'
+                        +   '<input type="text" id="groupReportPw" readonly value="' + _testsEscape(g.report_password) + '">'
+                        +   '<button class="btn-secondary" onclick="_copyGroupPassword()">Copy</button>'
+                        + '</div></div>';
+                }} else {{
+                    pwBlock = '<div class="group-report-pw-gone">Password already revealed and destroyed. '
+                        + '<button class="btn-secondary" onclick="_groupGenerate(\\'' + _testsEscape(g.id) + '\\')">Regenerate for a new password</button></div>';
+                }}
+                return '<div class="group-report group-report-ready">'
+                     + '<div class="group-report-title">Performance report ready &mdash; ' + (r.num_launches || 0) + ' launch(es)' + dropped + '</div>'
+                     + '<a class="btn-primary" href="' + _testsEscape(link) + '" target="_blank" rel="noopener noreferrer">Open report &rarr;</a>'
+                     + pwBlock
+                     + '</div>';
+            }}
+            // none
+            return '<div class="group-report">Performance report will generate automatically once every iteration finishes.</div>';
+        }}
+
+        function _groupViewHtml(g) {{
+            const pct = g.pct || 0;
+            const eta = (g.eta_sec != null) ? ('ETA ~' + Math.max(1, Math.round(g.eta_sec / 60)) + ' min') : (g.all_done ? 'complete' : 'ETA --');
+            const sc = g.status_counts || {{}};
+            const countsLine = ['finished', 'failed', 'running', 'queued', 'scheduled']
+                .filter(function(s) {{ return sc[s]; }})
+                .map(function(s) {{ return sc[s] + ' ' + s; }}).join(' &middot; ');
+            const members = (g.members || []).map(function(m) {{
+                const mp = m.progress || {{}};
+                const tot = m.scenario_count || mp.total || 0;
+                const mdone = mp.done || 0;
+                const mpct = tot ? Math.min(100, Math.round(mdone / tot * 100)) : (m.status === 'finished' || m.status === 'failed' ? 100 : 0);
+                const color = m.status === 'finished' ? '#3fb950' : (m.status === 'failed' ? '#f85149' : (m.status === 'running' ? '#3fb950' : '#8b949e'));
+                const rp = m.rp_url ? '<a class="rp-link" href="' + _testsEscape(m.rp_url) + '" target="_blank" rel="noopener noreferrer">RP &rarr;</a>' : '';
+                return '<div class="group-iter" onclick="_selectPipeline(\\'' + _testsEscape(m.id) + '\\')">'
+                     +   '<span class="group-iter-idx">#' + (m.iteration_index || '?') + '</span>'
+                     +   '<span class="group-iter-status status-' + m.status + '">' + m.status + '</span>'
+                     +   '<span class="group-iter-bar"><span style="width:' + mpct + '%;background:' + color + '"></span></span>'
+                     +   '<span class="group-iter-num">' + mdone + '/' + tot + '</span>'
+                     +   rp
+                     + '</div>';
+            }}).join('');
+            return '<div class="group-section-title">Configuration (shared by all iterations)</div>'
+                 + _groupConfigRows(g.config)
+                 + '<div class="group-section-title">Progress &mdash; ' + g.iterations_done + ' / ' + g.iteration_count + ' iterations'
+                 +   (countsLine ? ' <span class="group-counts">(' + countsLine + ')</span>' : '') + '</div>'
+                 + '<div class="group-progress-head"><span>Scenarios ' + g.scenarios_done + ' / ' + g.scenarios_total + ' (' + pct + '%)</span><span class="group-eta">' + eta + '</span></div>'
+                 + '<div class="group-progress-track"><div class="group-progress-fill" style="width:' + pct + '%"></div></div>'
+                 + '<div class="group-iters">' + members + '</div>'
+                 + '<div class="group-section-title">Performance report</div>'
+                 + _groupReportHtml(g);
+        }}
+
+        async function _refreshGroupView() {{
+            if (!_selectedGroupId) return;
+            try {{
+                const res = await fetch('/api/groups/' + encodeURIComponent(_selectedGroupId));
+                const g = await res.json();
+                const gv = document.getElementById('pipelinesViewGroup');
+                const title = document.getElementById('pipelinesViewTitle');
+                const status = document.getElementById('pipelinesViewStatus');
+                if (!res.ok) {{ if (gv) gv.innerHTML = '<div class="group-error">' + _testsEscape(g.error || ('HTTP ' + res.status)) + '</div>'; return; }}
+                if (title) title.textContent = (g.name || g.id) + '  (group of ' + g.iteration_count + ')';
+                if (status) {{
+                    const live = (g.status_counts && g.status_counts.running) ? '<span class="live-dot"></span>' : '';
+                    const label = g.all_done ? (g.report_status === 'ready' ? 'report ready' : 'complete') : (g.iterations_done + '/' + g.iteration_count);
+                    status.innerHTML = live + '<span class="status-pill">' + label + '</span>';
+                }}
+                if (gv) gv.innerHTML = _groupViewHtml(g);
+            }} catch (_e) {{ /* keep last render */ }}
+        }}
+
+        async function _groupGenerate(gid) {{
+            try {{ await fetch('/api/groups/' + encodeURIComponent(gid) + '/generate', {{method: 'POST'}}); }} catch (_e) {{}}
+            _refreshGroupView();
+        }}
+
+        function _copyGroupPassword() {{
+            const el = document.getElementById('groupReportPw');
+            if (!el) return;
+            el.select();
+            try {{ document.execCommand('copy'); }} catch (_e) {{}}
+            if (navigator.clipboard) {{ try {{ navigator.clipboard.writeText(el.value); }} catch (_e) {{}} }}
+        }}
+
         async function _selectPipeline(id, opts) {{
+            _leaveGroupView();
             _selectedPipelineId = id;
             // Highlight in list immediately.
-            document.querySelectorAll('.pipeline-item.active').forEach(function(e) {{
+            document.querySelectorAll('.pipeline-item.active, .pipeline-group.active').forEach(function(e) {{
                 e.classList.remove('active');
             }});
             document.querySelectorAll('.pipeline-item').forEach(function(e) {{
@@ -4587,6 +5087,12 @@ SPA_HTML = f"""<!DOCTYPE html>
         // /pipelines/<id>   -> Pipelines tab, that pipeline auto-selected
         // /reports          -> Reports tab
         function _routeFromPath(path, fromPop) {{
+            const gm = (path || '/').match(/^\/groups\/([A-Za-z0-9_-]+)\/?$/);
+            if (gm) {{
+                showTab('pipelines', {{fromPop: fromPop}});
+                _selectGroup(gm[1], {{fromPop: fromPop}});
+                return;
+            }}
             const m = (path || '/').match(/^\/pipelines\/([A-Za-z0-9_-]+)\/?$/);
             if (m) {{
                 _selectedPipelineId = m[1];
@@ -4666,6 +5172,7 @@ class _SpaHandler(http.server.BaseHTTPRequestHandler):
             path in ("/", "/index.html")
             or path in ("/tests", "/pipelines", "/reports", "/new")
             or path.startswith("/pipelines/")
+            or path.startswith("/groups/")
         ):
             self._send(200, "text/html; charset=utf-8", SPA_HTML.encode("utf-8"))
             return
@@ -4688,6 +5195,9 @@ class _SpaHandler(http.server.BaseHTTPRequestHandler):
         if path.startswith("/api/pipelines/") and path.endswith("/logs"):
             pid = path[len("/api/pipelines/"):-len("/logs")]
             self._handle_pipeline_logs(pid)
+            return
+        if path.startswith("/api/groups/"):
+            self._handle_group_detail(path[len("/api/groups/"):])
             return
         if path.startswith("/reports/"):
             self._serve_report_file(path)
@@ -4824,6 +5334,12 @@ class _SpaHandler(http.server.BaseHTTPRequestHandler):
             pid = path[len("/api/pipelines/"):-len("/rerun")]
             self._handle_pipeline_rerun(pid)
             return
+        if path.startswith("/api/groups/") and path.endswith("/forget-password"):
+            self._handle_group_forget_password(path[len("/api/groups/"):-len("/forget-password")])
+            return
+        if path.startswith("/api/groups/") and path.endswith("/generate"):
+            self._handle_group_generate(path[len("/api/groups/"):-len("/generate")])
+            return
         self._send(404, "text/plain; charset=utf-8", b"Not found")
 
     def _read_json_body(self, max_bytes: int = 100_000_000):
@@ -4898,15 +5414,26 @@ class _SpaHandler(http.server.BaseHTTPRequestHandler):
             iterations = max(1, min(50, int(payload.get("iterations", 1))))
         except (TypeError, ValueError):
             iterations = 1
+        # A multi-iteration burst becomes one report-package group; iterations
+        # share a stable group_id + group_name. Single runs stay ungrouped.
+        group_id = group_name = None
+        if iterations > 1:
+            group_id = _new_group_id()
+            group_name = ((payload.get("name") or "").strip()
+                          or f"group-{datetime.now().astimezone().strftime('%Y%m%d-%H%M%S')}")
         records = []
         for i in range(iterations):
-            rec = _create_pipeline(payload, iteration_index=i + 1, iteration_count=iterations)
+            rec = _create_pipeline(payload, iteration_index=i + 1, iteration_count=iterations,
+                                   group_id=group_id, group_name=group_name)
             records.append(rec)
+        if group_id:
+            _create_group_record(group_id, group_name, records)
         # `now` jobs are now `queued`; the single-slot dispatcher starts the next
         # one when the slot is free. Nudge it so a free slot fills immediately.
         _ensure_pipeline_scheduler()
         _dispatch_tick()
-        self._send_json(200, {"pipelines": records, "count": len(records)})
+        self._send_json(200, {"pipelines": records, "count": len(records),
+                              "group_id": group_id})
 
     def _handle_pipeline_rerun(self, pid: str):
         """Re-run a finished/failed pipeline with the same configuration:
@@ -4969,10 +5496,105 @@ class _SpaHandler(http.server.BaseHTTPRequestHandler):
                     "started_at":      p.get("started_at"),
                     "finished_at":     p.get("finished_at"),
                     "rp_url":          p.get("rp_url"),
+                    "group_id":        p.get("group_id"),
+                    "group_name":      p.get("group_name"),
+                    "iteration_index": p.get("iteration_index"),
+                    "iteration_count": p.get("iteration_count"),
                     "logs":            p.get("logs") or [],
                 })
                 return
         self._send_json(404, {"error": "not found"})
+
+    # ------------------------------------------------------------------ #
+    # Iteration groups
+    # ------------------------------------------------------------------ #
+    def _handle_group_detail(self, gid: str):
+        gid = (gid or "").strip()
+        if not gid or not all(c.isalnum() or c in "-_" for c in gid):
+            self._send_json(404, {"error": "not found"})
+            return
+        with _pipelines_lock():
+            groups = _load_groups()
+            g = groups.get(gid)
+            pipelines = _load_pipelines()
+        if not g:
+            self._send_json(404, {"error": "not found"})
+            return
+        members = [p for p in pipelines if p.get("group_id") == gid]
+        members.sort(key=lambda p: p.get("iteration_index") or 0)
+
+        status_counts, member_views = {}, []
+        scen_done = scen_total = 0
+        eta_sec, any_eta = 0, False
+        for m in members:
+            st = m.get("status")
+            status_counts[st] = status_counts.get(st, 0) + 1
+            prog = m.get("progress") or {}
+            scen_done += int(prog.get("done") or 0)
+            scen_total += int(m.get("scenario_count") or 0)
+            # Single-slot sequential model: the running iteration contributes its
+            # live ETA; not-yet-started iterations contribute their full estimate.
+            if st == "running":
+                eta_sec += int(prog.get("eta_sec") or m.get("est_runtime_sec") or 0); any_eta = True
+            elif st in ("queued", "scheduled"):
+                eta_sec += int(m.get("est_runtime_sec") or 0); any_eta = True
+            member_views.append({
+                "id": m.get("id"), "name": m.get("name"),
+                "iteration_index": m.get("iteration_index"),
+                "status": st, "rp_url": m.get("rp_url"),
+                "scenario_count": m.get("scenario_count"), "progress": prog,
+            })
+        total_iters = len(members)
+        done_iters = sum(status_counts.get(s, 0) for s in ("finished", "failed"))
+        pct = (round(scen_done / scen_total * 100) if scen_total
+               else (round(done_iters / total_iters * 100) if total_iters else 0))
+        report = g.get("report") or None
+        self._send_json(200, {
+            "id": gid, "name": g.get("name"), "config": g.get("config"),
+            "iteration_count": total_iters, "iterations_done": done_iters,
+            "status_counts": status_counts,
+            "scenarios_done": scen_done, "scenarios_total": scen_total, "pct": pct,
+            "eta_sec": (eta_sec if any_eta else None),
+            "all_done": total_iters > 0 and done_iters == total_iters,
+            "members": member_views,
+            "report_status": g.get("report_status"),
+            "report": report,
+            "report_error": g.get("report_error"),
+            # one-time password: present only while held in memory (see lifecycle)
+            "report_password": _group_report_passwords.get(gid),
+        })
+
+    def _handle_group_forget_password(self, gid: str):
+        """Drop the in-memory one-time report password -- the client calls this
+        when leaving the group view, so the password is shown once and destroyed
+        on view switch."""
+        gid = (gid or "").strip()
+        _group_report_passwords.pop(gid, None)
+        self._send_json(200, {"ok": True})
+
+    def _handle_group_generate(self, gid: str):
+        """Manual (re)generate: re-arm the group so the dispatcher regenerates
+        its report. Only valid once every iteration is terminal."""
+        gid = (gid or "").strip()
+        with _pipelines_lock():
+            groups = _load_groups()
+            g = groups.get(gid)
+            if not g:
+                self._send_json(404, {"error": "not found"})
+                return
+            by_id = {p.get("id"): p for p in _load_pipelines()}
+            members = [by_id.get(mid) for mid in g.get("member_ids", [])]
+            members = [m for m in members if m]
+            if not members or not all(
+                    m.get("status") in ("finished", "failed") for m in members):
+                self._send_json(409, {"error": "group still has running/queued iterations"})
+                return
+            g["report_status"] = "none"
+            g["report_error"] = None
+            _save_groups(groups)
+        _group_report_passwords.pop(gid, None)
+        _check_group_completions()
+        self._send_json(200, {"ok": True, "report_status": "generating"})
 
     def _handle_generate(self):
         payload, err = self._read_json_body()
@@ -5041,6 +5663,10 @@ def serve_spa(port: int = PORT) -> None:
     orphaned = _reconcile_orphan_pipelines()
     if orphaned:
         print(f"  Reconciled {orphaned} orphaned pipeline(s) -> failed")
+    # Groups left mid-generation by the previous process re-arm for regeneration.
+    requeued = _reconcile_orphan_groups()
+    if requeued:
+        print(f"  Re-armed {requeued} group report(s) interrupted by restart")
     # Start the pipeline scheduler so any pipelines created later -- and any
     # already-scheduled ones from prior server runs -- get picked up when
     # their `scheduled_for` arrives.
