@@ -99,6 +99,16 @@ PACKAGE_DIR    = os.path.dirname(os.path.abspath(__file__))
 REPORTS_DIR    = os.path.join(PACKAGE_DIR, "reports")
 ASSETS_DIR     = os.path.join(PACKAGE_DIR, "assets")
 PIPELINES_FILE = os.path.join(PACKAGE_DIR, "pipelines.json")
+# Iteration groups: an N-iteration burst is one "report package". Group records
+# live here; the per-iteration pipelines stay in pipelines.json linked by group_id.
+GROUPS_FILE    = os.path.join(PACKAGE_DIR, "groups.json")
+# The report generator (generate_report_for_urls) compares up to this many
+# launches; a group with more iterations than this caps its report inputs.
+GROUP_REPORT_MAX_LAUNCHES = int(os.environ.get("DOKIMOS_GROUP_REPORT_MAX_LAUNCHES", "20"))
+# group_id -> one-time report password. IN MEMORY ONLY, never written to disk:
+# revealed once in the group view and dropped when the user leaves it (or on
+# process restart), matching the "shown once, never recoverable" report model.
+_group_report_passwords: dict = {}
 
 # Root for the Tests tab's file browser. Resolution order:
 #   1. DOKIMOS_TESTS_DIR env var (explicit override, prod uses this)
@@ -186,6 +196,71 @@ _PIPELINE_STATUSES = ("scheduled", "running", "finished", "failed")
 # documents this exact tag as the canonical local build target.
 DOCKER_IMAGE = os.environ.get("DOKIMOS_DOCKER_IMAGE", "ifp-fcap-perf:latest")
 
+# Hard ceiling on a single pipeline run. A hung container (e.g. behavex
+# deadlock, stuck Report-Portal upload) would otherwise block the single-slot
+# queue forever, so the runner watchdog kills it and marks the pipeline failed.
+MAX_RUNTIME_SEC = int(os.environ.get("DOKIMOS_MAX_RUNTIME_SEC", "2700"))  # 45 min
+
+# Upper bound the operator can dial in from the Tests panel (minutes). The
+# DOKIMOS_MAX_RUNTIME_SEC env value remains the *default*; the per-run field
+# can only set something between 1 minute and this ceiling.
+MAX_RUNTIME_CEILING_MIN = int(os.environ.get("DOKIMOS_MAX_RUNTIME_CEILING_MIN", "240"))
+
+# Per-scenario retry budget passed through to the suite as IFP_SCENARIO_RETRY
+# (see environment.py: max attempts per scenario, 1 = run once). Default 3
+# mirrors the suite default; the Tests-panel field can dial it in [1, ceiling].
+SCENARIO_RETRY_DEFAULT = int(os.environ.get("DOKIMOS_SCENARIO_RETRY_DEFAULT", "3"))
+SCENARIO_RETRY_CEILING = int(os.environ.get("DOKIMOS_SCENARIO_RETRY_CEILING", "5"))
+
+# Rough per-scenario wall time (seconds) for the *pre-run* duration estimate on
+# the job-config panel. Calibrated from observed @perf runs (~15s/scenario for
+# the heavier forecast mix; SUMMARY-only calls are faster). This is only the
+# initial guess -- once a run starts, the panel shows a live rate-based ETA that
+# supersedes it. Override via env if the suite's profile changes.
+EST_SEC_PER_SCENARIO = float(os.environ.get("DOKIMOS_EST_SEC_PER_SCENARIO", "15"))
+# Fixed per-iteration overhead (seconds) that happens regardless of scenario
+# count: container start, behave import, the before_feature Report Portal launch,
+# and teardown. Without it, a 1-scenario run is wildly underestimated. NOT
+# divided by parallelism (it's paid once per container run).
+EST_FIXED_OVERHEAD_SEC = float(os.environ.get("DOKIMOS_EST_FIXED_OVERHEAD_SEC", "40"))
+
+
+def _clamp_scenario_retry(val) -> int:
+    """Translate the Tests-panel 'Retries' field into an IFP_SCENARIO_RETRY
+    value (max attempts per scenario; 1 = run once, no retry).
+
+    Blank/garbage -> 3 (the suite's environment.py default). Otherwise clamp
+    to [1, SCENARIO_RETRY_CEILING] so a typo can't spin every failing scenario
+    forever (each retry re-runs the scenario + backoff)."""
+    if val is None or (isinstance(val, str) and not val.strip()):
+        return SCENARIO_RETRY_DEFAULT
+    try:
+        n = int(val)
+    except (TypeError, ValueError):
+        return SCENARIO_RETRY_DEFAULT
+    return max(1, min(SCENARIO_RETRY_CEILING, n))
+
+
+def _clamp_max_runtime_sec(min_val) -> int:
+    """Translate the Tests-panel 'Max runtime (min)' field into seconds.
+
+    Blank/garbage -> the MAX_RUNTIME_SEC default. Anything supplied is clamped
+    to [1, MAX_RUNTIME_CEILING_MIN] minutes so a typo can't disable the
+    watchdog or pin the single-slot queue for days."""
+    if min_val is None or (isinstance(min_val, str) and not min_val.strip()):
+        return MAX_RUNTIME_SEC
+    try:
+        m = int(min_val)
+    except (TypeError, ValueError):
+        return MAX_RUNTIME_SEC
+    m = max(1, min(MAX_RUNTIME_CEILING_MIN, m))
+    return m * 60
+
+# Cap per-pipeline log lines. The whole pipelines.json is re-serialised on every
+# append, so an unbounded `logs` array (chatty container) bloats the file and
+# slows every save. Keep the head (creation/context) + the most recent tail.
+MAX_LOG_LINES = int(os.environ.get("DOKIMOS_MAX_LOG_LINES", "4000"))
+
 # Where in the InventoryForecasting tree the perf Dockerfile + README live.
 # We auto-discover by scanning, but this constant is the documented spot.
 _DOCKERFILE_BASENAMES = ("Dockerfile",)
@@ -270,7 +345,8 @@ def _build_docker_command(pipeline: dict, assets: dict) -> tuple:
     pass ENV / PARALLEL_THREADS / optional TESTS+BEHAVEX_EXTRA as env vars.
 
     Returns (argv, envrc_host_path | None)."""
-    argv = ["docker", "run", "--rm"]
+    # Stable container name so the runtime watchdog can `docker kill` it on timeout.
+    argv = ["docker", "run", "--rm", "--name", f"dokimos-{pipeline['id']}"]
     # Mount the local .envrc so secrets aren't echoed via -e flags.
     envrc_host = None
     if assets.get("rel_root"):
@@ -285,8 +361,10 @@ def _build_docker_command(pipeline: dict, assets: dict) -> tuple:
 
     # Env vars from the pipeline config.
     env_pairs = [
-        ("ENV",              pipeline["env"]),
-        ("PARALLEL_THREADS", str(pipeline["parallel"])),
+        ("ENV",                pipeline["env"]),
+        ("PARALLEL_THREADS",   str(pipeline["parallel"])),
+        # Per-scenario retry budget, consumed by the suite's environment.py.
+        ("IFP_SCENARIO_RETRY", str(pipeline.get("scenario_retry") or SCENARIO_RETRY_DEFAULT)),
     ]
     if pipeline.get("feature"):
         env_pairs.append(("TESTS", pipeline["feature"]))
@@ -314,6 +392,55 @@ def _rp_url_re():
     return _RP_URL_RE
 
 
+# The IFP suite never prints a clickable Report Portal URL -- it prints
+# "ReportPortal Launch ID: <uuid>" and "ReportPortal launch_info: {... 'id': N ...}"
+# (see Base/Misc/ReportPortalAgent.py). We build the launch deep-link ourselves
+# from the launch id + the known RP endpoint/project. Both are env-overridable.
+RP_ENDPOINT = os.environ.get(
+    "DOKIMOS_RP_ENDPOINT", "https://ads-report-portal.staging.hulu.com").rstrip("/")
+RP_PROJECT = os.environ.get("DOKIMOS_RP_PROJECT", "ad-apps-automation")
+
+_RP_LAUNCH_INFO_RE = None
+_RP_LAUNCH_ID_RE = None
+def _extract_rp_url(line: str):
+    """Find a Report Portal launch URL in (or derivable from) `line`.
+
+    Returns ``(url, is_numeric)`` or ``None``. ``is_numeric`` is True when the
+    URL uses Report Portal's numeric launch id (the form the UI deep-link
+    actually resolves) rather than the launch UUID -- the suite prints the UUID
+    (`ReportPortal Launch ID:`) *before* the numeric id (`launch_info: {... 'id': N ...}`),
+    so the caller uses this flag to upgrade a provisional UUID link to the numeric one.
+
+    Preference: a full printed URL > numeric launch_info id > UUID Launch ID."""
+    m = _rp_url_re().search(line)
+    if m:
+        return (m.group(1), True)
+    global _RP_LAUNCH_INFO_RE, _RP_LAUNCH_ID_RE
+    if _RP_LAUNCH_INFO_RE is None:
+        import re as _re
+        _RP_LAUNCH_INFO_RE = _re.compile(r"launch_info:.*?['\"]id['\"]\s*:\s*(\d+)")
+        _RP_LAUNCH_ID_RE = _re.compile(r"ReportPortal Launch ID:\s*(\S+)")
+    m = _RP_LAUNCH_INFO_RE.search(line)
+    if m:
+        return (f"{RP_ENDPOINT}/ui/#{RP_PROJECT}/launches/all/{m.group(1)}", True)
+    m = _RP_LAUNCH_ID_RE.search(line)
+    if m and m.group(1).lower() != "none":
+        tok = m.group(1)
+        return (f"{RP_ENDPOINT}/ui/#{RP_PROJECT}/launches/all/{tok}", tok.isdigit())
+    return None
+
+
+# behavex/behave logs one line per scenario start: "... Running Scenario <name>".
+# We count distinct names to drive the live progress + ETA on the logs panel.
+_SCENARIO_MARKER_RE = None
+def _scenario_marker_re():
+    global _SCENARIO_MARKER_RE
+    if _SCENARIO_MARKER_RE is None:
+        import re as _re
+        _SCENARIO_MARKER_RE = _re.compile(r"Running Scenario\s+(.+?)\s*$")
+    return _SCENARIO_MARKER_RE
+
+
 def _append_pipeline_log(pipeline_id: str, *lines: str, **mut) -> None:
     """Atomically append log lines (and optionally mutate top-level fields)
     on a single pipeline record. Held under the persistence lock so the
@@ -322,11 +449,378 @@ def _append_pipeline_log(pipeline_id: str, *lines: str, **mut) -> None:
         pipelines = _load_pipelines()
         for p in pipelines:
             if p.get("id") == pipeline_id:
-                p.setdefault("logs", []).extend(lines)
+                logs = p.setdefault("logs", [])
+                logs.extend(lines)
+                if len(logs) > MAX_LOG_LINES:
+                    head, tail = logs[:50], logs[-(MAX_LOG_LINES - 51):]
+                    dropped = len(logs) - len(head) - len(tail)
+                    p["logs"] = head + [f"[... {dropped} earlier log lines truncated ...]"] + tail
                 for k, v in mut.items():
                     p[k] = v
                 break
         _save_pipelines(pipelines)
+
+
+def _docker_image_exists(image: str) -> bool:
+    """True if `image` is already present in the local Docker image store."""
+    import subprocess
+    try:
+        r = subprocess.run(
+            ["docker", "image", "inspect", image],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def _ensure_base_submodule(pipeline_id: str, context: str) -> bool:
+    """Ensure the `Base` git submodule is checked out under the build context;
+    the perf image build needs it. On a fresh checkout it's uninitialised, so
+    init it (the runner is User=bober, so git uses bober's cached enterprise
+    token via the credential helper). Returns True if Base is present/ready
+    (or not registered as a submodule at all), False if an init was needed but
+    failed."""
+    import subprocess
+    try:
+        st = subprocess.run(
+            ["git", "-C", context, "submodule", "status", "Base"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        )
+    except Exception as exc:
+        _append_pipeline_log(
+            pipeline_id, f"[{_now_iso()}] WARN: Base submodule check failed: {exc}; continuing")
+        return True
+    line = (st.stdout or "").strip()
+    # `git submodule status` prefixes uninitialised entries with '-'. A checked-out
+    # one has ' ' or '+'. Empty output = no Base submodule registered -> nothing to do.
+    if not line or not line.startswith("-"):
+        return True
+
+    _append_pipeline_log(
+        pipeline_id, f"[{_now_iso()}] Base submodule not checked out -- initialising it")
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
+    try:
+        proc = subprocess.Popen(
+            ["git", "-C", context, "submodule", "update", "--init", "Base"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, env=env,
+        )
+        for raw in proc.stdout:
+            ln = raw.rstrip("\r\n")
+            if ln:
+                _append_pipeline_log(pipeline_id, ln)
+        rc = proc.wait()
+    except Exception as exc:
+        _append_pipeline_log(
+            pipeline_id,
+            f"[{_now_iso()}] ERROR: Base submodule init failed: {type(exc).__name__}: {exc}")
+        return False
+    if rc != 0:
+        _append_pipeline_log(
+            pipeline_id,
+            f"[{_now_iso()}] ERROR: Base submodule init failed (exit {rc}). Needs VPN + a "
+            f"cached github.twdcgrid.net token (git credential.helper).",
+        )
+        return False
+    _append_pipeline_log(pipeline_id, f"[{_now_iso()}] Base submodule checked out OK")
+    return True
+
+
+def _ensure_docker_image(pipeline_id: str, assets: dict) -> bool:
+    """Guarantee DOCKER_IMAGE is available before running.
+
+    If the image is **already built locally, reuse it as-is** (no rebuild).
+    Otherwise build it once from the discovered Dockerfile with the repo root
+    as context (BuildKit), streaming the build output into the pipeline log.
+    Returns True if the image is ready to run, False if the build failed (in
+    which case the pipeline has already been marked `failed`)."""
+    import subprocess
+    if _docker_image_exists(DOCKER_IMAGE):
+        _append_pipeline_log(
+            pipeline_id,
+            f"[{_now_iso()}] image {DOCKER_IMAGE} already built -- reusing it (no rebuild)",
+        )
+        return True
+
+    dockerfile = assets.get("dockerfile")
+    context = assets.get("rel_root")
+    if not dockerfile or not context:
+        _append_pipeline_log(
+            pipeline_id,
+            f"[{_now_iso()}] ERROR: image {DOCKER_IMAGE} missing and cannot build "
+            f"(no Dockerfile/context discovered)",
+            status="failed", finished_at=_now_iso(),
+        )
+        return False
+
+    # The build context needs the Base submodule; auto-init it if a fresh
+    # checkout left it empty.
+    if not _ensure_base_submodule(pipeline_id, context):
+        _append_pipeline_log(
+            pipeline_id,
+            f"[{_now_iso()}] aborting: cannot build {DOCKER_IMAGE} without the Base submodule",
+            status="failed", finished_at=_now_iso(),
+        )
+        return False
+
+    build_argv = ["docker", "build", "-f", dockerfile, "-t", DOCKER_IMAGE, context]
+    _append_pipeline_log(
+        pipeline_id,
+        f"[{_now_iso()}] image {DOCKER_IMAGE} not found locally -- building it once",
+        f"[{_now_iso()}] (needs VPN for artifactory.prod.hulu.com + the Base submodule checked out)",
+        f"[{_now_iso()}] building: DOCKER_BUILDKIT=1 {' '.join(build_argv)}",
+    )
+    build_env = dict(os.environ, DOCKER_BUILDKIT="1")
+    try:
+        proc = subprocess.Popen(
+            build_argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1, env=build_env,
+        )
+    except Exception as exc:
+        _append_pipeline_log(
+            pipeline_id,
+            f"[{_now_iso()}] ERROR: failed to start docker build: "
+            f"{type(exc).__name__}: {exc}",
+            status="failed", finished_at=_now_iso(),
+        )
+        return False
+    try:
+        for raw in proc.stdout:
+            line = raw.rstrip("\r\n")
+            if line:
+                _append_pipeline_log(pipeline_id, line)
+    except Exception:
+        pass
+    rc = proc.wait()
+    if rc != 0:
+        _append_pipeline_log(
+            pipeline_id,
+            f"[{_now_iso()}] docker build failed (exit {rc}) -- see log above. "
+            f"Common causes: VPN down (artifactory unreachable) or Base submodule "
+            f"not checked out.",
+            status="failed", finished_at=_now_iso(),
+        )
+        return False
+    _append_pipeline_log(
+        pipeline_id,
+        f"[{_now_iso()}] image {DOCKER_IMAGE} built OK -- future runs reuse it",
+    )
+    return True
+
+
+# The perf entrypoint (NAS_components/.../perf/run_perf.sh) always runs
+# `behavex tests/api_tests --tags=@perf`, regardless of the UI feature/tests
+# filters. So the meaningful pre-run count is: total scenarios in api_tests vs
+# how many carry the @perf tag (= what actually executes).
+PERF_FEATURES_SUBDIR = os.path.join("tests", "api_tests")
+PERF_RUN_TAG = "@perf"
+
+
+def _scan_feature_file(path: str):
+    """Static parse of one .feature file -> a list of scenario dicts
+    ``{name, tags(set, feature tags inherited), count}``. A Scenario Outline
+    contributes one per Examples data row (header excluded); a plain Scenario
+    counts as one. Best-effort, not a full behave parser."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return []
+
+    feature_tags = set()
+    pending_tags = set()
+    blocks = []          # {tags, outline, rows, name}
+    cur = None
+    in_examples = False
+    ex_header_seen = False
+
+    def _close():
+        if cur is not None:
+            blocks.append(cur)
+
+    for raw in lines:
+        s = raw.strip()
+        if not s or s.startswith("#"):
+            continue
+        if s.startswith("@"):
+            pending_tags.update(t for t in s.split() if t.startswith("@"))
+            continue
+        if s.startswith("Feature:"):
+            feature_tags = set(pending_tags)
+            pending_tags = set()
+            in_examples = False
+            continue
+        if s.startswith("Scenario Outline:") or s.startswith("Scenario:"):
+            _close()
+            label = "Scenario Outline:" if s.startswith("Scenario Outline:") else "Scenario:"
+            cur = {"tags": set(pending_tags), "outline": label.startswith("Scenario Outline"),
+                   "rows": 0, "name": s[len(label):].strip()}
+            pending_tags = set()
+            in_examples = False
+            ex_header_seen = False
+            continue
+        if s.startswith("Background:"):
+            pending_tags = set()
+            in_examples = False
+            continue
+        if s.startswith("Examples:"):
+            in_examples = True
+            ex_header_seen = False
+            continue
+        if in_examples and s.startswith("|"):
+            if not ex_header_seen:
+                ex_header_seen = True          # first row is the column header
+            elif cur is not None:
+                cur["rows"] += 1
+            continue
+        if in_examples:
+            in_examples = False                # any non-table line ends the block
+    _close()
+
+    out = []
+    for b in blocks:
+        n = b["rows"] if (b["outline"] and b["rows"] > 0) else 1
+        out.append({"name": b["name"], "tags": feature_tags | b["tags"], "count": n})
+    return out
+
+
+def _parse_tests_filter(s):
+    """Pull behave ``--name`` regexes and ``--tags`` expressions out of the
+    free-form Tests-filter string (the SPA's `tests`/BEHAVEX_EXTRA field).
+    Returns (name_patterns, tag_values). Unknown tokens are ignored."""
+    import shlex
+    try:
+        toks = shlex.split(s or "")
+    except ValueError:
+        toks = (s or "").split()
+    names, tags, i = [], [], 0
+    while i < len(toks):
+        t = toks[i]
+        if t in ("--name", "-n") and i + 1 < len(toks):
+            names.append(toks[i + 1]); i += 2; continue
+        if t.startswith("--name="):
+            names.append(t[len("--name="):]); i += 1; continue
+        if t in ("--tags", "-t") and i + 1 < len(toks):
+            tags.append(toks[i + 1]); i += 2; continue
+        if t.startswith("--tags="):
+            tags.append(t[len("--tags="):]); i += 1; continue
+        i += 1
+    return names, tags
+
+
+def _name_match(name, patterns):
+    """True if `name` matches any --name pattern (behave uses regex search)."""
+    if not patterns:
+        return True
+    import re as _re
+    for p in patterns:
+        try:
+            if _re.search(p, name):
+                return True
+        except _re.error:
+            if p in name:        # fall back to substring on a bad regex
+                return True
+    return False
+
+
+def _tag_match(tags, tag_values):
+    """True if the scenario's tag set satisfies every --tags value (ANDed
+    across values; comma within one value is OR; ~/not negates a tag)."""
+    if not tag_values:
+        return True
+    def _norm(t):
+        return t if t.startswith("@") else "@" + t
+    for val in tag_values:
+        ok = False
+        for part in val.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            neg = False
+            if part.startswith("~"):
+                neg, part = True, part[1:]
+            elif part.lower().startswith("not "):
+                neg, part = True, part[4:].strip()
+            present = _norm(part) in tags
+            if present != neg:
+                ok = True
+                break
+        if not ok:
+            return False
+    return True
+
+
+def _discover_perf_scenarios(tests_filter=None):
+    """Pre-run, host-side discovery of what the perf container will execute.
+
+    Scans tests/api_tests and, for each scenario, counts it as @perf if tagged,
+    and as *running* if it also satisfies the Tests filter (--name / --tags).
+    Returns counts {total, perf, running, has_filter, per_file:[(rel, perf, run)]}
+    or None if the tests dir isn't present. Pure static scan, fast."""
+    api_dir = os.path.join(TESTS_DIR, PERF_FEATURES_SUBDIR)
+    if not os.path.isdir(api_dir):
+        return None
+    names, tags = _parse_tests_filter(tests_filter)
+    has_filter = bool(names or tags)
+    per_file, total, perf, running = [], 0, 0, 0
+    for root, dirs, fnames in os.walk(api_dir):
+        dirs.sort()
+        for fn in sorted(fnames):
+            if not fn.endswith(".feature"):
+                continue
+            p = os.path.join(root, fn)
+            f_perf = f_run = 0
+            for sc in _scan_feature_file(p):
+                total += sc["count"]
+                if PERF_RUN_TAG in sc["tags"]:
+                    f_perf += sc["count"]
+                    if _name_match(sc["name"], names) and _tag_match(sc["tags"], tags):
+                        f_run += sc["count"]
+            perf += f_perf
+            running += f_run
+            per_file.append((os.path.relpath(p, TESTS_DIR), f_perf, f_run))
+    return {
+        "dir": os.path.relpath(api_dir, TESTS_DIR),
+        "tag": PERF_RUN_TAG,
+        "files": len(per_file),
+        "total": total,
+        "perf": perf,
+        "running": running,
+        "has_filter": has_filter,
+        "per_file": per_file,
+    }
+
+
+def _log_scenario_discovery(pipeline_id: str) -> None:
+    """Emit the discovered-vs-running scenario summary at the start of a run."""
+    with _pipelines_lock():
+        rec = next((p for p in _load_pipelines() if p.get("id") == pipeline_id), None)
+    tests_filter = (rec or {}).get("tests") or None
+    disco = _discover_perf_scenarios(tests_filter)
+    if disco is None:
+        _append_pipeline_log(
+            pipeline_id,
+            f"[{_now_iso()}] test discovery: tests dir not found on host "
+            f"({TESTS_DIR}) -- cannot pre-count scenarios; the container will "
+            f"discover them itself.",
+        )
+        return
+    filt = (f" matching the Tests filter [{tests_filter}]"
+            if disco["has_filter"] else "")
+    running_files = [f"{rel} ({run})" for rel, _perf, run in disco["per_file"] if run]
+    lines = [
+        f"[{_now_iso()}] test discovery: scanned {disco['files']} feature file(s) "
+        f"under {disco['dir']} -- found {disco['total']} scenario(s); "
+        f"{disco['perf']} tagged {disco['tag']} -> RUNNING {disco['running']}{filt}.",
+    ]
+    if running_files:
+        lines.append(
+            f"[{_now_iso()}]   running scenarios in: {', '.join(running_files)}")
+    else:
+        lines.append(
+            f"[{_now_iso()}]   nothing matches -- this run will execute nothing "
+            f"and exit quickly.")
+    _append_pipeline_log(pipeline_id, *lines)
 
 
 def _run_pipeline(pipeline_id: str) -> None:
@@ -339,6 +833,7 @@ def _run_pipeline(pipeline_id: str) -> None:
     outermost try/except ensures even a bug here can't strand a record."""
     import shutil
     import subprocess
+    import threading
     import traceback
 
     final_status = None  # set by inner paths; the outer finally enforces it.
@@ -349,6 +844,10 @@ def _run_pipeline(pipeline_id: str) -> None:
             rec = next((p for p in pipelines if p.get("id") == pipeline_id), None)
         if rec is None:
             return
+
+        # Surface, at the top of the run log, how many scenarios were discovered
+        # and how many will actually execute (@perf) -- before the container starts.
+        _log_scenario_discovery(pipeline_id)
 
         assets = _discover_docker_assets()
         if not assets["dockerfile"]:
@@ -371,6 +870,11 @@ def _run_pipeline(pipeline_id: str) -> None:
             final_status = "failed"
             return
 
+        # Reuse the image if it's already built; otherwise build it once now.
+        if not _ensure_docker_image(pipeline_id, assets):
+            final_status = "failed"
+            return
+
         argv, envrc = _build_docker_command(rec, assets)
         _append_pipeline_log(
             pipeline_id,
@@ -386,7 +890,7 @@ def _run_pipeline(pipeline_id: str) -> None:
         try:
             proc = subprocess.Popen(
                 argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, bufsize=1,
+                text=True, bufsize=1, close_fds=True,
             )
         except FileNotFoundError:
             _append_pipeline_log(
@@ -405,35 +909,117 @@ def _run_pipeline(pipeline_id: str) -> None:
             final_status = "failed"
             return
 
+        # Runtime watchdog: a hung container (or a leaked stdout fd that never
+        # EOFs) would block this thread -- and thus the single-slot queue --
+        # forever. After MAX_RUNTIME_SEC, kill the container + docker client and
+        # close our read end so the loop below unblocks.
+        container_name = f"dokimos-{pipeline_id}"
+        timed_out = {"flag": False}
+        def _on_timeout():
+            timed_out["flag"] = True
+            try:
+                subprocess.run(["docker", "kill", container_name],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+            except Exception:
+                pass
+            try: proc.kill()
+            except Exception: pass
+            try: proc.stdout.close()   # unblocks a wedged readline in this thread
+            except Exception: pass
+        run_timeout_sec = int(rec.get("max_runtime_sec") or MAX_RUNTIME_SEC)
+        watchdog = threading.Timer(run_timeout_sec, _on_timeout)
+        watchdog.daemon = True
+        watchdog.start()
+
+        # Stream output, BATCHED. Writing pipelines.json per line is O(file size)
+        # each and degrades to O(n^2) on chatty containers -- the real cause of the
+        # runner grinding in json.dump and appearing wedged. Flush the buffer every
+        # ~40 lines or ~2s instead of once per line.
+        import time as _time
+        log_buf, pending_mut, last_flush = [], {}, [_time.monotonic()]
+        def _flush_logs(force=False):
+            if not log_buf and not pending_mut:
+                return
+            if force or len(log_buf) >= 40 or (_time.monotonic() - last_flush[0]) >= 2.0:
+                _append_pipeline_log(pipeline_id, *log_buf, **pending_mut)
+                log_buf.clear(); pending_mut.clear(); last_flush[0] = _time.monotonic()
+
+        # Live scenario progress: count distinct "Running Scenario <name>" lines
+        # and derive a rate-based ETA. `scenario_count` (the @perf total) is the
+        # denominator; if it's unknown we still report a running tally.
+        _scen_re = _scenario_marker_re()
+        _seen_scen = set()
+        _first_scen = [None]
+        _prog_total = rec.get("scenario_count")
+        def _update_progress(line):
+            m = _scen_re.search(line)
+            if not m:
+                return
+            name = m.group(1).strip()
+            if name in _seen_scen:
+                return
+            _seen_scen.add(name)
+            if _first_scen[0] is None:
+                _first_scen[0] = _time.monotonic()
+            done = len(_seen_scen)
+            elapsed = _time.monotonic() - _first_scen[0]
+            eta_sec = rate_pm = pct = None
+            if done > 0 and elapsed > 0:
+                rate = done / elapsed  # scenarios/sec
+                rate_pm = round(rate * 60, 1)
+                if _prog_total:
+                    pct = round(done / _prog_total * 100)
+                    eta_sec = int(max(0, _prog_total - done) / rate) if rate > 0 else None
+            pending_mut["progress"] = {
+                "done": done, "total": _prog_total, "pct": pct,
+                "eta_sec": eta_sec, "rate_per_min": rate_pm,
+                "updated_at": _now_iso(),
+            }
+
         image_missing_hint_emitted = False
         rp_url_found = None
+        rp_url_locked = False   # True once we have the authoritative numeric-id URL
         try:
             for raw_line in proc.stdout:
                 line = raw_line.rstrip("\r\n")
                 if not line:
                     continue
+                _update_progress(line)
                 # Surface a useful hint if Docker tells us the image isn't built.
                 if (not image_missing_hint_emitted and (
                     "Unable to find image" in line or "pull access denied" in line
                 )):
                     image_missing_hint_emitted = True
-                    _append_pipeline_log(
-                        pipeline_id,
+                    log_buf.extend([
                         line,
                         f"[{_now_iso()}] HINT: build the image first --",
                         f"[{_now_iso()}]   cd {assets['rel_root']}",
                         f"[{_now_iso()}]   DOCKER_BUILDKIT=1 docker build -f {assets['dockerfile']} -t {DOCKER_IMAGE} .",
-                    )
+                    ])
+                    _flush_logs(force=True)
                     continue
-                # Capture the first Report Portal URL we see.
-                if rp_url_found is None:
-                    m = _rp_url_re().search(line)
-                    if m:
-                        rp_url_found = m.group(1)
-                        _append_pipeline_log(pipeline_id, line, rp_url=rp_url_found)
+                # Capture the Report Portal launch link. The suite prints a launch
+                # id rather than a URL, so _extract_rp_url builds the deep-link. The
+                # UUID line prints before the numeric one, so accept a provisional
+                # UUID link and upgrade to the numeric id when it arrives, then lock.
+                if not rp_url_locked:
+                    rp_res = _extract_rp_url(line)
+                    if rp_res:
+                        cand, is_numeric = rp_res
+                        if is_numeric or rp_url_found is None:
+                            rp_url_found = cand
+                            pending_mut["rp_url"] = cand
+                            log_buf.append(line)
+                            log_buf.append(f"[{_now_iso()}] Report Portal launch: {cand}")
+                            _flush_logs(force=True)
+                        if is_numeric:
+                            rp_url_locked = True
                         continue
-                _append_pipeline_log(pipeline_id, line)
+                log_buf.append(line)
+                _flush_logs()
+            _flush_logs(force=True)
         except Exception as exc:
+            _flush_logs(force=True)
             # Unexpected error while streaming output -- log it but make sure
             # we still drain + wait the process and mark the pipeline failed.
             _append_pipeline_log(
@@ -443,6 +1029,8 @@ def _run_pipeline(pipeline_id: str) -> None:
                 f"[{_now_iso()}] traceback: {traceback.format_exc()}",
             )
             final_status = "failed"
+
+        watchdog.cancel()
 
         # Wait for the process even if streaming was interrupted.
         try:
@@ -454,15 +1042,35 @@ def _run_pipeline(pipeline_id: str) -> None:
                 pass
             rc = -1
 
-        # If we didn't already decide to fail (no exception above), use the
-        # process exit code to choose between finished and failed.
-        if final_status is None:
-            final_status = "finished" if rc == 0 else "failed"
-        _append_pipeline_log(
-            pipeline_id,
-            f"[{_now_iso()}] docker exited with code {rc} -- status: {final_status}",
-            status=final_status, finished_at=_now_iso(),
-        )
+        if timed_out["flag"]:
+            final_status = "failed"
+            _append_pipeline_log(
+                pipeline_id,
+                f"[{_now_iso()}] KILLED: exceeded max runtime ({run_timeout_sec}s); "
+                f"container {container_name} stopped. Marking failed so the queue advances.",
+                status="failed", finished_at=_now_iso(),
+            )
+        else:
+            # No timeout: use the process exit code (unless an earlier path
+            # already decided to fail) to choose between finished and failed.
+            if final_status is None:
+                final_status = "finished" if rc == 0 else "failed"
+            end_mut = {"status": final_status, "finished_at": _now_iso()}
+            # On a clean finish, peg the bar to 100% using the ACTUAL number of
+            # scenarios that ran (distinct "Running Scenario" markers), not the
+            # pre-run @perf estimate -- a Tests filter (e.g. --name) can narrow a
+            # run to a single scenario, and we want 1/1, not 1/179.
+            if final_status == "finished" and _seen_scen:
+                actual = len(_seen_scen)
+                end_mut["progress"] = {
+                    "done": actual, "total": actual, "pct": 100,
+                    "eta_sec": 0, "rate_per_min": None, "updated_at": _now_iso(),
+                }
+            _append_pipeline_log(
+                pipeline_id,
+                f"[{_now_iso()}] docker exited with code {rc} -- status: {final_status}",
+                **end_mut,
+            )
 
     except Exception as exc:
         # Catch-all outer guard: anything weird (lock errors, JSON corruption,
@@ -533,10 +1141,72 @@ def _reconcile_orphan_pipelines() -> int:
         return n
 
 
+def _dispatch_tick() -> None:
+    """One scheduling pass. Enforces **a single running pipeline at a time**:
+
+    1. Promote any `scheduled` job whose time has come into the queue, marked
+       `priority` so it takes the *front* of the line (it was due to run, but a
+       currently-running job is never preempted).
+    2. If nothing is `running`, dequeue the next job and start it. Order:
+       priority (scheduled-that-came-due) first, then FIFO by enqueue time.
+
+    Safe to call from the dispatcher loop or inline after enqueuing (it holds
+    the persistence lock and starts at most one runner)."""
+    to_start = None
+    with _pipelines_lock():
+        pipelines = _load_pipelines()
+        now = datetime.now().astimezone()
+        changed = False
+
+        # 1. Scheduled -> queued (front) when due.
+        for p in pipelines:
+            if p.get("status") != "scheduled":
+                continue
+            sf = p.get("scheduled_for")
+            if not sf:
+                continue
+            try:
+                sf_dt = datetime.fromisoformat(sf.replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            if sf_dt <= now:
+                p["status"] = "queued"
+                p["priority"] = True
+                p["queued_at"] = _now_iso()
+                p.setdefault("logs", []).append(
+                    f"[{p['queued_at']}] scheduled time reached -> queued (front of line)")
+                changed = True
+
+        # 2. Start the next job only if the single run slot is free.
+        if not any(p.get("status") == "running" for p in pipelines):
+            queued = [p for p in pipelines if p.get("status") == "queued"]
+            if queued:
+                # Priority (scheduled-due) first; within each group FIFO by when
+                # the job entered the queue.
+                queued.sort(key=lambda p: (
+                    not p.get("priority", False),
+                    p.get("queued_at") or p.get("created_at") or "",
+                ))
+                nxt = queued[0]
+                nxt["status"] = "running"
+                nxt["started_at"] = _now_iso()
+                nxt.setdefault("logs", []).append(
+                    f"[{nxt['started_at']}] dequeued -> running (run slot acquired)")
+                to_start = nxt["id"]
+                changed = True
+
+        if changed:
+            _save_pipelines(pipelines)
+
+    if to_start:
+        _start_runner(to_start)
+
+
 _SCHEDULER_STARTED = False
 def _ensure_pipeline_scheduler() -> None:
-    """Start the singleton scheduler thread on first call. Picks up scheduled
-    pipelines whose `scheduled_for` has arrived and kicks off their runners."""
+    """Start the singleton dispatcher thread on first call. It enforces a single
+    running pipeline at a time and drains the queue in FIFO order (scheduled
+    jobs that come due jump to the front). See `_dispatch_tick`."""
     global _SCHEDULER_STARTED
     if _SCHEDULER_STARTED:
         return
@@ -547,38 +1217,16 @@ def _ensure_pipeline_scheduler() -> None:
         import time as _time
         while True:
             try:
-                now = datetime.now().astimezone()
-                with _pipelines_lock():
-                    pipelines = _load_pipelines()
-                    changed = False
-                    to_launch = []
-                    for p in pipelines:
-                        if p.get("status") != "scheduled":
-                            continue
-                        sf = p.get("scheduled_for")
-                        if not sf:
-                            continue
-                        try:
-                            sf_dt = datetime.fromisoformat(sf.replace("Z", "+00:00"))
-                        except ValueError:
-                            continue
-                        if sf_dt <= now:
-                            p["status"] = "running"
-                            p["started_at"] = _now_iso()
-                            p.setdefault("logs", []).append(
-                                f"[{p['started_at']}] scheduler: due, launching docker"
-                            )
-                            to_launch.append(p["id"])
-                            changed = True
-                    if changed:
-                        _save_pipelines(pipelines)
-                for pid in to_launch:
-                    _start_runner(pid)
+                _dispatch_tick()
             except Exception:
                 pass
-            _time.sleep(15)
+            try:
+                _check_group_completions()
+            except Exception:
+                pass
+            _time.sleep(2)
 
-    threading.Thread(target=loop, daemon=True, name="pipeline-scheduler").start()
+    threading.Thread(target=loop, daemon=True, name="pipeline-dispatcher").start()
 
 
 def _load_pipelines() -> list:
@@ -604,19 +1252,212 @@ def _new_pipeline_id() -> str:
     return "pl_" + secrets.token_urlsafe(8).replace("-", "").replace("_", "")[:10]
 
 
+def _new_group_id() -> str:
+    return "grp_" + secrets.token_urlsafe(8).replace("-", "").replace("_", "")[:10]
+
+
+def _load_groups() -> dict:
+    if not os.path.isfile(GROUPS_FILE):
+        return {}
+    try:
+        with open(GROUPS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_groups(groups: dict) -> None:
+    """Atomic write (mirrors _save_pipelines). Guard with _pipelines_lock()."""
+    tmp = GROUPS_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(groups, f, indent=2)
+    os.replace(tmp, GROUPS_FILE)
+
+
+def _create_group_record(group_id: str, group_name: str, member_records: list) -> None:
+    """Persist a group record linking the N iteration pipelines. The shared
+    config snapshot drives the group view's config strip (all iterations share
+    the same config)."""
+    sample = member_records[0]
+    with _pipelines_lock():
+        groups = _load_groups()
+        groups[group_id] = {
+            "id":              group_id,
+            "name":            group_name,
+            "created_at":      _now_iso(),
+            "iteration_count": len(member_records),
+            "member_ids":      [r["id"] for r in member_records],
+            "config": {k: sample.get(k) for k in (
+                "env", "parallel", "feature", "tests", "max_runtime_sec",
+                "scenario_retry", "scenario_count", "scenario_total", "est_runtime_sec")},
+            "report_status":   "none",   # none | generating | ready | failed
+            "report":          None,
+            "report_error":    None,
+        }
+        _save_groups(groups)
+
+
+def _check_group_completions() -> None:
+    """Detect iteration groups whose every member reached a terminal state and
+    auto-generate the aggregated perf report exactly once. Called by the
+    dispatcher loop; the expensive generation runs in a worker thread."""
+    to_generate = []
+    with _pipelines_lock():
+        groups = _load_groups()
+        if not groups:
+            return
+        by_id = {p.get("id"): p for p in _load_pipelines()}
+        changed = False
+        for gid, g in groups.items():
+            if g.get("report_status") != "none":
+                continue
+            members = [by_id.get(mid) for mid in g.get("member_ids", [])]
+            members = [m for m in members if m]
+            if not members or not all(
+                    m.get("status") in ("finished", "failed") for m in members):
+                continue
+            g["report_status"] = "generating"
+            g["report_error"] = None
+            changed = True
+            to_generate.append((gid, [m.get("rp_url") for m in members if m.get("rp_url")]))
+        if changed:
+            _save_groups(groups)
+    for gid, urls in to_generate:
+        _start_group_report(gid, urls)
+
+
+def _start_group_report(group_id: str, urls: list) -> None:
+    import threading
+    threading.Thread(target=_run_group_report, args=(group_id, list(urls)),
+                     daemon=True, name=f"group-report-{group_id}").start()
+
+
+def _run_group_report(group_id: str, urls: list) -> None:
+    """Generate the aggregated password-protected perf report for a finished
+    group from its members' Report Portal launch links. Worker thread (the
+    generation does network I/O to Report Portal). Reuses _run_generation, so
+    the report is AES-256-GCM encrypted and stored under reports/ exactly like
+    a manual Generate-tab report. The one-time password is kept in memory."""
+    seen, deduped = set(), []
+    for u in urls:
+        if u and u not in seen:
+            seen.add(u)
+            deduped.append(u)
+    dropped = max(0, len(deduped) - GROUP_REPORT_MAX_LAUNCHES)
+    deduped = deduped[:GROUP_REPORT_MAX_LAUNCHES]
+    with _pipelines_lock():
+        g0 = _load_groups().get(group_id) or {}
+    dbx_dir = g0.get("report_dbx_dir") or None
+    dbx_temp = bool(g0.get("report_dbx_temp"))
+    try:
+        if not deduped:
+            raise RuntimeError(
+                "no Report Portal launches were produced by this group's runs "
+                "(RP disabled / token missing, or no run reached a launch)")
+        result = _run_generation(deduped, databricks_log_dir=dbx_dir)  # dict incl. report_password
+        password = result.pop("report_password", None)
+        result["dropped_launches"] = dropped
+        result["has_databricks"] = bool(dbx_dir)
+        with _pipelines_lock():
+            groups = _load_groups()
+            g = groups.get(group_id)
+            if g is not None:
+                g["report_status"] = "ready"
+                g["report"] = result
+                g["report_error"] = None
+                _save_groups(groups)
+        if password:
+            _group_report_passwords[group_id] = password
+    except Exception as exc:
+        with _pipelines_lock():
+            groups = _load_groups()
+            g = groups.get(group_id)
+            if g is not None:
+                g["report_status"] = "failed"
+                g["report_error"] = f"{type(exc).__name__}: {exc}"
+                _save_groups(groups)
+    finally:
+        # Remove the materialized upload tempdir and clear the marker so a later
+        # auto-regen doesn't point at a deleted dir.
+        if dbx_temp and dbx_dir:
+            import shutil
+            shutil.rmtree(dbx_dir, ignore_errors=True)
+            with _pipelines_lock():
+                groups = _load_groups()
+                g = groups.get(group_id)
+                if g is not None and g.get("report_dbx_temp"):
+                    g["report_dbx_dir"] = None
+                    g["report_dbx_temp"] = False
+                    _save_groups(groups)
+
+
+def _cleanup_pipelines(statuses=("failed",)) -> dict:
+    """Remove pipelines in the given terminal statuses (default: failed). Never
+    removes a running/queued/scheduled job. Prunes group member refs and drops
+    groups left with no members. Returns counts."""
+    statuses = tuple(s for s in statuses if s in ("failed", "finished"))
+    if not statuses:
+        return {"removed": 0, "groups_removed": 0}
+    with _pipelines_lock():
+        pipelines = _load_pipelines()
+        keep = [p for p in pipelines if p.get("status") not in statuses]
+        removed = len(pipelines) - len(keep)
+        if removed:
+            _save_pipelines(keep)
+        live_ids = {p.get("id") for p in keep}
+        groups = _load_groups()
+        groups_removed = 0
+        changed = False
+        for gid in list(groups.keys()):
+            mids = [m for m in groups[gid].get("member_ids", []) if m in live_ids]
+            if not mids:
+                del groups[gid]
+                _group_report_passwords.pop(gid, None)
+                groups_removed += 1
+                changed = True
+            elif len(mids) != len(groups[gid].get("member_ids", [])):
+                groups[gid]["member_ids"] = mids
+                changed = True
+        if changed:
+            _save_groups(groups)
+    return {"removed": removed, "groups_removed": groups_removed}
+
+
+def _reconcile_orphan_groups() -> int:
+    """A group left 'generating' at boot lost its worker thread on restart.
+    Flip it back to 'none' so the dispatcher regenerates (its members are
+    already terminal). Any in-memory password died with the old process."""
+    with _pipelines_lock():
+        groups = _load_groups()
+        n = 0
+        for g in groups.values():
+            if g.get("report_status") == "generating":
+                g["report_status"] = "none"
+                n += 1
+        if n:
+            _save_groups(groups)
+        return n
+
+
 def _now_iso() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
 
 
-def _create_pipeline(cfg: dict, iteration_index: int = 1, iteration_count: int = 1) -> dict:
+def _create_pipeline(cfg: dict, iteration_index: int = 1, iteration_count: int = 1,
+                     group_id: Optional[str] = None,
+                     group_name: Optional[str] = None) -> dict:
     """Build a new pipeline record from the run config posted by the SPA,
     persist it, and return the full record. When part of a multi-iteration
     burst, ``iteration_index`` / ``iteration_count`` drive name suffixing
-    (e.g. ``nightly-smoke-1``, ``nightly-smoke-2``)."""
+    (e.g. ``nightly-smoke-1``, ``nightly-smoke-2``) and ``group_id`` links the
+    iterations into one report package (see [groups.json])."""
     kind = cfg.get("kind") if cfg.get("kind") in _PIPELINE_KINDS else "now"
     now = datetime.now().astimezone()
     if kind == "now":
-        status, started_at, scheduled_for = "running", now.isoformat(timespec="seconds"), None
+        # `now` jobs enter the queue immediately; the dispatcher promotes one to
+        # `running` when the single run slot is free (FIFO).
+        status, started_at, scheduled_for = "queued", None, None
     else:
         status, started_at = "scheduled", None
         # Honour a client-provided scheduled_for (from the datetime modal) if
@@ -632,7 +1473,9 @@ def _create_pipeline(cfg: dict, iteration_index: int = 1, iteration_count: int =
         if not scheduled_for:
             scheduled_for = (now + timedelta(hours=1)).isoformat(timespec="seconds")
 
-    name = (cfg.get("name") or "").strip()
+    # For grouped bursts use the caller-provided stable group_name as the base
+    # so every iteration shares one prefix; otherwise fall back to cfg/default.
+    name = (group_name or cfg.get("name") or "").strip()
     if not name:
         # Generate a sensible default name.
         name = f"{kind}-{now.strftime('%Y%m%d-%H%M%S')}"
@@ -650,8 +1493,16 @@ def _create_pipeline(cfg: dict, iteration_index: int = 1, iteration_count: int =
         "parallel":      max(1, min(6, int(cfg.get("parallel") or 2))),
         "feature":       (cfg.get("feature") or "").strip(),
         "tests":         (cfg.get("tests") or "").strip(),
+        "max_runtime_sec": _clamp_max_runtime_sec(cfg.get("max_runtime_min")),
+        "scenario_retry": _clamp_scenario_retry(cfg.get("scenario_retry")),
+        "group_id":      group_id,
+        "group_name":    group_name,
+        "iteration_index": iteration_index,
+        "iteration_count": iteration_count,
         "created_at":    now.isoformat(timespec="seconds"),
         "scheduled_for": scheduled_for,
+        "queued_at":     now.isoformat(timespec="seconds") if kind == "now" else None,
+        "priority":      False,
         "started_at":    started_at,
         "finished_at":   None,
         "rp_url":        None,
@@ -668,8 +1519,50 @@ def _create_pipeline(cfg: dict, iteration_index: int = 1, iteration_count: int =
         record["logs"].append(f"[{record['created_at']}] feature: {record['feature']}")
     if record["tests"]:
         record["logs"].append(f"[{record['created_at']}] tests filter: {record['tests']}")
-    if status == "running":
-        record["logs"].append(f"[{record['created_at']}] state: running (waiting for runner)")
+    record["logs"].append(
+        f"[{record['created_at']}] max runtime: {record['max_runtime_sec']}s "
+        f"({record['max_runtime_sec'] // 60} min) -- watchdog kills the run past this"
+    )
+    record["logs"].append(
+        f"[{record['created_at']}] scenario retries: {record['scenario_retry']} "
+        f"attempt(s) per scenario (IFP_SCENARIO_RETRY; 1 = no retry)"
+    )
+
+    # Pre-run discovery + a rough duration estimate for the job-config panel.
+    # @perf scenarios all live in one feature, and feature-scheme parallelism
+    # can't split one file, so effective parallelism is the number of distinct
+    # selected feature files (capped by the thread count) -- usually 1.
+    disco = _discover_perf_scenarios(record["tests"])
+    if disco:
+        run_n = disco["running"]
+        files_with_sel = sum(1 for _rel, _perf, run in disco["per_file"] if run)
+        eff_par = max(1, min(record["parallel"], files_with_sel or 1))
+        # Fixed per-iteration overhead + scenario time spread across the effective
+        # parallelism (scenarios divide, overhead doesn't).
+        est_sec = int(EST_FIXED_OVERHEAD_SEC + -(-(run_n * EST_SEC_PER_SCENARIO) // eff_par)) if run_n else 0
+        record["scenario_count"] = run_n            # filter-aware: what actually runs
+        record["scenario_total"] = disco["total"]
+        record["scenario_files"] = files_with_sel
+        record["effective_parallel"] = eff_par
+        record["est_runtime_sec"] = est_sec
+        filt = " (Tests filter applied)" if disco["has_filter"] else ""
+        record["logs"].append(
+            f"[{record['created_at']}] discovered {disco['perf']} @perf scenario(s) "
+            f"(of {disco['total']} in api_tests); RUNNING {run_n}{filt} across "
+            f"{files_with_sel} file(s); effective parallelism {eff_par} -> "
+            f"est. runtime ~{max(1, round(est_sec / 60))} min "
+            f"(@~{EST_SEC_PER_SCENARIO:g}s/scenario, retries excluded)"
+        )
+    else:
+        record["scenario_count"] = None
+        record["scenario_total"] = None
+        record["scenario_files"] = None
+        record["effective_parallel"] = None
+        record["est_runtime_sec"] = None
+
+    if status == "queued":
+        record["logs"].append(
+            f"[{record['created_at']}] state: queued (waiting for the run slot, FIFO)")
     else:
         record["logs"].append(
             f"[{record['created_at']}] state: scheduled for {scheduled_for}"
@@ -1277,8 +2170,77 @@ def _generate_report_password() -> str:
     return secrets.token_urlsafe(12)
 
 
+# Credential keys the report generator needs; sourced from tests/.envrc when
+# absent from the SPA process env (systemd services don't inherit the shell env,
+# so RP_TOKEN -- which the test suite keeps in .envrc -- isn't present here).
+_RP_ENVRC_KEYS = ("RP_TOKEN", "RP_API_BASE", "DISNEY_DD_API_KEY", "DISNEY_DD_APP_KEY")
+
+
+def _rp_envrc_path() -> Optional[str]:
+    override = os.environ.get("DOKIMOS_PERF_ENVRC")
+    if override and os.path.isfile(override):
+        return override
+    if TESTS_DIR:
+        cand = os.path.join(TESTS_DIR, "tests", ".envrc")
+        if os.path.isfile(cand):
+            return cand
+    return None
+
+
+def _parse_envrc(path: str) -> dict:
+    """Best-effort parse of `export KEY=value` lines for the RP/DD credential
+    keys. Pure text parsing -- never executes the file. Skips values that need
+    shell evaluation ($(...), backticks, ${...})."""
+    import re as _re
+    out = {}
+    pat = _re.compile(r"^\s*(?:export\s+)?([A-Z_][A-Z0-9_]*)\s*=\s*(.*?)\s*$")
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if line.lstrip().startswith("#"):
+                    continue
+                m = pat.match(line)
+                if not m or m.group(1) not in _RP_ENVRC_KEYS:
+                    continue
+                v = m.group(2)
+                if v[:1] in ("\"", "'") and v[-1:] == v[:1]:
+                    v = v[1:-1]
+                if "$(" in v or "`" in v or v.startswith("$"):
+                    continue
+                out[m.group(1)] = v
+    except OSError:
+        return {}
+    return out
+
+
+def _ensure_rp_credentials() -> None:
+    """Make RP_TOKEN (+ RP_API_BASE, optional Datadog keys) available to the
+    report generator. The SPA runs as a systemd service that does NOT inherit
+    the shell env, so RP_TOKEN isn't present even though the test suite uses it
+    constantly -- it lives in tests/.envrc (owned/readable by this user). Load
+    it from there when missing, into BOTH os.environ and the analyzer module
+    globals (analyzer.py binds TOKEN/API_BASE at import time)."""
+    if not os.environ.get("RP_TOKEN"):
+        path = _rp_envrc_path()
+        if path:
+            vals = _parse_envrc(path)
+            for k in _RP_ENVRC_KEYS:
+                if vals.get(k) and not os.environ.get(k):
+                    os.environ[k] = vals[k]
+    import sys as _sys
+    mod = _sys.modules.get("rp_perf_report.analyzer") or _sys.modules.get("analyzer")
+    if mod is not None:
+        for env_key, attr in (("RP_TOKEN", "TOKEN"), ("RP_API_BASE", "API_BASE"),
+                              ("DISNEY_DD_API_KEY", "DD_API_KEY"),
+                              ("DISNEY_DD_APP_KEY", "DD_APP_KEY")):
+            val = os.environ.get(env_key)
+            if val and hasattr(mod, attr):
+                setattr(mod, attr, val)
+
+
 def _run_generation(urls: list, payload_key: Optional[str] = None,
                     databricks_log_dir: Optional[str] = None) -> dict:
+    _ensure_rp_credentials()
     report_password = _generate_report_password()
     html, meta = generate_report_for_urls(
         urls,
@@ -1770,9 +2732,22 @@ html, body {
 }
 .pipeline-item .rp-link:hover { color: #ffa867; }
 .pipeline-item.status-running   { border-left-color: #60a5fa; }
+.pipeline-item.status-queued    { border-left-color: #a78bfa; }
 .pipeline-item.status-scheduled { border-left-color: #f59e0b; }
 .pipeline-item.status-finished  { border-left-color: #10b981; }
 .pipeline-item.status-failed    { border-left-color: var(--red); }
+.pipeline-item-actions { margin-top: 6px; }
+.pipeline-rerun-btn {
+    background: transparent;
+    color: var(--bronze);
+    border: 1px solid var(--bronze-dk);
+    border-radius: 6px;
+    padding: 3px 10px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    cursor: pointer;
+}
+.pipeline-rerun-btn:hover { background: rgba(205,127,50,0.18); color: var(--bronze-lt); }
 
 .pipelines-view {
     display: flex;
@@ -1806,6 +2781,7 @@ html, body {
     color: var(--white-soft);
 }
 .pipelines-view-status .status-running   { background: rgba(96,165,250,0.25); color: #93c5fd; }
+.pipelines-view-status .status-queued    { background: rgba(167,139,250,0.20); color: #c4b5fd; }
 .pipelines-view-status .status-scheduled { background: rgba(245,158,11,0.20); color: #fcd34d; }
 .pipelines-view-status .status-finished  { background: rgba(16,185,129,0.22); color: #6ee7b7; }
 .pipelines-view-status .status-failed    { background: rgba(226,101,101,0.22); color: #fca5a5; }
@@ -1964,6 +2940,119 @@ html, body {
     white-space: pre-wrap;
     word-break: break-word;
 }
+
+/* ----- Iteration groups (visual wrapper around member pipelines) ----- */
+.pipeline-group-wrap {
+    border: 1px solid rgba(176,141,87,0.5); border-radius: 8px; margin: 8px 0;
+    background: rgba(176,141,87,0.06); overflow: hidden;
+}
+.pipeline-group-head {
+    display: flex; align-items: center; gap: 8px; padding: 8px 10px; cursor: pointer;
+    font-weight: 600; background: rgba(176,141,87,0.12);
+    border-bottom: 1px solid rgba(176,141,87,0.25);
+}
+.pipeline-group-head:hover { background: rgba(176,141,87,0.20); }
+.pipeline-group-head.active { background: rgba(176,141,87,0.32); }
+.pipeline-group-members { padding: 4px 6px 6px 12px; }
+.pipeline-group-members .pipeline-item { margin: 3px 0; }
+.group-count { opacity: 0.6; font-size: 12px; }
+.group-badge { font-size: 11px; opacity: 0.75; margin-left: auto; }
+.group-badge-done { color: #3fb950; opacity: 0.95; }
+/* ----- Group view (right panel): hero ring + cards ----- */
+.pipelines-view-group { flex: 1; overflow: auto; padding: 20px 22px; }
+/* Fill 100% of the logs panel: left (config/iterations) + right (report) columns. */
+.gv { display: flex; flex-direction: row; align-items: flex-start; gap: 18px; width: 100%; }
+.gv-main { flex: 1 1 0; min-width: 0; display: flex; flex-direction: column; gap: 16px; }
+.gv-side { flex: 1 1 0; min-width: 0; position: sticky; top: 0; display: flex; flex-direction: column; gap: 16px; }
+.gv-side .gv-card { margin: 0; }
+@media (max-width: 900px) {
+    .gv { flex-direction: column; }
+    .gv-main, .gv-side { flex: 1 1 auto; width: 100%; position: static; }
+}
+.gv-hero { display: flex; align-items: center; gap: 20px; padding: 18px 20px; border-radius: 14px;
+    background: linear-gradient(135deg, rgba(176,141,87,0.12), rgba(255,255,255,0.015));
+    border: 1px solid rgba(176,141,87,0.28); }
+.gv-ring { width: 86px; height: 86px; border-radius: 50%; flex: 0 0 auto; display: flex;
+    align-items: center; justify-content: center; transition: background .6s ease; }
+.gv-ring-in { width: 64px; height: 64px; border-radius: 50%; background: var(--bg-dark, #0d1117);
+    display: flex; align-items: center; justify-content: center; }
+.gv-ring-pct { font: 700 21px var(--font-mono); color: #e6edf3; }
+.gv-hero-meta { display: flex; flex-direction: column; gap: 7px; min-width: 0; }
+.gv-hero-h1 { font-size: 24px; font-weight: 700; color: #e6edf3; }
+.gv-hero-h2 { font-size: 16px; color: #9aa4af; }
+.gv-chips { display: flex; gap: 7px; flex-wrap: wrap; margin-top: 4px; }
+.gv-chip { font-size: 13px; font-weight: 600; padding: 3px 12px; border-radius: 999px;
+    background: rgba(255,255,255,0.07); color: #c9d1d9; }
+.gv-chip-running { background: rgba(88,166,255,0.18); color: #79b8ff; }
+.gv-chip-finished { background: rgba(63,185,80,0.18); color: #56d364; }
+.gv-chip-failed { background: rgba(248,81,73,0.18); color: #f85149; }
+.gv-chip-queued, .gv-chip-scheduled { background: rgba(176,141,87,0.20); color: #d6b98a; }
+.gv-card { padding: 14px 16px; border-radius: 12px; background: rgba(255,255,255,0.025);
+    border: 1px solid rgba(255,255,255,0.07); }
+.gv-card-h { font-size: 13px; font-weight: 700; text-transform: uppercase; letter-spacing: .07em;
+    color: #9aa4af; margin-bottom: 12px; }
+.gv-card-sub { font-weight: 400; text-transform: none; letter-spacing: 0; opacity: 0.7; margin-left: 6px; }
+.gv .pipelines-view-config-grid { font-size: 14px; row-gap: 9px; }
+.gv .pipelines-view-config-grid strong { font-size: 13px; }
+.gv-iters { display: flex; flex-direction: column; gap: 6px; }
+.gv-iter { display: flex; align-items: center; gap: 12px; padding: 10px 12px; border-radius: 8px;
+    background: rgba(255,255,255,0.02); cursor: pointer; font-size: 14px; transition: background .15s; }
+.gv-iter:hover { background: rgba(255,255,255,0.07); }
+.gv-iter-idx { font-family: var(--font-mono); font-size: 14px; opacity: 0.6; min-width: 34px; }
+.gv-iter-status { min-width: 78px; font-size: 13px; font-weight: 600; text-transform: capitalize; }
+.gv-st-finished { color: #3fb950; } .gv-st-failed { color: #f85149; }
+.gv-st-running { color: #58a6ff; } .gv-st-queued, .gv-st-scheduled { color: #d6b98a; }
+.gv-iter-bar { flex: 1; height: 6px; background: #21262d; border-radius: 3px; overflow: hidden; }
+.gv-iter-bar > span { display: block; height: 100%; transition: width .6s ease; }
+.gv-iter-num { font-family: var(--font-mono); font-size: 14px; opacity: 0.65; min-width: 58px; text-align: right; }
+.gv-iter-norp { opacity: 0.4; font-size: 13px; min-width: 64px; text-align: right; }
+/* report card */
+.gv-report-ready { border-color: rgba(63,185,80,0.38); background: rgba(63,185,80,0.05); }
+.gv-report-failed { border-color: rgba(248,81,73,0.38); background: rgba(248,81,73,0.05); }
+.gv-report-badge { display: inline-block; font-size: 13px; font-weight: 700; padding: 2px 10px;
+    border-radius: 999px; background: rgba(63,185,80,0.22); color: #56d364; margin-right: 8px; }
+.gv-report-meta { font-size: 16px; color: #d6dde5; margin-bottom: 14px; }
+.gv-report-busy { font-size: 15px; color: #9aa4af; display: flex; align-items: center; gap: 8px; }
+.gv-report-wait { font-size: 15px; color: #9aa4af; }
+.gv-report-err { font-family: var(--font-mono); font-size: 13px; color: #f85149; margin-bottom: 12px; word-break: break-word; }
+.gv-report-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.gv-dbx { flex: 1; min-width: 240px; font-family: var(--font-mono); font-size: 14px; padding: 10px 12px;
+    border-radius: 8px; border: 1px solid rgba(255,255,255,0.15); background: var(--bg-dark, #0d1117); color: #e6edf3; }
+.gv-dbx:focus { outline: none; border-color: rgba(176,141,87,0.65); }
+.gv-dbx-hint { font-size: 13px; opacity: 0.6; margin-top: 8px; }
+.gv-dbx-section { margin: 4px 0 12px; }
+.gv-dbx-section .dbx-dropzone { margin: 0; }
+.gv-btn { font-family: var(--font-mono); font-size: 13px; font-weight: 700; letter-spacing: 0.06em;
+    text-transform: uppercase; padding: 10px 18px; border-radius: 8px; cursor: pointer;
+    border: 1px solid transparent; text-decoration: none; display: inline-flex; align-items: center; gap: 6px;
+    white-space: nowrap; transition: background .12s, color .12s, border-color .12s; }
+.gv-btn-primary { background: var(--bronze); color: var(--bg-dark); border-color: var(--bronze); }
+.gv-btn-primary:hover { background: var(--bronze-lt); border-color: var(--bronze-lt); }
+/* "Generate report" (regen) state stays in the gold palette, just brighter. */
+.gv-btn-primary.regen { background: var(--bronze-lt); border-color: var(--bronze-lt); }
+.gv-btn-primary.regen:hover { background: var(--bronze); border-color: var(--bronze); }
+.gv-btn-ghost { background: transparent; color: var(--bronze-lt); border-color: var(--bronze-dk); }
+.gv-btn-ghost:hover { background: rgba(205,127,50,0.15); color: var(--bronze-lt); border-color: var(--bronze); }
+.gv-pw { margin-top: 16px; }
+.gv-pw label { display: block; font-size: 14px; color: #c9d1d9; margin-bottom: 7px; }
+.gv-pw-warn { color: #d29922; font-weight: 500; }
+.gv-pw-row { display: flex; gap: 8px; max-width: 480px; }
+.gv-pw-row input { flex: 1; font-family: var(--font-mono); font-size: 15px; letter-spacing: 1px;
+    padding: 10px 12px; border-radius: 8px; border: 1px solid rgba(210,153,34,0.4);
+    background: rgba(210,153,34,0.08); color: #f0d999; }
+.gv-pw-gone { margin-top: 16px; font-size: 14px; opacity: 0.85; }
+.group-error { padding: 18px; color: #f85149; }
+.pipelines-cleanup-btn {
+    float: right; font-size: 11px; cursor: pointer; padding: 1px 8px; border-radius: 4px;
+    border: 1px solid rgba(248,81,73,0.45); background: transparent; color: #f85149;
+}
+.pipelines-cleanup-btn:hover { background: rgba(248,81,73,0.14); }
+.pipeline-kill-btn {
+    font-size: 11px; cursor: pointer; padding: 1px 8px; border-radius: 4px;
+    border: 1px solid rgba(248,81,73,0.5); background: transparent; color: #f85149;
+}
+.pipeline-kill-btn:hover { background: rgba(248,81,73,0.16); }
+.group-rerun-btn { margin-left: 8px; }
 
 /* ----- Cards (Dokimos "std_card") ----- */
 .card {
@@ -2624,6 +3713,18 @@ SPA_HTML = f"""<!DOCTYPE html>
                     <input type="number" id="testsIterations" min="1" max="50" value="1"
                            title="Number of identical pipelines to enqueue">
                 </div>
+                <div class="tests-control">
+                    <label>Max runtime (min)</label>
+                    <input type="number" id="testsMaxRuntime" min="1" max="{MAX_RUNTIME_CEILING_MIN}"
+                           value="{MAX_RUNTIME_SEC // 60}"
+                           title="Watchdog kills the run if it exceeds this many minutes">
+                </div>
+                <div class="tests-control">
+                    <label>Retries</label>
+                    <input type="number" id="testsRetries" min="1" max="{SCENARIO_RETRY_CEILING}"
+                           value="{SCENARIO_RETRY_DEFAULT}"
+                           title="Attempts per scenario (IFP_SCENARIO_RETRY); 1 = run once, no retry">
+                </div>
                 <div class="tests-control tests-control-grow">
                     <label>Name <span class="opt">(optional)</span></label>
                     <input type="text" id="testsName" placeholder="e.g. nightly-smoke-2026-06-03">
@@ -2669,7 +3770,9 @@ SPA_HTML = f"""<!DOCTYPE html>
                         <span class="pipelines-view-status" id="pipelinesViewStatus"></span>
                     </div>
                     <div class="pipelines-view-config" id="pipelinesViewConfig" hidden></div>
+                    <div class="pipelines-view-progress" id="pipelinesViewProgress" hidden></div>
                     <pre class="pipelines-view-logs" id="pipelinesViewLogs">No pipeline selected.</pre>
+                    <div class="pipelines-view-group" id="pipelinesViewGroup" hidden></div>
                 </main>
             </div>
         </section>
@@ -2749,6 +3852,7 @@ SPA_HTML = f"""<!DOCTYPE html>
             document.querySelectorAll('.tab-panel').forEach(function(p) {{
                 p.classList.toggle('active', p.getAttribute('data-panel') === name);
             }});
+            if (name !== 'pipelines') _leaveGroupView();
             if (name === 'reports') refreshReports();
             if (name === 'tests') {{ _loadTestsTree(); _loadTestsEnvs(); }}
             if (name === 'pipelines') {{ _enterPipelinesTab(); }}
@@ -2797,13 +3901,21 @@ SPA_HTML = f"""<!DOCTYPE html>
             let iters = parseInt(document.getElementById('testsIterations').value, 10);
             if (!Number.isFinite(iters) || iters < 1) iters = 1;
             if (iters > 50) iters = 50;
+            let maxrt = parseInt(document.getElementById('testsMaxRuntime').value, 10);
+            if (!Number.isFinite(maxrt) || maxrt < 1) maxrt = {MAX_RUNTIME_SEC // 60};
+            if (maxrt > {MAX_RUNTIME_CEILING_MIN}) maxrt = {MAX_RUNTIME_CEILING_MIN};
+            let retries = parseInt(document.getElementById('testsRetries').value, 10);
+            if (!Number.isFinite(retries) || retries < 1) retries = {SCENARIO_RETRY_DEFAULT};
+            if (retries > {SCENARIO_RETRY_CEILING}) retries = {SCENARIO_RETRY_CEILING};
             return {{
-                env:        document.getElementById('testsEnv').value,
-                parallel:   parseInt(document.getElementById('testsParallel').value, 10),
-                name:       document.getElementById('testsName').value.trim(),
-                feature:    document.getElementById('testsFeature').value.trim(),
-                tests:      document.getElementById('testsFilter').value.trim(),
-                iterations: iters,
+                env:            document.getElementById('testsEnv').value,
+                parallel:       parseInt(document.getElementById('testsParallel').value, 10),
+                name:           document.getElementById('testsName').value.trim(),
+                feature:        document.getElementById('testsFeature').value.trim(),
+                tests:          document.getElementById('testsFilter').value.trim(),
+                max_runtime_min: maxrt,
+                scenario_retry: retries,
+                iterations:     iters,
             }};
         }}
 
@@ -2883,8 +3995,37 @@ SPA_HTML = f"""<!DOCTYPE html>
 
         // ----- Pipelines tab -----
         let _selectedPipelineId = null;
+        let _selectedGroupId    = null;   // when set, the right panel shows the group view (no logs)
+        let _expandedGroups     = new Set();
         let _pipelinesPollTimer = null;
         let _logsPollTimer      = null;
+        let _medianRunSec = 0;   // updated each render from past run durations
+
+        function _computeMedianRunSec(pipelines) {{
+            const durs = [];
+            (pipelines || []).forEach(function(p) {{
+                if (p.started_at && p.finished_at) {{
+                    const d = (new Date(p.finished_at) - new Date(p.started_at)) / 1000;
+                    if (d > 10 && d < 3 * 3600) durs.push(d);
+                }}
+            }});
+            if (!durs.length) return 0;
+            durs.sort(function(a, b) {{ return a - b; }});
+            return durs[Math.floor(durs.length / 2)];
+        }}
+
+        function _etaText(p) {{
+            // Estimated finish for a running pipeline, from the median past duration.
+            if (p.status !== 'running' || !p.started_at || _medianRunSec <= 0) return '';
+            const started = new Date(p.started_at).getTime();
+            if (isNaN(started)) return '';
+            const etaMs = started + _medianRunSec * 1000;
+            const remMin = Math.round((etaMs - Date.now()) / 60000);
+            const clock = new Date(etaMs).toLocaleTimeString();
+            return remMin > 0
+                ? (' · ~' + remMin + ' min left (est. finish ' + clock + ')')
+                : ' · past estimate, finishing…';
+        }}
 
         function _humanWhen(iso) {{
             if (!iso) return '';
@@ -2902,10 +4043,12 @@ SPA_HTML = f"""<!DOCTYPE html>
             ].join(' · ');
             const timing = (p.status === 'scheduled')
                 ? 'scheduled for ' + _humanWhen(p.scheduled_for)
+                : (p.status === 'queued')
+                    ? ('queued ' + _humanWhen(p.queued_at || p.created_at) + (p.priority ? ' · priority' : ''))
                 : (p.status === 'finished')
                     ? 'finished ' + _humanWhen(p.finished_at)
                     : (p.status === 'running')
-                        ? 'started ' + _humanWhen(p.started_at || p.created_at)
+                        ? ('started ' + _humanWhen(p.started_at || p.created_at) + _etaText(p))
                         : 'created ' + _humanWhen(p.created_at);
             const rp = p.rp_url
                 ? '<a class="rp-link" href="' + _testsEscape(p.rp_url) + '" target="_blank" rel="noopener noreferrer" onclick="event.stopPropagation()">Report Portal &rarr;</a>'
@@ -2914,43 +4057,156 @@ SPA_HTML = f"""<!DOCTYPE html>
             // Pulsing green dot for the running ones -- visible-at-a-glance
             // signal that something is actually in flight.
             const liveDot = (p.status === 'running') ? '<span class="live-dot" title="running"></span>' : '';
+            // Re-run button for terminal states. stopPropagation so clicking it
+            // doesn't also select/open the pipeline. Enqueues a fresh pipeline
+            // with the same config at the end of the queue.
+            let actions = '';
+            if (p.status === 'finished' || p.status === 'failed') {{
+                actions = '<div class="pipeline-item-actions">'
+                    +   '<button class="pipeline-rerun-btn" title="Re-run with the same configuration" '
+                    +     'onclick="event.stopPropagation(); _rerunPipeline(\\'' + _testsEscape(p.id) + '\\')">&#8635; rerun</button>'
+                    + '</div>';
+            }} else if (p.status === 'running') {{
+                actions = '<div class="pipeline-item-actions">'
+                    +   '<button class="pipeline-kill-btn" title="Kill this running pipeline" '
+                    +     'onclick="event.stopPropagation(); _killPipeline(\\'' + _testsEscape(p.id) + '\\')">&#10005; kill</button>'
+                    + '</div>';
+            }}
             return '<div class="' + cls + '" onclick="_selectPipeline(\\'' + _testsEscape(p.id) + '\\')">'
                  +   '<div class="pipeline-item-name">' + liveDot + _testsEscape(p.name) + '</div>'
                  +   '<div class="pipeline-item-meta">' + _testsEscape(meta) + '</div>'
                  +   '<div class="pipeline-item-meta">' + _testsEscape(timing) + '</div>'
                  +   (rp ? '<div>' + rp + '</div>' : '')
+                 +   actions
                  + '</div>';
+        }}
+
+        function _groupRowHtml(gid, info) {{
+            // A visual wrapper box: a clickable group header (-> aggregate group
+            // view) with the individual iteration pipelines nested inside (each
+            // still clickable -> its own logs).
+            const members = info.members.slice().sort(function(a, b) {{
+                return (a.iteration_index || 0) - (b.iteration_index || 0);
+            }});
+            const total = members.length;
+            const done = members.filter(function(m) {{ return m.status === 'finished' || m.status === 'failed'; }}).length;
+            const running = members.some(function(m) {{ return m.status === 'running'; }});
+            const allDone = done === total && total > 0;
+            const liveDot = running ? '<span class="live-dot" title="running"></span>' : '';
+            const tag = allDone
+                ? '<span class="group-badge group-badge-done">done &middot; open report</span>'
+                : '<span class="group-badge">' + done + '/' + total + ' done</span>';
+            const headCls = 'pipeline-group-head' + (gid === _selectedGroupId ? ' active' : '');
+            // Re-run the whole group once it's terminal (enqueues a fresh group).
+            const rerun = allDone
+                ? '<button class="pipeline-rerun-btn group-rerun-btn" title="Re-run the whole group" '
+                +   'onclick="event.stopPropagation(); _rerunGroup(\\'' + _testsEscape(gid) + '\\')">&#8635; rerun group</button>'
+                : '';
+            return '<div class="pipeline-group-wrap">'
+                 +   '<div class="' + headCls + '" onclick="_selectGroup(\\'' + _testsEscape(gid) + '\\')">'
+                 +     '<span class="pipeline-item-name">' + liveDot + _testsEscape(info.name) + '</span>'
+                 +     '<span class="group-count">&times;' + total + '</span>'
+                 +     tag + rerun
+                 +   '</div>'
+                 +   '<div class="pipeline-group-members">'
+                 +     members.map(_pipelineItemHtml).join('')
+                 +   '</div>'
+                 + '</div>';
+        }}
+
+        // A group's aggregate status decides which status section it sits in,
+        // alongside single pipelines (running wins, then queued/scheduled, then
+        // failed if any failed, else finished).
+        function _groupAggStatus(members) {{
+            if (members.some(function(m) {{ return m.status === 'running'; }})) return 'running';
+            if (members.some(function(m) {{ return m.status === 'queued'; }})) return 'queued';
+            if (members.some(function(m) {{ return m.status === 'scheduled'; }})) return 'scheduled';
+            if (members.some(function(m) {{ return m.status === 'failed'; }})) return 'failed';
+            return 'finished';
         }}
 
         function _renderPipelinesList(pipelines) {{
             const panel = document.getElementById('pipelinesListPanel');
             if (!panel) return;
-            const buckets = {{ running: [], scheduled: [], finished: [], failed: [] }};
+            _medianRunSec = _computeMedianRunSec(pipelines);
+            // Each entry is either a single pipeline or a whole group wrapper, and
+            // is filed into the SAME status section it belongs to. Grouped
+            // iterations render inside their group wrapper (not as loose rows).
+            const groups = {{}};   // gid -> {{name, members:[], created}}
+            const singles = [];
             (pipelines || []).forEach(function(p) {{
-                (buckets[p.status] || (buckets.finished)).push(p);
+                if (p.group_id) {{
+                    (groups[p.group_id] || (groups[p.group_id] = {{name: p.group_name || p.group_id, members: [], created: p.created_at}})).members.push(p);
+                }} else {{
+                    singles.push(p);
+                }}
             }});
-            // Sort: running by start desc, scheduled by scheduled_for asc, finished by finished_at desc.
-            buckets.running.sort(function(a, b) {{ return (b.started_at || '').localeCompare(a.started_at || ''); }});
-            buckets.scheduled.sort(function(a, b) {{ return (a.scheduled_for || '').localeCompare(b.scheduled_for || ''); }});
-            buckets.finished.sort(function(a, b) {{ return (b.finished_at || b.created_at || '').localeCompare(a.finished_at || a.created_at || ''); }});
-            buckets.failed.sort(function(a, b) {{ return (b.finished_at || b.created_at || '').localeCompare(a.finished_at || a.created_at || ''); }});
+            const buckets = {{ running: [], queued: [], scheduled: [], finished: [], failed: [] }};
+            singles.forEach(function(p) {{
+                const e = {{kind: 'single', p: p, ts: (p.finished_at || p.started_at || p.queued_at || p.created_at || '')}};
+                (buckets[p.status] || buckets.finished).push(e);
+            }});
+            Object.keys(groups).forEach(function(gid) {{
+                const info = groups[gid];
+                const st = _groupAggStatus(info.members);
+                const tss = info.members.map(function(m) {{ return (m.finished_at || m.started_at || m.queued_at || m.created_at || ''); }}).sort();
+                buckets[st].push({{kind: 'group', gid: gid, info: info, ts: tss[tss.length - 1] || info.created || ''}});
+            }});
+            // Sort each section: scheduled ascending (soonest first), others most-recent first.
+            Object.keys(buckets).forEach(function(st) {{
+                buckets[st].sort(function(a, b) {{
+                    return st === 'scheduled' ? a.ts.localeCompare(b.ts) : b.ts.localeCompare(a.ts);
+                }});
+            }});
 
-            function section(label, items) {{
+            function renderEntry(e) {{
+                return e.kind === 'group' ? _groupRowHtml(e.gid, e.info) : _pipelineItemHtml(e.p);
+            }}
+            function section(label, items, action) {{
                 const body = items.length
-                    ? items.map(_pipelineItemHtml).join('')
+                    ? items.map(renderEntry).join('')
                     : '<div class="pipelines-list-empty">none</div>';
                 return '<div class="pipelines-list-section">'
                      +   '<div class="pipelines-list-section-title">' + label
                      +     ' <span class="count">' + items.length + '</span>'
+                     +     (action || '')
                      +   '</div>'
                      +   body
                      + '</div>';
             }}
+            const failedAction = buckets.failed.length
+                ? '<button class="pipelines-cleanup-btn" title="Remove all failed pipelines" onclick="event.stopPropagation(); _cleanupStatus(\\'failed\\')">clear all</button>'
+                : '';
+            const finishedAction = buckets.finished.length
+                ? '<button class="pipelines-cleanup-btn" title="Remove all finished pipelines" onclick="event.stopPropagation(); _cleanupStatus(\\'finished\\')">clear all</button>'
+                : '';
             panel.innerHTML =
                   section('Running',   buckets.running)
+                + section('Queued',    buckets.queued)
                 + section('Scheduled', buckets.scheduled)
-                + section('Finished',  buckets.finished)
-                + section('Failed',    buckets.failed);
+                + section('Finished',  buckets.finished, finishedAction)
+                + section('Failed',    buckets.failed, failedAction);
+        }}
+
+        async function _cleanupStatus(status) {{
+            if (!window.confirm('Remove all ' + status + ' pipelines? This cannot be undone.')) return;
+            try {{
+                const res = await fetch('/api/pipelines/cleanup', {{
+                    method: 'POST',
+                    headers: {{'Content-Type': 'application/json'}},
+                    body: JSON.stringify({{statuses: [status]}}),
+                }});
+                if (res.ok) {{
+                    // If the open pipeline was just removed, reset the view.
+                    _selectedPipelineId = null;
+                    const logs = document.getElementById('pipelinesViewLogs');
+                    if (logs) {{ logs.hidden = false; logs.textContent = 'No pipeline selected.'; }}
+                    ['pipelinesViewConfig', 'pipelinesViewProgress'].forEach(function(id) {{
+                        const el = document.getElementById(id); if (el) el.hidden = true;
+                    }});
+                }}
+            }} catch (_e) {{}}
+            await _refreshPipelines();
         }}
 
         async function _refreshPipelines() {{
@@ -2962,10 +4218,257 @@ SPA_HTML = f"""<!DOCTYPE html>
             }} catch (_e) {{ /* leave previous render */ }}
         }}
 
+        async function _rerunPipeline(id) {{
+            try {{
+                const res = await fetch('/api/pipelines/' + encodeURIComponent(id) + '/rerun', {{ method: 'POST' }});
+                if (res.ok) {{
+                    const data = await res.json();
+                    if (data && data.pipeline) _selectedPipelineId = data.pipeline.id;
+                }}
+            }} catch (_e) {{ /* swallow; the refresh below reflects real state */ }}
+            await _refreshPipelines();
+        }}
+
+        async function _killPipeline(id) {{
+            if (!window.confirm('Kill this running pipeline? The run will be marked failed.')) return;
+            try {{ await fetch('/api/pipelines/' + encodeURIComponent(id) + '/kill', {{ method: 'POST' }}); }} catch (_e) {{}}
+            await _refreshPipelines();
+            if (_selectedPipelineId === id) await _refreshLogs();
+        }}
+
+        async function _rerunGroup(gid) {{
+            try {{
+                const res = await fetch('/api/groups/' + encodeURIComponent(gid) + '/rerun', {{ method: 'POST' }});
+                if (res.ok) {{
+                    const data = await res.json();
+                    if (data && data.group_id) await _selectGroup(data.group_id);
+                }}
+            }} catch (_e) {{}}
+            await _refreshPipelines();
+        }}
+
+        function _leaveGroupView() {{
+            // Switching away from a group view destroys its one-time report
+            // password (server-side + DOM), per the "shown once" model.
+            if (_selectedGroupId) {{
+                const gid = _selectedGroupId;
+                try {{ fetch('/api/groups/' + encodeURIComponent(gid) + '/forget-password', {{method: 'POST'}}); }} catch (_e) {{}}
+            }}
+            _selectedGroupId = null;
+            const gv = document.getElementById('pipelinesViewGroup');
+            if (gv) {{ gv.hidden = true; gv.innerHTML = ''; }}
+            const logs = document.getElementById('pipelinesViewLogs');
+            if (logs) logs.hidden = false;
+        }}
+
+        function _toggleGroup(gid) {{
+            if (_expandedGroups.has(gid)) _expandedGroups.delete(gid);
+            else _expandedGroups.add(gid);
+            _refreshPipelines();
+        }}
+
+        async function _selectGroup(gid, opts) {{
+            if (_selectedGroupId && _selectedGroupId !== gid) _leaveGroupView();
+            _selectedGroupId = gid;
+            _selectedPipelineId = null;
+            // Group view replaces the per-pipeline panels (no logs for a group).
+            ['pipelinesViewConfig', 'pipelinesViewProgress', 'pipelinesViewLogs'].forEach(function(id) {{
+                const el = document.getElementById(id); if (el) el.hidden = true;
+            }});
+            const gv = document.getElementById('pipelinesViewGroup'); if (gv) gv.hidden = false;
+            document.querySelectorAll('.pipeline-item.active, .pipeline-group.active').forEach(function(e) {{ e.classList.remove('active'); }});
+            document.querySelectorAll('.pipeline-group').forEach(function(e) {{
+                if (e.getAttribute('onclick') && e.getAttribute('onclick').indexOf(gid) >= 0) e.classList.add('active');
+            }});
+            await _refreshGroupView();
+            if (_logsPollTimer) clearInterval(_logsPollTimer);
+            _logsPollTimer = setInterval(_refreshGroupView, 4000);
+            if (!opts || !opts.fromPop) {{
+                const target = '/groups/' + gid;
+                if (window.location.pathname !== target) history.pushState({{tab: 'pipelines', gid: gid}}, '', target);
+            }}
+        }}
+
+        function _groupConfigRows(c) {{
+            if (!c) return '';
+            const rows = [
+                ['env', c.env], ['parallel', c.parallel],
+                ['retries', c.scenario_retry], ['max runtime', c.max_runtime_sec ? (Math.round(c.max_runtime_sec / 60) + ' min') : ''],
+                ['scenarios/iter', c.scenario_count != null ? (c.scenario_count + (c.scenario_total ? ' @perf (of ' + c.scenario_total + ')' : '')) : ''],
+                ['est/iter', c.est_runtime_sec != null ? ('~' + Math.max(1, Math.round(c.est_runtime_sec / 60)) + ' min') : ''],
+                ['feature', c.feature || ''], ['tests', c.tests || ''],
+            ];
+            return '<div class="pipelines-view-config-grid">' + rows.map(function(r) {{
+                const v = (r[1] == null || r[1] === '') ? '<span class="empty">&mdash;</span>' : ('<span class="val">' + _testsEscape(String(r[1])) + '</span>');
+                return '<strong>' + r[0] + '</strong>' + v;
+            }}).join('') + '</div>';
+        }}
+
+        function _groupReportHtml(g) {{
+            const st = g.report_status;
+            let inner, cls = 'gv-card gv-report';
+            if (st === 'generating') {{
+                inner = '<div class="gv-report-busy"><span class="live-dot"></span> Generating performance report from the run launches&hellip;</div>';
+            }} else if (st === 'failed') {{
+                cls += ' gv-report-failed';
+                inner = '<div class="gv-report-err">' + _testsEscape(g.report_error || 'unknown error') + '</div>'
+                      + '<button class="gv-btn gv-btn-primary" onclick="_groupGenerate(\\'' + _testsEscape(g.id) + '\\')">&#8635; Generate report</button>';
+            }} else if (st === 'ready' && g.report) {{
+                cls += ' gv-report-ready';
+                const r = g.report;
+                const link = r.share_url || r.url || '#';
+                const meta = '<span class="gv-report-badge">&#10003; ready</span> '
+                    + (r.num_launches || 0) + ' launch(es)'
+                    + (r.dropped_launches ? ' &middot; ' + r.dropped_launches + ' omitted' : '')
+                    + (r.has_databricks ? ' &middot; + Databricks logs' : '');
+                let pw;
+                if (g.report_password) {{
+                    pw = '<div class="gv-pw">'
+                        + '<label>One-time password <span class="gv-pw-warn">&mdash; shown once, destroyed when you leave this view</span></label>'
+                        + '<div class="gv-pw-row">'
+                        +   '<input type="text" id="groupReportPw" readonly value="' + _testsEscape(g.report_password) + '">'
+                        +   '<button class="gv-btn gv-btn-ghost" onclick="_copyGroupPassword()">Copy</button>'
+                        + '</div></div>';
+                }} else {{
+                    pw = '<div class="gv-pw-gone">Password was revealed and destroyed. '
+                        + '<button class="gv-btn gv-btn-ghost" onclick="_groupGenerate(\\'' + _testsEscape(g.id) + '\\')">Regenerate for a new password</button></div>';
+                }}
+                // Open the existing report, OR drop Databricks logs to fold them in
+                // and regenerate (the button flips to "Generate report" once files
+                // are staged). _gvDbxWire() re-attaches handlers after each re-render.
+                inner = '<div class="gv-report-meta">' + meta + '</div>'
+                      + '<div class="gv-dbx-section">'
+                      +   '<div class="dbx-dropzone" id="gvDbxDropzone" tabindex="0" '
+                      +     'onclick="document.getElementById(\\'gvDbxFileInput\\').click()" '
+                      +     'onkeydown="if(event.key===\\'Enter\\'||event.key===\\' \\'){{event.preventDefault();document.getElementById(\\'gvDbxFileInput\\').click();}}">'
+                      +     '<input type="file" id="gvDbxFileInput" multiple accept=".log,.gz,.txt" style="display:none">'
+                      +     '<input type="file" id="gvDbxFolderInput" multiple webkitdirectory directory style="display:none">'
+                      +     '<div class="dbx-dropzone-cta">Drop files or a folder here, or click to browse</div>'
+                      +     '<div class="dbx-dropzone-hint">'
+                      +       '<a href="#" class="dbx-folder-link" onclick="event.preventDefault();event.stopPropagation();document.getElementById(\\'gvDbxFolderInput\\').click();">Pick a folder instead</a>'
+                      +       '&nbsp;&middot;&nbsp; Accepts <code>log4j-*.log[.gz]</code>, <code>stdout*.txt</code>, <code>stderr*.txt</code>. Other files are ignored.'
+                      +     '</div>'
+                      +   '</div>'
+                      +   '<div class="dbx-file-list" id="gvDbxFileList"></div>'
+                      + '</div>'
+                      + '<div class="gv-report-actions">'
+                      +   '<button id="groupReportBtn" class="gv-btn gv-btn-primary" '
+                      +     'data-gid="' + _testsEscape(g.id) + '" data-link="' + _testsEscape(link) + '" '
+                      +     'onclick="_groupReportBtnClick()">Open report &rarr;</button>'
+                      + '</div>'
+                      + pw;
+            }} else {{
+                inner = '<div class="gv-report-wait">Generates automatically once every iteration finishes.</div>';
+            }}
+            return '<div class="' + cls + '"><div class="gv-card-h">Performance report</div>' + inner + '</div>';
+        }}
+
+        function _groupViewHtml(g) {{
+            const pct = g.pct || 0;
+            const eta = (g.eta_sec != null) ? ('~' + Math.max(1, Math.round(g.eta_sec / 60)) + ' min') : (g.all_done ? 'done' : '--');
+            const sc = g.status_counts || {{}};
+            const chips = ['running', 'queued', 'scheduled', 'finished', 'failed']
+                .filter(function(s) {{ return sc[s]; }})
+                .map(function(s) {{ return '<span class="gv-chip gv-chip-' + s + '">' + sc[s] + ' ' + s + '</span>'; }}).join('');
+            const ringColor = g.all_done ? (sc.failed ? '#f85149' : '#3fb950') : '#58a6ff';
+            const members = (g.members || []).map(function(m) {{
+                const mp = m.progress || {{}};
+                // Prefer the live/actual progress total (filter-aware) over the estimate.
+                const tot = (mp.total != null ? mp.total : (m.scenario_count || 0));
+                const mdone = mp.done || 0;
+                const mpct = tot ? Math.min(100, Math.round(mdone / tot * 100)) : (m.status === 'finished' || m.status === 'failed' ? 100 : 0);
+                const color = m.status === 'finished' ? '#3fb950' : (m.status === 'failed' ? '#f85149' : (m.status === 'running' ? '#58a6ff' : '#8b949e'));
+                const rp = m.rp_url
+                    ? '<a class="rp-link" href="' + _testsEscape(m.rp_url) + '" target="_blank" rel="noopener noreferrer" onclick="event.stopPropagation()">RP &rarr;</a>'
+                    : '<span class="gv-iter-norp">no launch</span>';
+                return '<div class="gv-iter" onclick="_selectPipeline(\\'' + _testsEscape(m.id) + '\\')">'
+                     +   '<span class="gv-iter-idx">#' + (m.iteration_index || '?') + '</span>'
+                     +   '<span class="gv-iter-status gv-st-' + m.status + '">' + m.status + '</span>'
+                     +   '<span class="gv-iter-bar"><span style="width:' + mpct + '%;background:' + color + '"></span></span>'
+                     +   '<span class="gv-iter-num">' + mdone + '/' + tot + '</span>'
+                     +   rp
+                     + '</div>';
+            }}).join('');
+            return '<div class="gv">'
+                 +   '<div class="gv-main">'
+                 +     '<div class="gv-hero">'
+                 +       '<div class="gv-ring" style="background: conic-gradient(' + ringColor + ' ' + pct + '%, rgba(255,255,255,0.07) ' + pct + '%)">'
+                 +         '<div class="gv-ring-in"><span class="gv-ring-pct">' + pct + '%</span></div>'
+                 +       '</div>'
+                 +       '<div class="gv-hero-meta">'
+                 +         '<div class="gv-hero-h1">' + g.iterations_done + ' / ' + g.iteration_count + ' iterations</div>'
+                 +         '<div class="gv-hero-h2">' + g.scenarios_done + ' / ' + g.scenarios_total + ' scenarios &middot; ETA ' + eta + '</div>'
+                 +         (chips ? '<div class="gv-chips">' + chips + '</div>' : '')
+                 +       '</div>'
+                 +     '</div>'
+                 +     '<div class="gv-card"><div class="gv-card-h">Configuration <span class="gv-card-sub">shared by all iterations</span></div>'
+                 +       _groupConfigRows(g.config) + '</div>'
+                 +     '<div class="gv-card"><div class="gv-card-h">Iterations</div><div class="gv-iters">' + members + '</div></div>'
+                 +   '</div>'
+                 +   '<div class="gv-side">' + _groupReportHtml(g) + '</div>'
+                 + '</div>';
+        }}
+
+        async function _refreshGroupView() {{
+            if (!_selectedGroupId) return;
+            try {{
+                const res = await fetch('/api/groups/' + encodeURIComponent(_selectedGroupId));
+                const g = await res.json();
+                const gv = document.getElementById('pipelinesViewGroup');
+                const title = document.getElementById('pipelinesViewTitle');
+                const status = document.getElementById('pipelinesViewStatus');
+                if (!res.ok) {{ if (gv) gv.innerHTML = '<div class="group-error">' + _testsEscape(g.error || ('HTTP ' + res.status)) + '</div>'; return; }}
+                if (title) title.textContent = (g.name || g.id) + '  (group of ' + g.iteration_count + ')';
+                if (status) {{
+                    const live = (g.status_counts && g.status_counts.running) ? '<span class="live-dot"></span>' : '';
+                    const label = g.all_done ? (g.report_status === 'ready' ? 'report ready' : 'complete') : (g.iterations_done + '/' + g.iteration_count);
+                    status.innerHTML = live + '<span class="status-pill">' + label + '</span>';
+                }}
+                if (gv) gv.innerHTML = _groupViewHtml(g);
+                // Re-attach the Databricks dropzone + restore its staged files
+                // after the poll replaced the report card's DOM.
+                _gvDbxWire();
+            }} catch (_e) {{ /* keep last render */ }}
+        }}
+
+        async function _groupReportBtnClick() {{
+            const btn = document.getElementById('groupReportBtn');
+            if (!btn) return;
+            const accepted = _gvDbxAccepted();
+            if (accepted.length) {{
+                btn.disabled = true; btn.textContent = 'Reading files\\u2026';
+                let files = [];
+                try {{ files = await _readDbxFilesAsBase64(null, _gvDbxFiles); }} catch (_e) {{}}
+                _groupGenerate(btn.getAttribute('data-gid'), files);
+            }} else {{
+                window.open(btn.getAttribute('data-link'), '_blank', 'noopener');
+            }}
+        }}
+
+        async function _groupGenerate(gid, dbxFiles) {{
+            const opts = {{method: 'POST'}};
+            if (dbxFiles && dbxFiles.length) {{
+                opts.headers = {{'Content-Type': 'application/json'}};
+                opts.body = JSON.stringify({{databricks_files: dbxFiles}});
+            }}
+            try {{ await fetch('/api/groups/' + encodeURIComponent(gid) + '/generate', opts); }} catch (_e) {{}}
+            _gvDbxFiles.length = 0;   // clear staged uploads once generation is kicked off
+            _refreshGroupView();
+        }}
+
+        function _copyGroupPassword() {{
+            const el = document.getElementById('groupReportPw');
+            if (!el) return;
+            el.select();
+            try {{ document.execCommand('copy'); }} catch (_e) {{}}
+            if (navigator.clipboard) {{ try {{ navigator.clipboard.writeText(el.value); }} catch (_e) {{}} }}
+        }}
+
         async function _selectPipeline(id, opts) {{
+            _leaveGroupView();
             _selectedPipelineId = id;
             // Highlight in list immediately.
-            document.querySelectorAll('.pipeline-item.active').forEach(function(e) {{
+            document.querySelectorAll('.pipeline-item.active, .pipeline-group.active').forEach(function(e) {{
                 e.classList.remove('active');
             }});
             document.querySelectorAll('.pipeline-item').forEach(function(e) {{
@@ -3020,6 +4523,15 @@ SPA_HTML = f"""<!DOCTYPE html>
                         ['kind',         data.kind],
                         ['feature',      data.feature || ''],
                         ['tests',        data.tests || ''],
+                        ['max runtime',  data.max_runtime_sec ? (Math.round(data.max_runtime_sec / 60) + ' min') : ''],
+                        ['retries',      data.scenario_retry != null ? String(data.scenario_retry) : ''],
+                        ['scenarios',    data.scenario_count != null
+                                            ? (data.scenario_count + ' @perf'
+                                               + (data.scenario_total ? ' (of ' + data.scenario_total + ')' : ''))
+                                            : ''],
+                        ['est. runtime', data.est_runtime_sec != null
+                                            ? ('~' + Math.max(1, Math.round(data.est_runtime_sec / 60)) + ' min')
+                                            : ''],
                         ['created',      data.created_at],
                         ['scheduled',    data.scheduled_for || ''],
                         ['started',      data.started_at || ''],
@@ -3034,6 +4546,44 @@ SPA_HTML = f"""<!DOCTYPE html>
                         }}).join('')
                         + '</div>';
                     cfg.hidden = false;
+                }}
+                // Live scenario progress + ETA, pinned above the log body.
+                const prog = document.getElementById('pipelinesViewProgress');
+                if (prog) {{
+                    const pr = data.progress;
+                    const total = (pr && pr.total != null) ? pr.total
+                                : (data.scenario_count != null ? data.scenario_count : null);
+                    const done  = (pr && pr.done != null) ? pr.done : 0;
+                    const hasProg = (pr && pr.done != null) || data.status === 'running';
+                    if (hasProg && total) {{
+                        const pct = (pr && pr.pct != null) ? pr.pct
+                                  : Math.min(100, Math.round(done / total * 100));
+                        let meta;
+                        if (data.status === 'running') {{
+                            const eta = (pr && pr.eta_sec != null)
+                                ? ('ETA ~' + Math.max(1, Math.round(pr.eta_sec / 60)) + ' min')
+                                : 'ETA --';
+                            const rate = (pr && pr.rate_per_min != null) ? (' &middot; ' + pr.rate_per_min + '/min') : '';
+                            meta = eta + rate;
+                        }} else {{
+                            meta = data.status + (data.est_runtime_sec != null
+                                ? (' &middot; est was ~' + Math.max(1, Math.round(data.est_runtime_sec / 60)) + ' min') : '');
+                        }}
+                        const barColor = data.status === 'running' ? '#3fb950'
+                                       : (data.status === 'finished' ? '#3fb950'
+                                       : (data.status === 'failed' ? '#f85149' : '#8b949e'));
+                        prog.innerHTML =
+                            '<div style="display:flex;justify-content:space-between;font:600 12px/1.6 ui-monospace,monospace;color:#c9d1d9">'
+                          +   '<span>Scenarios ' + done + ' / ' + total + ' (' + pct + '%)</span>'
+                          +   '<span style="color:#8b949e;font-weight:500">' + meta + '</span>'
+                          + '</div>'
+                          + '<div style="height:6px;background:#21262d;border-radius:3px;overflow:hidden;margin-top:4px">'
+                          +   '<div style="height:100%;width:' + pct + '%;background:' + barColor + ';transition:width .6s ease"></div>'
+                          + '</div>';
+                        prog.hidden = false;
+                    }} else {{
+                        prog.hidden = true;
+                    }}
                 }}
                 if (logs) {{
                     const text = (data.logs || []).join('\\n');
@@ -3301,8 +4851,8 @@ SPA_HTML = f"""<!DOCTYPE html>
         // progress bar in the busy overlay. For typical Databricks log sets
         // (~20 files, a few MB total) the time-to-base64 is sub-second
         // anyway, but a 100 MB upload feels much better with progress.
-        function _readDbxFilesAsBase64(onProgress) {{
-            const accepted = _dbxFiles.filter(function(f) {{ return _dbxAccept(f.name); }});
+        function _readDbxFilesAsBase64(onProgress, filesArr) {{
+            const accepted = (filesArr || _dbxFiles).filter(function(f) {{ return _dbxAccept(f.name); }});
             if (!accepted.length) return Promise.resolve([]);
             const out = [];
             let i = 0;
@@ -3396,6 +4946,75 @@ SPA_HTML = f"""<!DOCTYPE html>
                     _dbxAddFiles(dt.files);
                 }}
             }});
+        }}
+
+        // ----- Group view: its own Databricks dropzone (re-wired after each poll
+        // re-render; file state persists in _gvDbxFiles). Reuses the New-tab
+        // helpers (_dbxAccept, _humanBytes, _escapeHtml, _walkEntry, _readDbxFilesAsBase64). -----
+        const _gvDbxFiles = [];
+        function _gvDbxAccepted() {{ return _gvDbxFiles.filter(function(f) {{ return _dbxAccept(f.name); }}); }}
+        function _gvDbxAddFiles(fileList) {{
+            const seen = new Set(_gvDbxFiles.map(function(f) {{ return f.name + ':' + f.size; }}));
+            for (const f of fileList) {{
+                const k = f.name + ':' + f.size;
+                if (!seen.has(k)) {{ seen.add(k); _gvDbxFiles.push(f); }}
+            }}
+            _gvDbxRender();
+        }}
+        function _gvDbxRemove(idx) {{ if (idx >= 0 && idx < _gvDbxFiles.length) {{ _gvDbxFiles.splice(idx, 1); _gvDbxRender(); }} }}
+        function _gvDbxRender() {{
+            const list = document.getElementById('gvDbxFileList');
+            const btn = document.getElementById('groupReportBtn');
+            const accepted = _gvDbxAccepted();
+            if (list) {{
+                const rejected = _gvDbxFiles.filter(function(f) {{ return !_dbxAccept(f.name); }});
+                const chips = _gvDbxFiles.map(function(f, idx) {{
+                    const ok = _dbxAccept(f.name);
+                    return '<span class="dbx-file-chip' + (ok ? '' : ' invalid') + '">'
+                        + _escapeHtml(f.name)
+                        + '<span class="dbx-file-chip-size">' + _humanBytes(f.size) + '</span>'
+                        + '<button type="button" class="dbx-file-chip-remove" title="Remove" onclick="_gvDbxRemove(' + idx + ')">&times;</button>'
+                        + '</span>';
+                }}).join('');
+                let summary = '';
+                if (accepted.length) {{
+                    const tot = accepted.reduce(function(a, f) {{ return a + f.size; }}, 0);
+                    summary = accepted.length + ' file' + (accepted.length === 1 ? '' : 's') + ' ready &middot; '
+                        + _humanBytes(tot) + ' total' + (rejected.length ? ' &middot; ' + rejected.length + ' ignored' : '');
+                }} else if (rejected.length) {{ summary = 'No recognized files yet'; }}
+                list.innerHTML = chips + (summary ? '<div class="dbx-file-summary">' + summary + '</div>' : '');
+            }}
+            if (btn) {{
+                if (accepted.length) {{ btn.textContent = 'Generate report'; btn.classList.add('regen'); }}
+                else {{ btn.innerHTML = 'Open report &rarr;'; btn.classList.remove('regen'); }}
+            }}
+        }}
+        function _gvDbxWire() {{
+            const dz = document.getElementById('gvDbxDropzone');
+            if (!dz) return;
+            if (!dz.dataset.wired) {{
+                dz.dataset.wired = '1';
+                const inp = document.getElementById('gvDbxFileInput');
+                const dirInp = document.getElementById('gvDbxFolderInput');
+                if (inp) inp.addEventListener('change', function(e) {{ _gvDbxAddFiles(e.target.files || []); inp.value = ''; }});
+                if (dirInp) dirInp.addEventListener('change', function(e) {{ _gvDbxAddFiles(e.target.files || []); dirInp.value = ''; }});
+                ['dragenter', 'dragover'].forEach(function(t) {{
+                    dz.addEventListener(t, function(e) {{ e.preventDefault(); e.stopPropagation(); dz.classList.add('dragover'); }});
+                }});
+                ['dragleave', 'drop'].forEach(function(t) {{
+                    dz.addEventListener(t, function(e) {{ e.preventDefault(); e.stopPropagation(); dz.classList.remove('dragover'); }});
+                }});
+                dz.addEventListener('drop', function(e) {{
+                    const dt = e.dataTransfer; if (!dt) return;
+                    const items = dt.items;
+                    if (items && items.length && typeof items[0].webkitGetAsEntry === 'function') {{
+                        const entries = [];
+                        for (let i = 0; i < items.length; i++) {{ const ent = items[i].webkitGetAsEntry && items[i].webkitGetAsEntry(); if (ent) entries.push(ent); }}
+                        Promise.all(entries.map(_walkEntry)).then(function(arrs) {{ const files = [].concat.apply([], arrs); if (files.length) _gvDbxAddFiles(files); }});
+                    }} else if (dt.files && dt.files.length) {{ _gvDbxAddFiles(dt.files); }}
+                }});
+            }}
+            _gvDbxRender();   // restore chips + button label after a re-render
         }}
 
         async function generateReport() {{
@@ -3756,6 +5375,12 @@ SPA_HTML = f"""<!DOCTYPE html>
         // /pipelines/<id>   -> Pipelines tab, that pipeline auto-selected
         // /reports          -> Reports tab
         function _routeFromPath(path, fromPop) {{
+            const gm = (path || '/').match(/^\/groups\/([A-Za-z0-9_-]+)\/?$/);
+            if (gm) {{
+                showTab('pipelines', {{fromPop: fromPop}});
+                _selectGroup(gm[1], {{fromPop: fromPop}});
+                return;
+            }}
             const m = (path || '/').match(/^\/pipelines\/([A-Za-z0-9_-]+)\/?$/);
             if (m) {{
                 _selectedPipelineId = m[1];
@@ -3835,6 +5460,7 @@ class _SpaHandler(http.server.BaseHTTPRequestHandler):
             path in ("/", "/index.html")
             or path in ("/tests", "/pipelines", "/reports", "/new")
             or path.startswith("/pipelines/")
+            or path.startswith("/groups/")
         ):
             self._send(200, "text/html; charset=utf-8", SPA_HTML.encode("utf-8"))
             return
@@ -3857,6 +5483,9 @@ class _SpaHandler(http.server.BaseHTTPRequestHandler):
         if path.startswith("/api/pipelines/") and path.endswith("/logs"):
             pid = path[len("/api/pipelines/"):-len("/logs")]
             self._handle_pipeline_logs(pid)
+            return
+        if path.startswith("/api/groups/"):
+            self._handle_group_detail(path[len("/api/groups/"):])
             return
         if path.startswith("/reports/"):
             self._serve_report_file(path)
@@ -3989,6 +5618,26 @@ class _SpaHandler(http.server.BaseHTTPRequestHandler):
         if path == "/api/pipelines":
             self._handle_pipeline_create()
             return
+        if path == "/api/pipelines/cleanup":
+            self._handle_pipeline_cleanup()
+            return
+        if path.startswith("/api/pipelines/") and path.endswith("/rerun"):
+            pid = path[len("/api/pipelines/"):-len("/rerun")]
+            self._handle_pipeline_rerun(pid)
+            return
+        if path.startswith("/api/pipelines/") and path.endswith("/kill"):
+            pid = path[len("/api/pipelines/"):-len("/kill")]
+            self._handle_pipeline_kill(pid)
+            return
+        if path.startswith("/api/groups/") and path.endswith("/forget-password"):
+            self._handle_group_forget_password(path[len("/api/groups/"):-len("/forget-password")])
+            return
+        if path.startswith("/api/groups/") and path.endswith("/generate"):
+            self._handle_group_generate(path[len("/api/groups/"):-len("/generate")])
+            return
+        if path.startswith("/api/groups/") and path.endswith("/rerun"):
+            self._handle_group_rerun(path[len("/api/groups/"):-len("/rerun")])
+            return
         self._send(404, "text/plain; charset=utf-8", b"Not found")
 
     def _read_json_body(self, max_bytes: int = 100_000_000):
@@ -4057,16 +5706,67 @@ class _SpaHandler(http.server.BaseHTTPRequestHandler):
             iterations = max(1, min(50, int(payload.get("iterations", 1))))
         except (TypeError, ValueError):
             iterations = 1
+        # A multi-iteration burst becomes one report-package group; iterations
+        # share a stable group_id + group_name. Single runs stay ungrouped.
+        group_id = group_name = None
+        if iterations > 1:
+            group_id = _new_group_id()
+            group_name = ((payload.get("name") or "").strip()
+                          or f"group-{datetime.now().astimezone().strftime('%Y%m%d-%H%M%S')}")
         records = []
         for i in range(iterations):
-            rec = _create_pipeline(payload, iteration_index=i + 1, iteration_count=iterations)
+            rec = _create_pipeline(payload, iteration_index=i + 1, iteration_count=iterations,
+                                   group_id=group_id, group_name=group_name)
             records.append(rec)
-        # Kick off `run-now` pipelines immediately. `scheduled` ones get
-        # picked up by the scheduler thread when their time arrives.
-        for r in records:
-            if r.get("status") == "running":
-                _start_runner(r["id"])
-        self._send_json(200, {"pipelines": records, "count": len(records)})
+        if group_id:
+            _create_group_record(group_id, group_name, records)
+        # `now` jobs are now `queued`; the single-slot dispatcher starts the next
+        # one when the slot is free. Nudge it so a free slot fills immediately.
+        _ensure_pipeline_scheduler()
+        _dispatch_tick()
+        self._send_json(200, {"pipelines": records, "count": len(records),
+                              "group_id": group_id})
+
+    def _handle_pipeline_cleanup(self):
+        """Remove terminal pipelines (default: failed). Body may set
+        {"statuses": ["failed", "finished"]}; running/queued are never touched."""
+        payload, _err = self._read_json_body()
+        statuses = ("failed",)
+        if isinstance(payload, dict) and isinstance(payload.get("statuses"), list):
+            statuses = tuple(payload["statuses"])
+        result = _cleanup_pipelines(statuses)
+        self._send_json(200, result)
+
+    def _handle_pipeline_rerun(self, pid: str):
+        """Re-run a finished/failed pipeline with the same configuration:
+        build a fresh run config from the original record and create a new
+        pipeline, which is appended to the **end of the queue** (FIFO) and run
+        by the single-slot dispatcher. The original record is left untouched."""
+        pid = (pid or "").strip()
+        src = None
+        for p in _load_pipelines():
+            if p.get("id") == pid:
+                src = p
+                break
+        if src is None:
+            self._send_json(404, {"error": f"pipeline {pid!r} not found"})
+            return
+        cfg = {
+            "kind":     "now",
+            "name":     src.get("name") or "",
+            "env":      src.get("env") or "prod",
+            "parallel": src.get("parallel") or 2,
+            "feature":  src.get("feature") or "",
+            "tests":    src.get("tests") or "",
+            # Preserve the original run's watchdog budget (seconds -> minutes;
+            # blank falls back to the default inside _clamp_max_runtime_sec).
+            "max_runtime_min": (src.get("max_runtime_sec") or MAX_RUNTIME_SEC) // 60,
+            "scenario_retry":  src.get("scenario_retry") or SCENARIO_RETRY_DEFAULT,
+        }
+        rec = _create_pipeline(cfg)
+        _ensure_pipeline_scheduler()
+        _dispatch_tick()
+        self._send_json(200, {"pipeline": rec, "rerun_of": pid})
 
     def _handle_pipeline_logs(self, pid: str):
         if not pid or not all(c.isalnum() or c in "-_" for c in pid):
@@ -4079,23 +5779,209 @@ class _SpaHandler(http.server.BaseHTTPRequestHandler):
                 # separate field, so the UI can render a config strip
                 # alongside the log tail without two round-trips.
                 self._send_json(200, {
-                    "id":            pid,
-                    "name":          p.get("name"),
-                    "status":        p.get("status"),
-                    "kind":          p.get("kind"),
-                    "env":           p.get("env"),
-                    "parallel":      p.get("parallel"),
-                    "feature":       p.get("feature"),
-                    "tests":         p.get("tests"),
-                    "created_at":    p.get("created_at"),
-                    "scheduled_for": p.get("scheduled_for"),
-                    "started_at":    p.get("started_at"),
-                    "finished_at":   p.get("finished_at"),
-                    "rp_url":        p.get("rp_url"),
-                    "logs":          p.get("logs") or [],
+                    "id":              pid,
+                    "name":            p.get("name"),
+                    "status":          p.get("status"),
+                    "kind":            p.get("kind"),
+                    "env":             p.get("env"),
+                    "parallel":        p.get("parallel"),
+                    "feature":         p.get("feature"),
+                    "tests":           p.get("tests"),
+                    "max_runtime_sec": p.get("max_runtime_sec"),
+                    "scenario_retry":  p.get("scenario_retry"),
+                    "scenario_count":  p.get("scenario_count"),
+                    "scenario_total":  p.get("scenario_total"),
+                    "est_runtime_sec": p.get("est_runtime_sec"),
+                    "progress":        p.get("progress"),
+                    "created_at":      p.get("created_at"),
+                    "scheduled_for":   p.get("scheduled_for"),
+                    "started_at":      p.get("started_at"),
+                    "finished_at":     p.get("finished_at"),
+                    "rp_url":          p.get("rp_url"),
+                    "group_id":        p.get("group_id"),
+                    "group_name":      p.get("group_name"),
+                    "iteration_index": p.get("iteration_index"),
+                    "iteration_count": p.get("iteration_count"),
+                    "logs":            p.get("logs") or [],
                 })
                 return
         self._send_json(404, {"error": "not found"})
+
+    # ------------------------------------------------------------------ #
+    # Iteration groups
+    # ------------------------------------------------------------------ #
+    def _handle_group_detail(self, gid: str):
+        gid = (gid or "").strip()
+        if not gid or not all(c.isalnum() or c in "-_" for c in gid):
+            self._send_json(404, {"error": "not found"})
+            return
+        with _pipelines_lock():
+            groups = _load_groups()
+            g = groups.get(gid)
+            pipelines = _load_pipelines()
+        if not g:
+            self._send_json(404, {"error": "not found"})
+            return
+        members = [p for p in pipelines if p.get("group_id") == gid]
+        members.sort(key=lambda p: p.get("iteration_index") or 0)
+
+        status_counts, member_views = {}, []
+        scen_done = scen_total = 0
+        eta_sec, any_eta = 0, False
+        for m in members:
+            st = m.get("status")
+            status_counts[st] = status_counts.get(st, 0) + 1
+            prog = m.get("progress") or {}
+            scen_done += int(prog.get("done") or 0)
+            # Prefer the live/actual total from progress (accurate once a run has
+            # started or finished -- and correct for Tests-filtered runs); fall
+            # back to the pre-run @perf estimate only before a run produces any.
+            scen_total += int(prog.get("total") or m.get("scenario_count") or 0)
+            # Single-slot sequential model: the running iteration contributes its
+            # live ETA; not-yet-started iterations contribute their full estimate.
+            if st == "running":
+                eta_sec += int(prog.get("eta_sec") or m.get("est_runtime_sec") or 0); any_eta = True
+            elif st in ("queued", "scheduled"):
+                eta_sec += int(m.get("est_runtime_sec") or 0); any_eta = True
+            member_views.append({
+                "id": m.get("id"), "name": m.get("name"),
+                "iteration_index": m.get("iteration_index"),
+                "status": st, "rp_url": m.get("rp_url"),
+                "scenario_count": m.get("scenario_count"), "progress": prog,
+            })
+        total_iters = len(members)
+        done_iters = sum(status_counts.get(s, 0) for s in ("finished", "failed"))
+        pct = (round(scen_done / scen_total * 100) if scen_total
+               else (round(done_iters / total_iters * 100) if total_iters else 0))
+        report = g.get("report") or None
+        self._send_json(200, {
+            "id": gid, "name": g.get("name"), "config": g.get("config"),
+            "iteration_count": total_iters, "iterations_done": done_iters,
+            "status_counts": status_counts,
+            "scenarios_done": scen_done, "scenarios_total": scen_total, "pct": pct,
+            "eta_sec": (eta_sec if any_eta else None),
+            "all_done": total_iters > 0 and done_iters == total_iters,
+            "members": member_views,
+            "report_status": g.get("report_status"),
+            "report": report,
+            "report_error": g.get("report_error"),
+            # one-time password: present only while held in memory (see lifecycle)
+            "report_password": _group_report_passwords.get(gid),
+        })
+
+    def _handle_group_forget_password(self, gid: str):
+        """Drop the in-memory one-time report password -- the client calls this
+        when leaving the group view, so the password is shown once and destroyed
+        on view switch."""
+        gid = (gid or "").strip()
+        _group_report_passwords.pop(gid, None)
+        self._send_json(200, {"ok": True})
+
+    def _handle_group_generate(self, gid: str):
+        """Manual (re)generate: re-arm the group so the dispatcher regenerates
+        its report. Only valid once every iteration is terminal. An optional
+        body {"databricks_log_dir": "<path>"} regenerates the report WITH those
+        Databricks logs folded in (empty/absent -> a plain regenerate)."""
+        gid = (gid or "").strip()
+        payload, _err = self._read_json_body()
+        # Validate the group is regeneratable BEFORE materializing any uploads,
+        # so a bad request never leaks a temp dir.
+        with _pipelines_lock():
+            g = _load_groups().get(gid)
+            if not g:
+                self._send_json(404, {"error": "not found"})
+                return
+            by_id = {p.get("id"): p for p in _load_pipelines()}
+            members = [m for m in (by_id.get(mid) for mid in g.get("member_ids", [])) if m]
+            if not members or not all(
+                    m.get("status") in ("finished", "failed") for m in members):
+                self._send_json(409, {"error": "group still has running/queued iterations"})
+                return
+        # Optional Databricks logs: uploaded files (preferred) or a server path.
+        dbx_dir, dbx_temp = None, False
+        if isinstance(payload, dict):
+            files = payload.get("databricks_files")
+            if isinstance(files, list) and files:
+                materialized = _materialize_databricks_uploads(files)
+                if materialized:
+                    dbx_dir, dbx_temp = materialized, True
+            if not dbx_dir:
+                d = (payload.get("databricks_log_dir") or "").strip()
+                if d and os.path.isdir(d):
+                    dbx_dir = os.path.realpath(d)
+                elif d:
+                    self._send_json(400, {"error": f"Databricks log dir not found: {d}"})
+                    return
+        with _pipelines_lock():
+            groups = _load_groups()
+            g = groups.get(gid)
+            if not g:
+                self._send_json(404, {"error": "not found"})
+                return
+            g["report_status"] = "none"
+            g["report_error"] = None
+            g["report_dbx_dir"] = dbx_dir      # consumed by _run_group_report
+            g["report_dbx_temp"] = dbx_temp     # rmtree'd after generation if True
+            _save_groups(groups)
+        _group_report_passwords.pop(gid, None)
+        _check_group_completions()
+        self._send_json(200, {"ok": True, "report_status": "generating"})
+
+    def _handle_group_rerun(self, gid: str):
+        """Re-run an entire group: enqueue a fresh group with the same config and
+        iteration count (a new group_id). The original group is left untouched."""
+        gid = (gid or "").strip()
+        with _pipelines_lock():
+            g = _load_groups().get(gid)
+        if not g:
+            self._send_json(404, {"error": "not found"})
+            return
+        cfg = dict(g.get("config") or {})
+        run_cfg = {
+            "kind": "now",
+            "env": cfg.get("env") or "prod",
+            "parallel": cfg.get("parallel") or 2,
+            "feature": cfg.get("feature") or "",
+            "tests": cfg.get("tests") or "",
+            "max_runtime_min": (cfg.get("max_runtime_sec") or MAX_RUNTIME_SEC) // 60,
+            "scenario_retry": cfg.get("scenario_retry") or SCENARIO_RETRY_DEFAULT,
+        }
+        n = max(1, int(g.get("iteration_count") or len(g.get("member_ids") or []) or 1))
+        new_gid = _new_group_id()
+        new_name = g.get("name") or "group"
+        records = [_create_pipeline(run_cfg, iteration_index=i + 1, iteration_count=n,
+                                    group_id=new_gid, group_name=new_name) for i in range(n)]
+        _create_group_record(new_gid, new_name, records)
+        _ensure_pipeline_scheduler()
+        _dispatch_tick()
+        self._send_json(200, {"group_id": new_gid, "count": len(records)})
+
+    def _handle_pipeline_kill(self, pid: str):
+        """Kill a running pipeline's container. The runner's stream loop then
+        sees the container exit and marks the pipeline failed."""
+        pid = (pid or "").strip()
+        if not pid or not all(c.isalnum() or c in "-_" for c in pid):
+            self._send_json(404, {"error": "not found"})
+            return
+        with _pipelines_lock():
+            p = next((x for x in _load_pipelines() if x.get("id") == pid), None)
+        if not p:
+            self._send_json(404, {"error": "not found"})
+            return
+        if p.get("status") != "running":
+            self._send_json(409, {"error": "pipeline is not running"})
+            return
+        import subprocess
+        container = f"dokimos-{pid}"
+        try:
+            subprocess.run(["docker", "kill", container],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+        except Exception:
+            pass
+        _append_pipeline_log(
+            pid, f"[{_now_iso()}] KILL requested by operator -- stopping container "
+                 f"{container}; the run will be marked failed.")
+        self._send_json(200, {"ok": True})
 
     def _handle_generate(self):
         payload, err = self._read_json_body()
@@ -4164,6 +6050,10 @@ def serve_spa(port: int = PORT) -> None:
     orphaned = _reconcile_orphan_pipelines()
     if orphaned:
         print(f"  Reconciled {orphaned} orphaned pipeline(s) -> failed")
+    # Groups left mid-generation by the previous process re-arm for regeneration.
+    requeued = _reconcile_orphan_groups()
+    if requeued:
+        print(f"  Re-armed {requeued} group report(s) interrupted by restart")
     # Start the pipeline scheduler so any pipelines created later -- and any
     # already-scheduled ones from prior server runs -- get picked up when
     # their `scheduled_for` arrives.
