@@ -2980,7 +2980,12 @@ html, body {
 .gv-hero-meta { display: flex; flex-direction: column; gap: 7px; min-width: 0; }
 .gv-hero-h1 { font-size: 24px; font-weight: 700; color: #e6edf3; }
 .gv-hero-h2 { font-size: 16px; color: #9aa4af; }
-.gv-chips { display: flex; gap: 7px; flex-wrap: wrap; margin-top: 4px; }
+.gv-hdots { display: flex; gap: 5px; flex-wrap: wrap; margin-top: 5px; }
+.gv-hdot { width: 22px; height: 22px; border-radius: 6px; cursor: pointer;
+    display: inline-flex; align-items: center; justify-content: center;
+    font: 700 11px var(--font-mono); color: #0d1117; transition: transform .1s; }
+.gv-hdot:hover { transform: scale(1.12); }
+.gv-chips { display: flex; gap: 7px; flex-wrap: wrap; margin-top: 7px; }
 .gv-chip { font-size: 13px; font-weight: 600; padding: 3px 12px; border-radius: 999px;
     background: rgba(255,255,255,0.07); color: #c9d1d9; }
 .gv-chip-running { background: rgba(88,166,255,0.18); color: #79b8ff; }
@@ -4370,7 +4375,24 @@ SPA_HTML = f"""<!DOCTYPE html>
             const chips = ['running', 'queued', 'scheduled', 'finished', 'failed']
                 .filter(function(s) {{ return sc[s]; }})
                 .map(function(s) {{ return '<span class="gv-chip gv-chip-' + s + '">' + sc[s] + ' ' + s + '</span>'; }}).join('');
-            const ringColor = g.all_done ? (sc.failed ? '#f85149' : '#3fb950') : '#58a6ff';
+            // Donut segmented by iteration: each slice = one iteration, colored
+            // by its status; small gaps separate the slices.
+            function _stColor(s) {{ return s === 'finished' ? '#3fb950' : (s === 'failed' ? '#f85149' : (s === 'running' ? '#58a6ff' : ((s === 'queued' || s === 'scheduled') ? '#d6b98a' : '#8b949e'))); }}
+            const _mlist = (g.members || []).slice().sort(function(a, b) {{ return (a.iteration_index || 0) - (b.iteration_index || 0); }});
+            const _n = _mlist.length || 1;
+            const _gap = _mlist.length > 1 ? 2 : 0;
+            const _segs = [];
+            _mlist.forEach(function(m, i) {{
+                const a0 = i * 360 / _n, a1 = (i + 1) * 360 / _n;
+                _segs.push(_stColor(m.status) + ' ' + a0.toFixed(2) + 'deg ' + (a1 - _gap).toFixed(2) + 'deg');
+                if (_gap) _segs.push('var(--bg-dark,#0d1117) ' + (a1 - _gap).toFixed(2) + 'deg ' + a1.toFixed(2) + 'deg');
+            }});
+            const _pie = 'conic-gradient(' + (_segs.length ? _segs.join(', ') : '#8b949e 0deg 360deg') + ')';
+            const _hdots = _mlist.map(function(m) {{
+                return '<span class="gv-hdot" style="background:' + _stColor(m.status) + '" '
+                     + 'title="iteration #' + (m.iteration_index || '?') + ' \\u2014 ' + m.status + '" '
+                     + 'onclick="_selectPipeline(\\'' + _testsEscape(m.id) + '\\')">' + (m.iteration_index || '') + '</span>';
+            }}).join('');
             const members = (g.members || []).map(function(m) {{
                 const mp = m.progress || {{}};
                 // Prefer the live/actual progress total (filter-aware) over the estimate.
@@ -4392,12 +4414,13 @@ SPA_HTML = f"""<!DOCTYPE html>
             return '<div class="gv">'
                  +   '<div class="gv-main">'
                  +     '<div class="gv-hero">'
-                 +       '<div class="gv-ring" style="background: conic-gradient(' + ringColor + ' ' + pct + '%, rgba(255,255,255,0.07) ' + pct + '%)">'
+                 +       '<div class="gv-ring" style="background: ' + _pie + '" title="each slice is one iteration, colored by its status">'
                  +         '<div class="gv-ring-in"><span class="gv-ring-pct">' + pct + '%</span></div>'
                  +       '</div>'
                  +       '<div class="gv-hero-meta">'
                  +         '<div class="gv-hero-h1">' + g.iterations_done + ' / ' + g.iteration_count + ' iterations</div>'
                  +         '<div class="gv-hero-h2">' + g.scenarios_done + ' / ' + g.scenarios_total + ' scenarios &middot; ETA ' + eta + '</div>'
+                 +         '<div class="gv-hdots">' + _hdots + '</div>'
                  +         (chips ? '<div class="gv-chips">' + chips + '</div>' : '')
                  +       '</div>'
                  +     '</div>'
