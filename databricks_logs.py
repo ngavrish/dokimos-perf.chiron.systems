@@ -84,9 +84,11 @@ PHASE_OPTIMIZE_RE = re.compile(r"^OPTIMIZE TABLE (\S+) completed in (\d+)s\s*$")
 # stdout SQL-execution markers; caller is e.g. "DbAccessor.upDateRecordState"
 STDOUT_SQL_RE = re.compile(r"^Executing SQL query from (\S+):\s*$")
 
-# Hourly-file naming convention: stdout--YYYY-MM-DD--HH-MM.txt
+# Hourly-file naming convention: stdout--YYYY-MM-DD--HH-MM[.txt]. The SPA
+# downloader prefixes each file with "<clusterid>__" and DBFS streams carry no
+# ".txt" extension, so both the prefix and the suffix are optional here.
 HOURLY_FILE_RE = re.compile(
-    r"^(?:stdout|stderr)--(\d{4})-(\d{2})-(\d{2})--(\d{2})-(\d{2})\.txt$"
+    r"^(?:.*__)?(?:stdout|stderr)--(\d{4})-(\d{2})-(\d{2})--(\d{2})-(\d{2})(?:\.txt)?$"
 )
 
 # Datadog APM agent line:
@@ -312,12 +314,17 @@ def fetch_databricks_logs(
     for p in sorted(log_dir.iterdir()):
         if not p.is_file():
             continue
+        # The SPA downloader names files "<clusterid>__<base>" when a run spans
+        # multiple clusters; strip that prefix so dispatch keys off the real
+        # stream name. DBFS streams (stdout/stderr) carry no ".txt" extension,
+        # so we match on the base name alone, not a suffix.
         name = p.name
-        if name.startswith("log4j-") and (name.endswith(".log") or name.endswith(".log.gz")):
+        base = name.split("__", 1)[1] if "__" in name else name
+        if base.startswith("log4j-") and (base.endswith(".log") or base.endswith(".log.gz")):
             events.extend(parse_log4j_file(p))
-        elif name.startswith("stdout") and name.endswith(".txt"):
+        elif base.startswith("stdout"):
             events.extend(parse_stdout_file(p))
-        elif name.startswith("stderr") and name.endswith(".txt"):
+        elif base.startswith("stderr"):
             events.extend(parse_stderr_file(p))
 
     _refine_phase_intervals(events)

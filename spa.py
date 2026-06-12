@@ -109,6 +109,9 @@ GROUP_REPORT_MAX_LAUNCHES = int(os.environ.get("DOKIMOS_GROUP_REPORT_MAX_LAUNCHE
 # revealed once in the group view and dropped when the user leaves it (or on
 # process restart), matching the "shown once, never recoverable" report model.
 _group_report_passwords: dict = {}
+# Pipeline ids the operator has cancelled; the runner reads this when its
+# container exits so a cancel is recorded as `cancelled`, not `failed`.
+_cancel_requested: set = set()
 
 # Root for the Tests tab's file browser. Resolution order:
 #   1. DOKIMOS_TESTS_DIR env var (explicit override, prod uses this)
@@ -378,6 +381,11 @@ def _build_docker_command(pipeline: dict, assets: dict) -> tuple:
         argv += ["-e", f"{k}={v}"]
 
     argv.append(DOCKER_IMAGE)
+    # Override the image's default CMD ["uat", "4"]: run_perf.sh takes ENV and
+    # PARALLEL_THREADS as positional args ($1/$2) which take PRECEDENCE over the
+    # -e env vars. Without this, the CMD defaults silently win and the run always
+    # uses uat / 4 regardless of the Tests-panel selection.
+    argv += [pipeline["env"], str(pipeline["parallel"])]
     return argv, envrc_host
 
 
@@ -1050,6 +1058,14 @@ def _run_pipeline(pipeline_id: str) -> None:
                 f"container {container_name} stopped. Marking failed so the queue advances.",
                 status="failed", finished_at=_now_iso(),
             )
+        elif pipeline_id in _cancel_requested:
+            _cancel_requested.discard(pipeline_id)
+            final_status = "cancelled"
+            _append_pipeline_log(
+                pipeline_id,
+                f"[{_now_iso()}] CANCELLED by operator -- container stopped.",
+                status="cancelled", finished_at=_now_iso(),
+            )
         else:
             # No timeout: use the process exit code (unless an earlier path
             # already decided to fail) to choose between finished and failed.
@@ -1315,7 +1331,7 @@ def _check_group_completions() -> None:
             members = [by_id.get(mid) for mid in g.get("member_ids", [])]
             members = [m for m in members if m]
             if not members or not all(
-                    m.get("status") in ("finished", "failed") for m in members):
+                    m.get("status") in ("finished", "failed", "cancelled") for m in members):
                 continue
             g["report_status"] = "generating"
             g["report_error"] = None
@@ -1348,14 +1364,18 @@ def _run_group_report(group_id: str, urls: list) -> None:
     deduped = deduped[:GROUP_REPORT_MAX_LAUNCHES]
     with _pipelines_lock():
         g0 = _load_groups().get(group_id) or {}
+        by_id = {p.get("id"): p for p in _load_pipelines()}
+        members0 = [by_id.get(mid) for mid in (g0.get("member_ids") or [])]
     dbx_dir = g0.get("report_dbx_dir") or None
     dbx_temp = bool(g0.get("report_dbx_temp"))
+    run_window = _iter_run_window(members0)
     try:
         if not deduped:
             raise RuntimeError(
                 "no Report Portal launches were produced by this group's runs "
                 "(RP disabled / token missing, or no run reached a launch)")
-        result = _run_generation(deduped, databricks_log_dir=dbx_dir)  # dict incl. report_password
+        result = _run_generation(deduped, databricks_log_dir=dbx_dir,
+                                 run_window=run_window)  # dict incl. report_password
         password = result.pop("report_password", None)
         result["dropped_launches"] = dropped
         result["has_databricks"] = bool(dbx_dir)
@@ -1396,7 +1416,7 @@ def _cleanup_pipelines(statuses=("failed",)) -> dict:
     """Remove pipelines in the given terminal statuses (default: failed). Never
     removes a running/queued/scheduled job. Prunes group member refs and drops
     groups left with no members. Returns counts."""
-    statuses = tuple(s for s in statuses if s in ("failed", "finished"))
+    statuses = tuple(s for s in statuses if s in ("failed", "finished", "cancelled"))
     if not statuses:
         return {"removed": 0, "groups_removed": 0}
     with _pipelines_lock():
@@ -2077,8 +2097,68 @@ def _generate_share_hash() -> str:
     return secrets.token_urlsafe(8)
 
 
+def _iter_run_window(members: list) -> tuple:
+    """Wall-clock run window for a set of pipeline records: earliest member
+    ``started_at`` and latest ``finished_at``. Either element is ``None`` if no
+    member has started / finished yet. ISO timestamps share one host/format here,
+    so lexical min/max matches chronological order."""
+    starts = [m.get("started_at") for m in members if m and m.get("started_at")]
+    ends = [m.get("finished_at") for m in members if m and m.get("finished_at")]
+    return (min(starts) if starts else None, max(ends) if ends else None)
+
+
+def _format_run_window(start_iso: Optional[str], end_iso: Optional[str]) -> Optional[str]:
+    """Human label for a run window, e.g. ``2026-06-08 17:04 -> 17:05`` (date is
+    shown once when start and end fall on the same day). ``None`` if neither bound
+    is known."""
+    if not start_iso and not end_iso:
+        return None
+
+    def _parse(s):
+        try:
+            return datetime.fromisoformat(s)
+        except Exception:
+            return None
+
+    def _off(dt):
+        o = dt.strftime('%z')  # e.g. +0200 (empty if naive)
+        return f" (UTC{o[:3]}:{o[3:]})" if o else ""
+
+    s_dt, e_dt = _parse(start_iso), _parse(end_iso)
+    if s_dt and e_dt:
+        tz = _off(s_dt)
+        if s_dt.date() == e_dt.date():
+            return f"{s_dt.strftime('%Y-%m-%d %H:%M:%S')} → {e_dt.strftime('%H:%M:%S')}{tz}"
+        return f"{s_dt.strftime('%Y-%m-%d %H:%M:%S')} → {e_dt.strftime('%Y-%m-%d %H:%M:%S')}{tz}"
+    only = s_dt or e_dt
+    return (only.strftime('%Y-%m-%d %H:%M:%S') + _off(only)) if only else (start_iso or end_iso)
+
+
+def _inject_run_window(html: str, start_iso: Optional[str], end_iso: Optional[str]) -> str:
+    """Insert a themed 'Test run window' banner as the first child of the report's
+    main ``.container`` (uniform across single/comparison/multi report templates).
+    No-op if the window is empty or the anchor is absent."""
+    label = _format_run_window(start_iso, end_iso)
+    if not label:
+        return html
+    banner = (
+        '<div style="margin:0 0 18px;padding:10px 16px;border-radius:8px;'
+        'background:rgba(205,127,50,0.10);border:1px solid rgba(205,127,50,0.35);'
+        'font:600 14px/1.4 \'Courier New\',Menlo,monospace;color:#E6A45A;">'
+        'Test run window: '
+        '<span style="color:#F7FAFC">' + label + '</span></div>'
+    )
+    anchor = '<div class="container">'
+    idx = html.find(anchor)
+    if idx == -1:
+        return html
+    pos = idx + len(anchor)
+    return html[:pos] + banner + html[pos:]
+
+
 def _save_report(html: str, urls: list, analyzer_meta: dict, report_password: str,
-                 dbx_log_dir: Optional[str] = None) -> dict:
+                 dbx_log_dir: Optional[str] = None,
+                 run_window: Optional[tuple] = None) -> dict:
     """Persist a generated report to disk and return the public list entry.
 
     SECURITY-REVIEW: ``report_password`` is the AES-256-GCM password the
@@ -2122,6 +2202,9 @@ def _save_report(html: str, urls: list, analyzer_meta: dict, report_password: st
             databricks_files_saved += 1
             databricks_bytes_saved += os.path.getsize(src)
 
+    rw_start = run_window[0] if run_window else None
+    rw_end = run_window[1] if run_window else None
+    rw_label = _format_run_window(rw_start, rw_end)
     title = now_la.strftime("%Y-%m-%d %H:%M") + f"  ({num_launches} launch{'es' if num_launches != 1 else ''})"
     metadata = {
         "id":           report_id,
@@ -2130,6 +2213,9 @@ def _save_report(html: str, urls: list, analyzer_meta: dict, report_password: st
         "title":        title,
         "generated_at": now_la.isoformat(timespec="seconds"),
         "num_launches": num_launches,
+        "run_started_at":  rw_start,
+        "run_finished_at": rw_end,
+        "run_window":      rw_label,
         "urls":         urls,
         "analyzer":     analyzer_meta,
         "databricks": {
@@ -2148,6 +2234,9 @@ def _save_report(html: str, urls: list, analyzer_meta: dict, report_password: st
         "title":          title,
         "generated_at":   metadata["generated_at"],
         "num_launches":   num_launches,
+        "run_started_at":  rw_start,
+        "run_finished_at": rw_end,
+        "run_window":      rw_label,
         "url":            f"/reports/{sprint_dirname}/{report_id}/index.html",
         # Returned to the caller (and ultimately the browser) ONCE on
         # generation. The server forgets it the moment this response is
@@ -2239,7 +2328,8 @@ def _ensure_rp_credentials() -> None:
 
 
 def _run_generation(urls: list, payload_key: Optional[str] = None,
-                    databricks_log_dir: Optional[str] = None) -> dict:
+                    databricks_log_dir: Optional[str] = None,
+                    run_window: Optional[tuple] = None) -> dict:
     _ensure_rp_credentials()
     report_password = _generate_report_password()
     html, meta = generate_report_for_urls(
@@ -2249,7 +2339,10 @@ def _run_generation(urls: list, payload_key: Optional[str] = None,
         report_password=report_password,
         databricks_log_dir=databricks_log_dir,
     )
-    return _save_report(html, urls, meta, report_password, dbx_log_dir=databricks_log_dir)
+    if run_window:
+        html = _inject_run_window(html, run_window[0], run_window[1])
+    return _save_report(html, urls, meta, report_password, dbx_log_dir=databricks_log_dir,
+                        run_window=run_window)
 
 
 # Filenames the Databricks log parser knows how to read. Used to gate the
@@ -2274,7 +2367,12 @@ def _materialize_databricks_uploads(files: list) -> Optional[str]:
         if not isinstance(f, dict):
             continue
         name = os.path.basename(str(f.get("name") or ""))
-        if not name or not name.startswith(_DBX_FILENAME_PREFIXES):
+        # The auto-download names files "<clusterid>__<stream>" (and the zip
+        # endpoint preserves that), so a re-uploaded download zip arrives
+        # prefixed. Gate on the stream name after stripping that prefix --
+        # matching what fetch_databricks_logs() now keys off.
+        base = name.split("__", 1)[1] if "__" in name else name
+        if not name or not base.startswith(_DBX_FILENAME_PREFIXES):
             continue
         try:
             raw = base64.b64decode(f.get("data") or "", validate=False)
@@ -2289,6 +2387,410 @@ def _materialize_databricks_uploads(files: list) -> Optional[str]:
         shutil.rmtree(tmpdir, ignore_errors=True)
         return None
     return tmpdir
+
+
+# --------------------------------------------------------------------------- #
+# Databricks job-run log auto-download
+# --------------------------------------------------------------------------- #
+# Replaces the manual log-upload dropzone: the user picks a Databricks Job from a
+# dropdown, we find the job RUN overlapping the test window, and pull that run's
+# driver logs (log4j/stdout/stderr) straight from cluster-log delivery (DBFS) into
+# a tempdir the analyzer consumes -- same format the uploader produced.
+#
+# Auth: OAuth U2M profiles in ~/.databrickscfg (gen-uat-uw2 / gen-prod-uw2), logged
+# in once via `databricks auth login`. The SDK's databricks-cli auth shells the CLI
+# to mint/refresh a 1h token; that works even from the systemd service (no keyring
+# session needed), so we just hand the SDK a fresh token per env.
+DATABRICKS_CLI = os.environ.get("DOKIMOS_DATABRICKS_CLI", "/home/bober/.local/bin/databricks")
+DATABRICKS_PROFILES = {"uat": "gen-uat-uw2", "prod": "gen-prod-uw2"}
+DATABRICKS_HOSTS = {
+    "uat":  "https://ads-data-gen-uat-uw2.cloud.databricks.com",
+    "prod": "https://ads-data-gen-prod-uw2.cloud.databricks.com",
+}
+# Driver-log file prefixes the analyzer understands (log4j-*, stdout*, stderr*) plus
+# stacktrace for context. Anything else in the driver dir is skipped.
+_DBX_LOG_PREFIXES = ("log4j-", "stdout", "stderr", "stacktrace")
+_DBX_MAX_FILE_BYTES = 60 * 1024 * 1024      # per-file cap
+_DBX_MAX_TOTAL_BYTES = 250 * 1024 * 1024    # per-run cap
+_DBX_RUN_MATCH_SLACK_MS = 20 * 60 * 1000    # "start >=20min before test end" fallback
+
+_dbx_token_cache: dict = {}   # env -> (access_token, expiry_epoch)
+_dbx_jobs_cache: dict = {}    # env -> (epoch_fetched, [ {job_id,name} ])
+
+
+def _dbx_env_ok(env: str) -> Optional[str]:
+    env = (env or "").strip().lower()
+    return env if env in DATABRICKS_PROFILES else None
+
+
+def _dbx_token(env: str) -> str:
+    """Return a fresh OAuth access token for the env's profile, shelling the CLI.
+    Cached in-memory until ~1 min before expiry."""
+    import time
+    cached = _dbx_token_cache.get(env)
+    if cached and cached[1] - 60 > time.time():
+        return cached[0]
+    import subprocess
+    profile = DATABRICKS_PROFILES[env]
+    proc = subprocess.run(
+        [DATABRICKS_CLI, "auth", "token", "-p", profile],
+        capture_output=True, text=True, timeout=60,
+        env={"HOME": os.path.expanduser("~"), "PATH": os.path.dirname(DATABRICKS_CLI) + ":/usr/bin:/bin"},
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"databricks auth token failed for {profile}: {proc.stderr.strip() or proc.stdout.strip()}")
+    data = json.loads(proc.stdout)
+    tok = data["access_token"]
+    # expiry is RFC3339; parse to epoch, fall back to expires_in
+    exp = time.time() + int(data.get("expires_in") or 3600)
+    try:
+        exp = datetime.fromisoformat(data["expiry"]).timestamp()
+    except Exception:
+        pass
+    _dbx_token_cache[env] = (tok, exp)
+    return tok
+
+
+def _dbx_client(env: str):
+    """A databricks-sdk WorkspaceClient for the env, authed with a fresh token."""
+    from databricks.sdk import WorkspaceClient
+    return WorkspaceClient(host=DATABRICKS_HOSTS[env], token=_dbx_token(env))
+
+
+def _dbx_check_auth(env: str) -> dict:
+    """Return {authorized, user, error} for the env's profile."""
+    try:
+        me = _dbx_client(env).current_user.me()
+        return {"authorized": True, "user": getattr(me, "user_name", None), "error": None}
+    except Exception as exc:
+        return {"authorized": False, "user": None, "error": f"{type(exc).__name__}: {exc}"}
+
+
+def _dbx_list_jobs(env: str, q: str = "") -> list:
+    """List the workspace's jobs as [{job_id, name}], newest-name-sorted, cached 60s.
+    Optional case-insensitive substring filter on the name."""
+    import time
+    now = time.time()
+    cached = _dbx_jobs_cache.get(env)
+    if not cached or now - cached[0] > 60:
+        w = _dbx_client(env)
+        jobs = []
+        for j in w.jobs.list(limit=100):
+            name = (j.settings.name if j.settings else None) or str(j.job_id)
+            jobs.append({"job_id": str(j.job_id), "name": name})
+        jobs.sort(key=lambda x: x["name"].lower())
+        _dbx_jobs_cache[env] = (now, jobs)
+        cached = _dbx_jobs_cache[env]
+    items = cached[1]
+    if q:
+        ql = q.lower()
+        items = [j for j in items if ql in j["name"].lower()]
+    return items
+
+
+_DBX_WINDOW_LOOKBACK_MS = 12 * 60 * 60 * 1000   # how far before the window to scan for long runs
+_DBX_WINDOW_SCAN_CAP = 800                       # max runs to scan across the workspace
+
+
+def _dbx_jobs_in_window(env: str, start_ms: int, end_ms: int, q: str = "") -> list:
+    """Jobs whose run overlaps the test window [start_ms, end_ms] AND finishes at
+    least 20 min after the test STARTED (run_start <= end AND run_end >=
+    start + 20min; a still-running run counts -- its effective end is 'now'). One
+    entry per job (the largest-overlap run), each carrying the intersection
+    [overlap_start, overlap_end] with the test window. Uses the cross-job runs/list
+    with a time filter, scanning back _DBX_WINDOW_LOOKBACK_MS for long runs."""
+    import itertools
+    now_ms = int(datetime.now().timestamp() * 1000)
+    min_end_ms = start_ms + _DBX_RUN_MATCH_SLACK_MS   # run must finish >=20min after test start
+    w = _dbx_client(env)
+    gen = w.jobs.list_runs(start_time_from=max(0, start_ms - _DBX_WINDOW_LOOKBACK_MS),
+                           start_time_to=end_ms, expand_tasks=False)
+    best = {}  # job_id -> (overlap_ms, run_dict)
+    for r in itertools.islice(gen, _DBX_WINDOW_SCAN_CAP):
+        rs = r.start_time or 0
+        re_eff = r.end_time or now_ms  # still-running -> effective end is now
+        if rs <= end_ms and re_eff >= min_end_ms:
+            ov_start = max(rs, start_ms)
+            ov_end = min(re_eff, end_ms)
+            ov = ov_end - ov_start
+            cur = best.get(r.job_id)
+            if cur is None or ov > cur[0]:
+                best[r.job_id] = (ov, {
+                    "run_id": r.run_id, "start_ms": rs, "end_ms": (r.end_time or None),
+                    "ov_start": ov_start, "ov_end": ov_end,
+                    "life": (r.state.life_cycle_state.value if r.state and r.state.life_cycle_state else None),
+                    "result": (r.state.result_state.value if r.state and r.state.result_state else None),
+                })
+    namecache = {j["job_id"]: j["name"] for j in _dbx_list_jobs(env)}
+    out = []
+    for jid, (ov, run) in best.items():
+        name = namecache.get(str(jid))
+        if not name:
+            try:
+                name = (w.jobs.get(job_id=jid).settings.name) or str(jid)
+            except Exception:
+                name = str(jid)
+        out.append({
+            "job_id": str(jid), "name": name, "run_id": str(run["run_id"]),
+            "run_start": _epoch_ms_to_iso(run["start_ms"]),
+            "run_end": _epoch_ms_to_iso(run["end_ms"]),
+            "overlap_start": _epoch_ms_to_iso(run["ov_start"]),
+            "overlap_end": _epoch_ms_to_iso(run["ov_end"]),
+            "overlap_sec": max(0, (run["ov_end"] - run["ov_start"]) // 1000),
+            "result": run["result"] or run["life"],
+        })
+    if q:
+        ql = q.lower()
+        out = [j for j in out if ql in j["name"].lower()]
+    out.sort(key=lambda x: x["name"].lower())
+    return out
+
+
+def _iso_to_epoch_ms(iso: Optional[str]) -> Optional[int]:
+    if not iso:
+        return None
+    try:
+        # Python <3.11 fromisoformat rejects a trailing 'Z'; normalize it.
+        s = iso.strip()
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        return int(datetime.fromisoformat(s).timestamp() * 1000)
+    except Exception:
+        return None
+
+
+def _epoch_ms_to_iso(ms: Optional[int]) -> Optional[str]:
+    """Epoch-ms -> ISO-8601 UTC ('...Z'); the UI re-casts to the browser tz."""
+    if not ms:
+        return None
+    try:
+        return datetime.utcfromtimestamp(ms / 1000).replace(microsecond=0).isoformat() + "Z"
+    except Exception:
+        return None
+
+
+def _dbx_recent_runs(env: str, job_id: int, limit: int = 25) -> list:
+    """Normalized recent runs for a job: [{run_id, start_ms, end_ms, life, result}]."""
+    w = _dbx_client(env)
+    out = []
+    for r in w.jobs.list_runs(job_id=job_id, limit=limit, expand_tasks=False):
+        out.append({
+            "run_id": r.run_id,
+            "start_ms": r.start_time or None,
+            "end_ms": r.end_time or None,
+            "life": (r.state.life_cycle_state.value if r.state and r.state.life_cycle_state else None),
+            "result": (r.state.result_state.value if r.state and r.state.result_state else None),
+        })
+    return out
+
+
+def _dbx_pick_run(runs: list, test_start_ms: Optional[int], test_end_ms: Optional[int]) -> dict:
+    """Choose the run that overlaps the test window AND finishes at least 20 min
+    after the test STARTED (run_start <= end AND run_end >= start + 20min; a
+    still-running run counts), picking the largest overlap. Returns {run_id,
+    reason, overlap}. No match (rather than a far-off run) when nothing qualifies."""
+    if not runs or test_end_ms is None:
+        return {"run_id": None, "reason": "no test window or no runs", "overlap": False}
+    ts = test_start_ms if test_start_ms is not None else (test_end_ms - _DBX_RUN_MATCH_SLACK_MS)
+    now_ms = int(datetime.now().timestamp() * 1000)
+    min_end_ms = ts + _DBX_RUN_MATCH_SLACK_MS
+    best, best_overlap = None, None
+    for r in runs:
+        rs = r.get("start_ms")
+        if rs is None:
+            continue
+        re_eff = r.get("end_ms") or now_ms  # still-running -> effective end is now
+        if rs <= test_end_ms and re_eff >= min_end_ms:
+            ov = min(re_eff, test_end_ms) - max(rs, ts)
+            if best is None or ov > best_overlap:
+                best, best_overlap = r, ov
+    if best is not None:
+        return {"run_id": best["run_id"], "reason": "overlaps window, ran 20min+ past test start", "overlap": True}
+    return {"run_id": None, "reason": "no run ran until 20min after the test started", "overlap": False}
+
+
+def _dbfs_read_file(w, path: str, max_bytes: int) -> bytes:
+    """Read a DBFS file fully via chunked dbfs.read (base64). Caps at max_bytes."""
+    import base64
+    CHUNK = 1024 * 1024
+    buf = bytearray()
+    offset = 0
+    while len(buf) < max_bytes:
+        resp = w.dbfs.read(path, offset=offset, length=CHUNK)
+        n = resp.bytes_read or 0
+        if resp.data:
+            buf += base64.b64decode(resp.data)
+        if not n or n < CHUNK:
+            break
+        offset += n
+    return bytes(buf[:max_bytes])
+
+
+def _dbx_run_targets(w, run_id: int) -> list:
+    """Distinct (cluster_id, driver_dir) pairs across a run's task-clusters that
+    have DBFS/Volumes log delivery configured."""
+    rd = w.jobs.get_run(run_id=run_id)
+    seen, targets = set(), []
+    for t in (rd.tasks or []):
+        ci = t.cluster_instance
+        cid = ci.cluster_id if ci else None
+        if not cid or cid in seen:
+            continue
+        seen.add(cid)
+        try:
+            cl = w.clusters.get(cluster_id=cid)
+        except Exception:
+            continue
+        conf = cl.cluster_log_conf
+        dest = None
+        if conf:
+            if conf.dbfs and conf.dbfs.destination:
+                dest = conf.dbfs.destination
+            elif conf.volumes and conf.volumes.destination:
+                dest = conf.volumes.destination
+        if dest:
+            targets.append((cid, dest.rstrip("/") + f"/{cid}/driver"))
+    return targets
+
+
+def _dbx_download_run_logs(env: str, run_id: int, progress=None) -> dict:
+    """Download a job run's driver logs (log4j/stdout/stderr/stacktrace) into a
+    fresh tempdir, in parallel, capped at _DBX_MAX_TOTAL_BYTES. Walks the run's
+    tasks -> clusters -> cluster_log_conf (DBFS/Volumes) -> <dest>/<cluster_id>/
+    driver/. ``progress`` is an optional callback(dict) invoked as files complete.
+    Returns {dir, files, clusters, total_bytes, dropped, run_id}; dir is None if
+    nothing was found. Caller owns the tempdir (rmtree)."""
+    import os as _os
+    import tempfile
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    w = _dbx_client(env)
+    targets = _dbx_run_targets(w, run_id)
+    multi = len(targets) > 1
+
+    # 1) Enumerate candidate files (parallel list across clusters) with sizes.
+    def _list_one(t):
+        cid, ddir = t
+        try:
+            return [(cid, e.path, int(e.file_size or 0))
+                    for e in w.dbfs.list(ddir)
+                    if not e.is_dir and _os.path.basename(e.path).startswith(_DBX_LOG_PREFIXES)]
+        except Exception:
+            return []
+    candidates = []
+    with ThreadPoolExecutor(max_workers=12) as ex:
+        for lst in ex.map(_list_one, targets):
+            candidates.extend(lst)
+
+    # 2) Deterministic size cap: keep files (capped per-file) until total budget.
+    planned, planned_bytes, dropped = [], 0, 0
+    for cid, path, size in candidates:
+        take = min(size, _DBX_MAX_FILE_BYTES)
+        if planned_bytes + take > _DBX_MAX_TOTAL_BYTES:
+            dropped += 1
+            continue
+        planned.append((cid, path, take))
+        planned_bytes += take
+
+    total_files = len(planned)
+    if progress:
+        progress({"phase": "downloading", "files_total": total_files, "files_done": 0,
+                  "bytes": 0, "clusters_total": len(targets), "dropped": dropped})
+
+    tmpdir = tempfile.mkdtemp(prefix="dokimos_dbxrun_")
+    lock = threading.Lock()
+    state = {"done": 0, "bytes": 0, "files": []}
+
+    def _dl(job):
+        cid, path, cap = job
+        base = _os.path.basename(path)
+        out_name = f"{cid}__{base}" if multi else base
+        try:
+            raw = _dbfs_read_file(w, path, cap)
+        except Exception:
+            raw = None
+        with lock:
+            state["done"] += 1
+            if raw is not None:
+                with open(_os.path.join(tmpdir, out_name), "wb") as fp:
+                    fp.write(raw)
+                state["bytes"] += len(raw)
+                state["files"].append({"name": out_name, "size": len(raw), "cluster_id": cid})
+            if progress:
+                progress({"phase": "downloading", "files_total": total_files,
+                          "files_done": state["done"], "bytes": state["bytes"],
+                          "clusters_total": len(targets), "dropped": dropped})
+
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        list(ex.map(_dl, planned))
+
+    if not state["files"]:
+        import shutil
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        return {"dir": None, "files": [], "clusters": [c for c, _ in targets],
+                "total_bytes": 0, "dropped": dropped, "run_id": run_id}
+    return {"dir": tmpdir, "files": state["files"], "clusters": [c for c, _ in targets],
+            "total_bytes": state["bytes"], "dropped": dropped, "run_id": run_id}
+
+
+# In-memory async download registry: token -> job record. Mirrors the report
+# password model -- ephemeral, lost on restart (the tempdir is too).
+_dbx_downloads: dict = {}
+_dbx_downloads_lock = None  # set lazily to a threading.Lock
+
+
+def _dbx_dl_lock():
+    global _dbx_downloads_lock
+    if _dbx_downloads_lock is None:
+        import threading
+        _dbx_downloads_lock = threading.Lock()
+    return _dbx_downloads_lock
+
+
+def _start_dbx_download(env: str, run_id: int, group_id: Optional[str] = None) -> str:
+    """Kick off an async driver-log download; returns a token to poll."""
+    import threading
+    token = "dl_" + secrets.token_urlsafe(8)
+    with _dbx_dl_lock():
+        _dbx_downloads[token] = {
+            "status": "running", "env": env, "run_id": run_id, "group_id": group_id,
+            "progress": {"phase": "starting", "files_total": 0, "files_done": 0, "bytes": 0},
+            "dir": None, "files": [], "total_bytes": 0, "clusters": [], "dropped": 0,
+            "error": None,
+        }
+    threading.Thread(target=_run_dbx_download, args=(token,), daemon=True,
+                     name=f"dbx-dl-{token}").start()
+    return token
+
+
+def _run_dbx_download(token: str) -> None:
+    rec = _dbx_downloads.get(token)
+    if not rec:
+        return
+    try:
+        def _prog(p):
+            with _dbx_dl_lock():
+                rec["progress"] = p
+        res = _dbx_download_run_logs(rec["env"], rec["run_id"], progress=_prog)
+        with _dbx_dl_lock():
+            rec.update({"dir": res["dir"], "files": res["files"],
+                        "total_bytes": res["total_bytes"], "clusters": res["clusters"],
+                        "dropped": res.get("dropped", 0),
+                        "status": "done" if res["dir"] else "empty"})
+        # Attach to a group's report inputs so the existing generate flow uses them.
+        if rec.get("group_id") and res["dir"]:
+            with _pipelines_lock():
+                groups = _load_groups()
+                g = groups.get(rec["group_id"])
+                if g is not None:
+                    g["report_dbx_dir"] = res["dir"]
+                    g["report_dbx_temp"] = True
+                    _save_groups(groups)
+    except Exception as exc:
+        with _dbx_dl_lock():
+            rec["status"] = "failed"
+            rec["error"] = f"{type(exc).__name__}: {exc}"
 
 
 # --------------------------------------------------------------------------- #
@@ -2650,6 +3152,25 @@ html, body {
 }
 
 /* Pipelines tab: list (left) + log viewer (right) */
+/* Themed scrollbars (Webkit + Firefox) -- thin, transparent track, bronze thumb */
+* {
+    scrollbar-width: thin;
+    scrollbar-color: rgba(205,127,50,0.45) transparent;
+}
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+    background: rgba(205,127,50,0.40);
+    border-radius: 8px;
+    border: 2px solid transparent;
+    background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover {
+    background: rgba(230,164,90,0.65);
+    background-clip: padding-box;
+}
+::-webkit-scrollbar-corner { background: transparent; }
+
 .pipelines-layout {
     display: grid;
     grid-template-columns: 360px 1fr;
@@ -2736,6 +3257,16 @@ html, body {
 .pipeline-item.status-scheduled { border-left-color: #f59e0b; }
 .pipeline-item.status-finished  { border-left-color: #10b981; }
 .pipeline-item.status-failed    { border-left-color: var(--red); }
+.pipeline-item.status-cancelled { border-left-color: #8b949e; opacity: 0.85; }
+/* Clear, colour-coded division between status sections */
+.pipelines-list-section { margin-bottom: 16px; }
+.pipelines-list-section-title { border-left: 3px solid transparent; padding-left: 8px; }
+.section-running   .pipelines-list-section-title { color: #60a5fa; border-left-color: #60a5fa; }
+.section-queued    .pipelines-list-section-title { color: #a78bfa; border-left-color: #a78bfa; }
+.section-finished  .pipelines-list-section-title { color: #10b981; border-left-color: #10b981; }
+.section-failed    .pipelines-list-section-title { color: #f85149; border-left-color: #f85149; }
+.section-cancelled .pipelines-list-section-title { color: #8b949e; border-left-color: #8b949e; }
+.section-scheduled .pipelines-list-section-title { color: #f59e0b; border-left-color: #f59e0b; }
 .pipeline-item-actions { margin-top: 6px; }
 .pipeline-rerun-btn {
     background: transparent;
@@ -2947,45 +3478,100 @@ html, body {
     background: rgba(176,141,87,0.06); overflow: hidden;
 }
 .pipeline-group-head {
-    display: flex; align-items: center; gap: 8px; padding: 8px 10px; cursor: pointer;
+    display: flex; flex-direction: column; align-items: stretch; gap: 6px;
+    padding: 8px 10px; cursor: pointer;
     font-weight: 600; background: rgba(176,141,87,0.12);
     border-bottom: 1px solid rgba(176,141,87,0.25);
 }
+.pgh-line1 { display: flex; min-width: 0; }
+.pgh-line1 .pipeline-item-name { flex: 1 1 auto; min-width: 0; }
+.pgh-line2 { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .pipeline-group-head:hover { background: rgba(176,141,87,0.20); }
 .pipeline-group-head.active { background: rgba(176,141,87,0.32); }
 .pipeline-group-members { padding: 4px 6px 6px 12px; }
 .pipeline-group-members .pipeline-item { margin: 3px 0; }
-.group-count { opacity: 0.6; font-size: 12px; }
-.group-badge { font-size: 11px; opacity: 0.75; margin-left: auto; }
+.group-count { opacity: 0.6; font-size: 12px; flex: 0 0 auto; }
+.group-badge { font-size: 11px; opacity: 0.75; margin-left: auto; white-space: nowrap; flex: 0 0 auto; }
 .group-badge-done { color: #3fb950; opacity: 0.95; }
 /* ----- Group view (right panel): hero ring + cards ----- */
 .pipelines-view-group { flex: 1; overflow: auto; padding: 20px 22px; }
-/* Fill 100% of the logs panel: left (config/iterations) + right (report) columns. */
-.gv { display: flex; flex-direction: row; align-items: flex-start; gap: 18px; width: 100%; }
-.gv-main { flex: 1 1 0; min-width: 0; display: flex; flex-direction: column; gap: 16px; }
-.gv-side { flex: 1 1 0; min-width: 0; position: sticky; top: 0; display: flex; flex-direction: column; gap: 16px; }
+/* Fill 100% of the logs panel: hero (full) -> Config+Report 50/50 row -> Iterations (full). */
+.gv { display: flex; flex-direction: column; gap: 16px; width: 100%; }
+.gv-cols { display: flex; flex-direction: row; align-items: flex-start; gap: 18px; }
+.gv-cols > .gv-card { flex: 1 1 0; min-width: 0; }   /* Configuration -- left 50% */
+.gv-cols > .gv-side { flex: 1 1 0; min-width: 0; }   /* Performance report -- right 50% */
+.gv-side { display: flex; flex-direction: column; gap: 16px; }
 .gv-side .gv-card { margin: 0; }
 @media (max-width: 900px) {
-    .gv { flex-direction: column; }
-    .gv-main, .gv-side { flex: 1 1 auto; width: 100%; position: static; }
+    .gv-cols { flex-direction: column; }
+    .gv-cols > .gv-card, .gv-cols > .gv-side { width: 100%; }
 }
-.gv-hero { display: flex; align-items: center; gap: 20px; padding: 18px 20px; border-radius: 14px;
-    background: linear-gradient(135deg, rgba(176,141,87,0.12), rgba(255,255,255,0.015));
-    border: 1px solid rgba(176,141,87,0.28); }
-.gv-ring { width: 86px; height: 86px; border-radius: 50%; flex: 0 0 auto; display: flex;
+/* Top panel: three equal (33%) cards -- Iterations | Report Portal | Configuration */
+.gv-hero { display: flex; align-items: stretch; gap: 16px; flex-wrap: wrap; }
+.gv-hcard { flex: 1 1 0; min-width: 240px; padding: 16px 18px; border-radius: 12px;
+    background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.08);
+    box-shadow: 0 3px 14px rgba(0,0,0,0.22); display: flex; flex-direction: column; }
+.gv-hcard-label { font-size: 11px; font-weight: 800; text-transform: uppercase; letter-spacing: .12em;
+    color: var(--bronze-lt, #E6A45A); margin-bottom: 12px; display: flex; align-items: center; gap: 7px; }
+.gv-hcard-label::before { content: ""; width: 7px; height: 7px; border-radius: 50%;
+    background: var(--bronze-lt, #E6A45A); box-shadow: 0 0 8px rgba(230,164,90,0.6); }
+.gv-iters-body { display: flex; align-items: center; gap: 18px; flex: 1; flex-wrap: wrap; }
+.gv-ring { width: 140px; height: 140px; border-radius: 50%; flex: 0 0 auto; display: flex;
     align-items: center; justify-content: center; transition: background .6s ease; }
-.gv-ring-in { width: 64px; height: 64px; border-radius: 50%; background: var(--bg-dark, #0d1117);
+.gv-ring-in { width: 100px; height: 100px; border-radius: 50%; background: var(--bg-dark, #0d1117);
     display: flex; align-items: center; justify-content: center; }
-.gv-ring-pct { font: 700 21px var(--font-mono); color: #e6edf3; }
-.gv-hero-meta { display: flex; flex-direction: column; gap: 7px; min-width: 0; }
-.gv-hero-h1 { font-size: 24px; font-weight: 700; color: #e6edf3; }
-.gv-hero-h2 { font-size: 16px; color: #9aa4af; }
-.gv-hdots { display: flex; gap: 5px; flex-wrap: wrap; margin-top: 5px; }
+.gv-ring-pct { font: 700 30px var(--font-mono); color: #e6edf3; }
+.gv-hero-meta { display: flex; flex-direction: column; gap: 6px; min-width: 0; flex: 1 1 auto; }
+.gv-hero-h1 { font-size: 20px; font-weight: 700; color: #e6edf3; line-height: 1.2; }
+.gv-hero-h2 { font-size: 13px; color: #9aa4af; }
+/* Run window banner (top of group view) -- important log-correlation data */
+.gv-window {
+    display: flex; flex-direction: column; gap: 7px;
+    padding: 11px 14px; border-radius: 10px;
+    background: rgba(205,127,50,0.06);
+    border: 1px solid rgba(205,127,50,0.22);
+}
+.gv-window-h {
+    font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .12em;
+    color: var(--bronze-lt, #E6A45A); opacity: 0.85;
+    display: flex; align-items: center; gap: 7px;
+}
+.gv-window-pair { display: flex; align-items: stretch; gap: 10px; flex-wrap: wrap; }
+.gv-window-cell {
+    display: flex; flex-direction: column; gap: 2px;
+    padding: 6px 11px; border-radius: 7px;
+    background: rgba(0,0,0,0.18); border: 1px solid rgba(255,255,255,0.05);
+    flex: 1 1 220px; min-width: 0;
+}
+.gv-window-k { font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: .08em; color: #8a949f; }
+.gv-window-v { font-family: var(--font-mono); font-size: 14px; font-weight: 600; color: #e6edf3; word-break: break-word; }
+.gv-window-arrow { display: flex; align-items: center; color: var(--bronze-lt, #E6A45A); font-size: 16px; opacity: 0.7; }
+.gv-iter-time { color: var(--bronze-lt, #E6A45A); font-weight: 600; }
+@media (max-width: 560px) {
+    .gv-window-arrow { transform: rotate(90deg); justify-content: center; width: 100%; }
+}
+.gv-hdots { display: flex; gap: 5px; flex-wrap: wrap; margin-top: 4px; }
 .gv-hdot { width: 22px; height: 22px; border-radius: 6px; cursor: pointer;
     display: inline-flex; align-items: center; justify-content: center;
     font: 700 11px var(--font-mono); color: #0d1117; transition: transform .1s; }
 .gv-hdot:hover { transform: scale(1.12); }
-.gv-chips { display: flex; gap: 7px; flex-wrap: wrap; margin-top: 7px; }
+.gv-chips { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
+/* Configuration card body */
+.gv-hero-cfg { display: flex; flex-direction: column; gap: 0; }
+.gv-cfg-empty { color: #6e7681; }
+.gv-cfg-row { display: flex; justify-content: space-between; align-items: baseline; gap: 16px;
+    padding: 7px 0; border-bottom: 1px solid rgba(255,255,255,0.07); }
+.gv-cfg-row:last-child { border-bottom: none; }
+.gv-cfg-k { color: #9aa4af; font-size: 12.5px; white-space: nowrap; }
+.gv-cfg-v { color: #f0f3f6; font-family: var(--font-mono); font-size: 13px; font-weight: 600;
+    text-align: right; word-break: break-word; }
+/* Report Portal card body -- links wrap, theme colour (no new colour) */
+.gv-hero-rps { display: flex; flex-wrap: wrap; gap: 7px; align-content: flex-start; }
+.gv-rp-pill { display: inline-block; font: 600 12.5px var(--font-mono); padding: 6px 12px; border-radius: 8px;
+    text-decoration: none; background: rgba(255,255,255,0.05); color: var(--bronze-lt, #E6A45A);
+    border: 1px solid rgba(255,255,255,0.12); transition: background .12s, border-color .12s; }
+.gv-rp-pill:hover { background: rgba(205,127,50,0.16); border-color: rgba(205,127,50,0.45); }
+.gv-rp-none { color: #6e7681; background: rgba(255,255,255,0.03); }
 .gv-chip { font-size: 13px; font-weight: 600; padding: 3px 12px; border-radius: 999px;
     background: rgba(255,255,255,0.07); color: #c9d1d9; }
 .gv-chip-running { background: rgba(88,166,255,0.18); color: #79b8ff; }
@@ -2999,10 +3585,13 @@ html, body {
 .gv-card-sub { font-weight: 400; text-transform: none; letter-spacing: 0; opacity: 0.7; margin-left: 6px; }
 .gv .pipelines-view-config-grid { font-size: 14px; row-gap: 9px; }
 .gv .pipelines-view-config-grid strong { font-size: 13px; }
-.gv-iters { display: flex; flex-direction: column; gap: 6px; }
-.gv-iter { display: flex; align-items: center; gap: 12px; padding: 10px 12px; border-radius: 8px;
+.gv-iters { display: flex; flex-direction: column; gap: 8px; }
+.gv-iter { display: flex; flex-direction: column; gap: 5px; padding: 10px 12px; border-radius: 8px;
     background: rgba(255,255,255,0.02); cursor: pointer; font-size: 14px; transition: background .15s; }
 .gv-iter:hover { background: rgba(255,255,255,0.07); }
+.gv-iter-top { display: flex; align-items: center; gap: 12px; }
+.gv-iter-rp { margin-left: auto; }
+.gv-iter-cfg { font: 500 12px var(--font-mono); color: #8b949e; padding-left: 42px; word-break: break-word; }
 .gv-iter-idx { font-family: var(--font-mono); font-size: 14px; opacity: 0.6; min-width: 34px; }
 .gv-iter-status { min-width: 78px; font-size: 13px; font-weight: 600; text-transform: capitalize; }
 .gv-st-finished { color: #3fb950; } .gv-st-failed { color: #f85149; }
@@ -3027,6 +3616,124 @@ html, body {
 .gv-dbx-hint { font-size: 13px; opacity: 0.6; margin-top: 8px; }
 .gv-dbx-section { margin: 4px 0 12px; }
 .gv-dbx-section .dbx-dropzone { margin: 0; }
+/* Databricks job-log picker -- collapsible nested panel inside the report card */
+.gv-dbx-panel { font-family: var(--font-mono); font-size: 13px; color: #e6edf3;
+    border-radius: 10px; background: rgba(0,0,0,0.20); border: 1px solid rgba(205,127,50,0.30); overflow: hidden; }
+.gv-dbx-toggle { display: flex; align-items: center; gap: 8px; width: 100%; text-align: left;
+    background: rgba(205,127,50,0.12); color: var(--bronze-lt, #E6A45A); border: none; cursor: pointer;
+    font-family: var(--font-mono); font-size: 12px; font-weight: 800; text-transform: uppercase; letter-spacing: .08em;
+    padding: 11px 15px; }
+.gv-dbx-toggle.open { border-bottom: 1px solid rgba(205,127,50,0.30); }
+.gv-dbx-toggle:hover { background: rgba(205,127,50,0.18); }
+.gv-dbx-tw { font-size: 11px; opacity: 0.85; }
+.gv-dbx-body { display: flex; flex-direction: column; gap: 9px; padding: 13px 15px; }
+/* Gantt-style job picker */
+.gv-chart { display: flex; flex-direction: column; gap: 2px; padding: 9px 11px; border-radius: 8px;
+    background: rgba(0,0,0,0.18); border: 1px solid rgba(255,255,255,0.06); }
+.gv-chart-legend { display: flex; gap: 16px; font-size: 12px; color: #9aa4af; margin-bottom: 5px; }
+.gv-chart-legend .lg::before { content: ""; display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 4px; vertical-align: -1px; }
+.gv-chart-legend .lg.run::before { background: rgba(205,127,50,0.6); }
+.gv-chart-legend .lg.test::before { background: var(--teal, #4FD1C5); }
+.gv-chart-legend .lg.isect::before { background: #3fb950; }
+.gv-chart-hint { font-size: 13px; color: var(--bronze-lt, #E6A45A); margin-bottom: 3px; }
+.gv-job { display: flex; flex-direction: column; gap: 7px; padding: 8px 11px; border-radius: 7px; cursor: pointer;
+    border: 1px solid rgba(255,255,255,0.10); background: rgba(255,255,255,0.025);
+    transition: background .12s, border-color .12s, box-shadow .12s; }
+.gv-job:hover { background: rgba(205,127,50,0.12); border-color: rgba(205,127,50,0.5); }
+.gv-job:focus-visible { outline: none; border-color: var(--bronze, #CD7F32); box-shadow: 0 0 0 2px rgba(205,127,50,0.35); }
+.gv-job.sel { background: rgba(205,127,50,0.20); border-color: var(--bronze, #CD7F32); box-shadow: inset 0 0 0 1px rgba(205,127,50,0.45); }
+.gv-job-top { display: flex; align-items: flex-start; gap: 9px; }
+.gv-job-radio { flex: 0 0 15px; width: 15px; height: 15px; margin-top: 2px; border-radius: 50%; box-sizing: border-box;
+    border: 2px solid var(--bronze-dk, #8B4F1A); position: relative; }
+.gv-job:hover .gv-job-radio, .gv-job.sel .gv-job-radio { border-color: var(--bronze, #CD7F32); }
+.gv-job.sel .gv-job-radio::after { content: ""; position: absolute; inset: 2.5px; border-radius: 50%; background: var(--bronze-lt, #E6A45A); }
+/* Full pipeline name -- never truncated; wraps when it has to. */
+.gv-job-name { flex: 1 1 auto; min-width: 0; font-size: 13px; color: #d6dde5; line-height: 1.35;
+    white-space: normal; overflow-wrap: anywhere; word-break: break-word; }
+.gv-job.sel .gv-job-name { color: var(--bronze-lt, #E6A45A); font-weight: 700; }
+.gv-job-dur { flex: 0 0 auto; font-size: 12px; color: #9aa4af; white-space: nowrap; margin-top: 1px; }
+.gv-job-pick { flex: 0 0 auto; font-size: 9px; text-transform: uppercase; letter-spacing: .08em; font-weight: 700;
+    padding: 2px 9px; border-radius: 10px; color: var(--bronze, #CD7F32); border: 1px solid var(--bronze-dk, #8B4F1A); background: transparent; white-space: nowrap; }
+.gv-job:hover .gv-job-pick { color: var(--bronze-lt, #E6A45A); border-color: var(--bronze, #CD7F32); }
+.gv-job.sel .gv-job-pick { color: var(--bg-dark, #0d1117); background: var(--bronze-lt, #E6A45A); border-color: var(--bronze-lt, #E6A45A); }
+.gv-job-track { position: relative; width: 100%; height: 18px; border-radius: 3px; background: rgba(255,255,255,0.05); overflow: hidden; }
+.gv-job-testband { position: absolute; top: 0; bottom: 0; background: rgba(79,209,197,0.20);
+    border-left: 1px solid rgba(79,209,197,0.55); border-right: 1px solid rgba(79,209,197,0.55); min-width: 1px; }
+.gv-job-run { position: absolute; top: 3px; bottom: 3px; background: rgba(205,127,50,0.55); border-radius: 2px; }
+.gv-job-isect { position: absolute; top: 1px; bottom: 1px; background: #3fb950; box-shadow: 0 0 5px rgba(63,185,80,0.85); border-radius: 2px; min-width: 2px; }
+.gv-job-dur { flex: 0 0 70px; text-align: right; font-size: 12px; color: #9aa4af; }
+.gv-chart-axis { display: flex; justify-content: space-between; font-size: 12px; color: #9aa4af; margin-top: 7px; padding-left: 11px; padding-right: 11px; }
+/* one-time password modal */
+.gv-pw-modal-row { display: flex; gap: 8px; margin-bottom: 6px; }
+.gv-pw-modal-row input { flex: 1; min-width: 0; font-family: var(--font-mono); font-size: 16px; letter-spacing: .04em;
+    padding: 9px 11px; border-radius: 6px; border: 1px solid var(--bronze-dk, #8B4F1A); background: var(--bg-dark, #0d1117); color: #F7FAFC; }
+.gv-dbx-row { display: flex; align-items: center; gap: 10px; }
+.gv-dbx-lbl { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .08em; color: #8a949f; min-width: 78px; }
+.gv-dbx-envs { display: inline-flex; gap: 6px; }
+.gv-dbx-env { font-family: var(--font-mono); font-size: 12px; text-transform: uppercase; padding: 3px 12px; border-radius: 6px;
+    background: transparent; color: var(--bronze, #CD7F32); border: 1px solid var(--bronze-dk, #8B4F1A); cursor: pointer; }
+.gv-dbx-env.on { background: rgba(205,127,50,0.22); color: var(--bronze-lt, #E6A45A); border-color: var(--bronze, #CD7F32); }
+.gv-dbx-auth { font-size: 12px; color: #3fb950; }
+.gv-dbx-tznote { font-size: 11px; color: var(--bronze-lt, #E6A45A); opacity: 0.9; }
+.gv-dbx-scope { font-size: 11px; color: #8a949f; }
+.gv-dbx-scope a { color: var(--bronze-lt, #E6A45A); text-decoration: none; }
+.gv-dbx-scope a:hover { text-decoration: underline; }
+.gv-dbx-note { font-size: 12px; color: #9aa4af; font-style: italic; }
+.gv-dbx-err { font-size: 12px; color: #f85149; word-break: break-word; }
+.gv-dbx-err code { background: rgba(255,255,255,0.08); padding: 1px 5px; border-radius: 4px; }
+.gv-dbx-search { display: flex; gap: 6px; }
+.gv-dbx-search input { flex: 1; min-width: 0; font-family: var(--font-mono); font-size: 13px; padding: 7px 10px;
+    border-radius: 7px; border: 1px solid rgba(255,255,255,0.15); background: var(--bg-dark, #0d1117); color: #e6edf3; }
+.gv-dbx-search input:focus { outline: none; border-color: rgba(176,141,87,0.65); }
+.gv-dbx-sel { width: 100%; font-family: var(--font-mono); font-size: 13px; padding: 7px 10px; border-radius: 7px;
+    border: 1px solid rgba(255,255,255,0.15); background: var(--bg-dark, #0d1117); color: #e6edf3; }
+.gv-dbx-sel:focus { outline: none; border-color: rgba(176,141,87,0.65); }
+.gv-dbx-win { font-size: 12px; color: #9aa4af; }
+.gv-dbx-win b { color: #e6edf3; font-weight: 700; }
+.gv-dbx-isect { font-size: 12px; color: var(--bronze-lt, #E6A45A); padding: 6px 10px; border-radius: 6px;
+    background: rgba(205,127,50,0.10); border: 1px solid rgba(205,127,50,0.25); }
+.gv-dbx-isect b { color: #F7FAFC; font-weight: 700; }
+.gv-dbx-isect-dur { color: #9aa4af; font-size: 11px; }
+/* Selected-job detail sub-panel (inside the expanded picker) */
+.gv-sel { border-radius: 9px; border: 1px solid rgba(205,127,50,0.40); background: rgba(0,0,0,0.22); overflow: hidden; }
+.gv-sel-h { font-size: 12px; font-weight: 800; text-transform: uppercase; letter-spacing: .07em;
+    color: var(--bronze-lt, #E6A45A); padding: 9px 13px; background: rgba(205,127,50,0.12);
+    border-bottom: 1px solid rgba(205,127,50,0.25); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.gv-sel-h b { color: #F7FAFC; }
+.gv-sel-body { display: flex; flex-direction: column; gap: 10px; padding: 12px 13px; }
+.gv-sel-isect { display: flex; flex-direction: column; gap: 5px; padding: 9px 11px; border-radius: 7px;
+    background: rgba(205,127,50,0.08); border: 1px solid rgba(205,127,50,0.22); }
+.gv-sel-isect-h { font-size: 12px; font-weight: 800; text-transform: uppercase; letter-spacing: .05em; color: var(--bronze-lt, #E6A45A); }
+.gv-sel-isect-range { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 10px; font-size: 13px; }
+.gv-sel-t { color: #F7FAFC; font-weight: 700; white-space: nowrap; }
+.gv-sel-arrow { color: #9aa4af; }
+.gv-sel-dur { color: #9aa4af; font-size: 12px; }
+.gv-sel-hint { font-size: 12px; color: var(--bronze-lt, #E6A45A); }
+.gv-sel-hint b { color: #F7FAFC; }
+/* Graphical run/test/intersection timeline */
+.gv-tl { display: flex; flex-direction: column; gap: 7px; margin-top: 2px; padding: 12px 14px;
+    border-radius: 8px; background: rgba(0,0,0,0.20); border: 1px solid rgba(255,255,255,0.07); }
+.gv-tl-cap { font-size: 13px; color: #c2cad3; }
+.gv-tl-row { display: flex; align-items: center; gap: 10px; }
+.gv-tl-lbl { font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: #9aa4af;
+    flex: 0 0 64px; text-align: right; }
+.gv-tl-track { position: relative; flex: 1; height: 20px; border-radius: 4px;
+    background: rgba(255,255,255,0.05); overflow: hidden; }
+.gv-tl-bar { position: absolute; top: 0; bottom: 0; border-radius: 3px; }
+.gv-tl-run { background: rgba(205,127,50,0.55); }
+.gv-tl-test { background: var(--teal, #4FD1C5); }
+.gv-tl-isect { position: absolute; top: 0; bottom: 0; background: #3fb950;
+    box-shadow: 0 0 7px rgba(63,185,80,0.85); min-width: 2px; }
+.gv-tl-ends { display: flex; justify-content: space-between; font-size: 12px; color: #9aa4af;
+    font-family: var(--font-mono); margin-left: 74px; }
+.gv-dbx-match { font-size: 12px; color: #f59e0b; }
+.gv-dbx-match.ok { color: #3fb950; }
+.gv-dbx-prog { display: flex; flex-direction: column; gap: 5px; }
+.gv-dbx-prog-bar { height: 8px; border-radius: 5px; background: rgba(255,255,255,0.08); overflow: hidden; }
+.gv-dbx-prog-bar > span { display: block; height: 100%; background: linear-gradient(90deg, var(--bronze-dk,#8B4F1A), var(--bronze-lt,#E6A45A)); transition: width .25s; }
+.gv-dbx-prog-txt { font-size: 12px; color: #9aa4af; }
+.gv-dbx-done { font-size: 12px; color: #3fb950; }
+.gv-dbx-actions { display: flex; gap: 8px; flex-wrap: wrap; }
 .gv-btn { font-family: var(--font-mono); font-size: 13px; font-weight: 700; letter-spacing: 0.06em;
     text-transform: uppercase; padding: 10px 18px; border-radius: 8px; cursor: pointer;
     border: 1px solid transparent; text-decoration: none; display: inline-flex; align-items: center; gap: 6px;
@@ -3057,7 +3764,9 @@ html, body {
     border: 1px solid rgba(248,81,73,0.5); background: transparent; color: #f85149;
 }
 .pipeline-kill-btn:hover { background: rgba(248,81,73,0.16); }
-.group-rerun-btn { margin-left: 8px; }
+.group-rerun-btn { margin-left: 0; }
+.group-remove-btn { color: var(--red, #f85149); border-color: rgba(248,81,73,0.45); }
+.group-remove-btn:hover { background: rgba(248,81,73,0.16); color: #ff7b72; }
 
 /* ----- Cards (Dokimos "std_card") ----- */
 .card {
@@ -3835,6 +4544,22 @@ SPA_HTML = f"""<!DOCTYPE html>
         </div>
     </div>
 
+    <div class="schedule-modal" id="gvPwModal" hidden>
+        <div class="schedule-modal-box">
+            <h3>Report ready</h3>
+            <p class="schedule-modal-sub">Your perf report with the Databricks pipeline-logs timeline is ready. Copy this <b>one-time password</b> &mdash; it is shown only now and is required to open the report.</p>
+            <label class="schedule-modal-label" for="gvPwModalInput">One-time password</label>
+            <div class="gv-pw-modal-row">
+                <input type="text" id="gvPwModalInput" readonly>
+                <button class="gv-btn gv-btn-ghost" type="button" onclick="_gvPwCopy()">Copy</button>
+            </div>
+            <div class="schedule-modal-actions">
+                <button class="btn-secondary" type="button" onclick="_gvPwClose()">Close</button>
+                <button class="btn-primary" type="button" id="gvPwOpenBtn">Open report &rarr;</button>
+            </div>
+        </div>
+    </div>
+
     <script>
         const MAX_INBOXES = 20;
         // Single user-facing error string -- never leak HTTP status codes,
@@ -4052,6 +4777,10 @@ SPA_HTML = f"""<!DOCTYPE html>
                     ? ('queued ' + _humanWhen(p.queued_at || p.created_at) + (p.priority ? ' · priority' : ''))
                 : (p.status === 'finished')
                     ? 'finished ' + _humanWhen(p.finished_at)
+                : (p.status === 'failed')
+                    ? 'failed ' + _humanWhen(p.finished_at)
+                : (p.status === 'cancelled')
+                    ? 'cancelled ' + _humanWhen(p.finished_at)
                     : (p.status === 'running')
                         ? ('started ' + _humanWhen(p.started_at || p.created_at) + _etaText(p))
                         : 'created ' + _humanWhen(p.created_at);
@@ -4066,15 +4795,20 @@ SPA_HTML = f"""<!DOCTYPE html>
             // doesn't also select/open the pipeline. Enqueues a fresh pipeline
             // with the same config at the end of the queue.
             let actions = '';
-            if (p.status === 'finished' || p.status === 'failed') {{
+            if (p.status === 'finished' || p.status === 'failed' || p.status === 'cancelled') {{
                 actions = '<div class="pipeline-item-actions">'
                     +   '<button class="pipeline-rerun-btn" title="Re-run with the same configuration" '
                     +     'onclick="event.stopPropagation(); _rerunPipeline(\\'' + _testsEscape(p.id) + '\\')">&#8635; rerun</button>'
                     + '</div>';
             }} else if (p.status === 'running') {{
                 actions = '<div class="pipeline-item-actions">'
-                    +   '<button class="pipeline-kill-btn" title="Kill this running pipeline" '
-                    +     'onclick="event.stopPropagation(); _killPipeline(\\'' + _testsEscape(p.id) + '\\')">&#10005; kill</button>'
+                    +   '<button class="pipeline-kill-btn" title="Cancel this running pipeline" '
+                    +     'onclick="event.stopPropagation(); _cancelPipeline(\\'' + _testsEscape(p.id) + '\\')">&#10005; cancel</button>'
+                    + '</div>';
+            }} else if (p.status === 'queued' || p.status === 'scheduled') {{
+                actions = '<div class="pipeline-item-actions">'
+                    +   '<button class="pipeline-kill-btn" title="Remove from the queue" '
+                    +     'onclick="event.stopPropagation(); _removePipeline(\\'' + _testsEscape(p.id) + '\\')">&#10005; remove</button>'
                     + '</div>';
             }}
             return '<div class="' + cls + '" onclick="_selectPipeline(\\'' + _testsEscape(p.id) + '\\')">'
@@ -4105,13 +4839,18 @@ SPA_HTML = f"""<!DOCTYPE html>
             // Re-run the whole group once it's terminal (enqueues a fresh group).
             const rerun = allDone
                 ? '<button class="pipeline-rerun-btn group-rerun-btn" title="Re-run the whole group" '
-                +   'onclick="event.stopPropagation(); _rerunGroup(\\'' + _testsEscape(gid) + '\\')">&#8635; rerun group</button>'
+                +   'onclick="event.stopPropagation(); _rerunGroup(\\'' + _testsEscape(gid) + '\\')">&#8635; rerun</button>'
                 : '';
+            // Remove the whole group (refused server-side while a member runs).
+            const remove = '<button class="pipeline-rerun-btn group-remove-btn" title="Remove this group and all its iterations" '
+                + 'onclick="event.stopPropagation(); _removeGroup(\\'' + _testsEscape(gid) + '\\')">&times; remove</button>';
             return '<div class="pipeline-group-wrap">'
                  +   '<div class="' + headCls + '" onclick="_selectGroup(\\'' + _testsEscape(gid) + '\\')">'
-                 +     '<span class="pipeline-item-name">' + liveDot + _testsEscape(info.name) + '</span>'
-                 +     '<span class="group-count">&times;' + total + '</span>'
-                 +     tag + rerun
+                 +     '<div class="pgh-line1"><span class="pipeline-item-name">' + liveDot + _testsEscape(info.name) + '</span></div>'
+                 +     '<div class="pgh-line2">'
+                 +       '<span class="group-count">&times;' + total + ' runs</span>'
+                 +       tag + rerun + remove
+                 +     '</div>'
                  +   '</div>'
                  +   '<div class="pipeline-group-members">'
                  +     members.map(_pipelineItemHtml).join('')
@@ -4127,6 +4866,7 @@ SPA_HTML = f"""<!DOCTYPE html>
             if (members.some(function(m) {{ return m.status === 'queued'; }})) return 'queued';
             if (members.some(function(m) {{ return m.status === 'scheduled'; }})) return 'scheduled';
             if (members.some(function(m) {{ return m.status === 'failed'; }})) return 'failed';
+            if (members.some(function(m) {{ return m.status === 'cancelled'; }})) return 'cancelled';
             return 'finished';
         }}
 
@@ -4146,7 +4886,7 @@ SPA_HTML = f"""<!DOCTYPE html>
                     singles.push(p);
                 }}
             }});
-            const buckets = {{ running: [], queued: [], scheduled: [], finished: [], failed: [] }};
+            const buckets = {{ running: [], queued: [], scheduled: [], finished: [], failed: [], cancelled: [] }};
             singles.forEach(function(p) {{
                 const e = {{kind: 'single', p: p, ts: (p.finished_at || p.started_at || p.queued_at || p.created_at || '')}};
                 (buckets[p.status] || buckets.finished).push(e);
@@ -4167,11 +4907,16 @@ SPA_HTML = f"""<!DOCTYPE html>
             function renderEntry(e) {{
                 return e.kind === 'group' ? _groupRowHtml(e.gid, e.info) : _pipelineItemHtml(e.p);
             }}
-            function section(label, items, action) {{
+            // Each section is colour-coded by status (section-<status>). Running
+            // and Queued ALWAYS render (even empty) so they're never "missing";
+            // the terminal sections appear only when they hold something. Within
+            // each, items are already latest-first.
+            function section(label, statusClass, items, action, alwaysShow) {{
+                if (!items.length && !alwaysShow) return '';
                 const body = items.length
                     ? items.map(renderEntry).join('')
                     : '<div class="pipelines-list-empty">none</div>';
-                return '<div class="pipelines-list-section">'
+                return '<div class="pipelines-list-section section-' + statusClass + '">'
                      +   '<div class="pipelines-list-section-title">' + label
                      +     ' <span class="count">' + items.length + '</span>'
                      +     (action || '')
@@ -4179,18 +4924,20 @@ SPA_HTML = f"""<!DOCTYPE html>
                      +   body
                      + '</div>';
             }}
-            const failedAction = buckets.failed.length
-                ? '<button class="pipelines-cleanup-btn" title="Remove all failed pipelines" onclick="event.stopPropagation(); _cleanupStatus(\\'failed\\')">clear all</button>'
-                : '';
-            const finishedAction = buckets.finished.length
-                ? '<button class="pipelines-cleanup-btn" title="Remove all finished pipelines" onclick="event.stopPropagation(); _cleanupStatus(\\'finished\\')">clear all</button>'
-                : '';
+            function _clearBtn(status, label) {{
+                return '<button class="pipelines-cleanup-btn" title="Remove all ' + label
+                     + ' pipelines" onclick="event.stopPropagation(); _cleanupStatus(\\'' + status + '\\')">clear all</button>';
+            }}
+            const failedAction    = buckets.failed.length    ? _clearBtn('failed', 'failed')       : '';
+            const finishedAction  = buckets.finished.length  ? _clearBtn('finished', 'finished')   : '';
+            const cancelledAction = buckets.cancelled.length ? _clearBtn('cancelled', 'cancelled') : '';
             panel.innerHTML =
-                  section('Running',   buckets.running)
-                + section('Queued',    buckets.queued)
-                + section('Scheduled', buckets.scheduled)
-                + section('Finished',  buckets.finished, finishedAction)
-                + section('Failed',    buckets.failed, failedAction);
+                  section('Running',   'running',   buckets.running,   '',              true)
+                + section('Queued',    'queued',    buckets.queued,    '',              true)
+                + section('Finished',  'finished',  buckets.finished,  finishedAction,  false)
+                + section('Failed',    'failed',    buckets.failed,    failedAction,    false)
+                + section('Cancelled', 'cancelled', buckets.cancelled, cancelledAction, false)
+                + section('Scheduled', 'scheduled', buckets.scheduled, '',              false);
         }}
 
         async function _cleanupStatus(status) {{
@@ -4234,11 +4981,22 @@ SPA_HTML = f"""<!DOCTYPE html>
             await _refreshPipelines();
         }}
 
-        async function _killPipeline(id) {{
-            if (!window.confirm('Kill this running pipeline? The run will be marked failed.')) return;
-            try {{ await fetch('/api/pipelines/' + encodeURIComponent(id) + '/kill', {{ method: 'POST' }}); }} catch (_e) {{}}
+        async function _cancelPipeline(id) {{
+            if (!window.confirm('Cancel this running pipeline? The run will be marked cancelled.')) return;
+            try {{ await fetch('/api/pipelines/' + encodeURIComponent(id) + '/cancel', {{ method: 'POST' }}); }} catch (_e) {{}}
             await _refreshPipelines();
             if (_selectedPipelineId === id) await _refreshLogs();
+        }}
+
+        async function _removePipeline(id) {{
+            if (!window.confirm('Remove this pipeline from the queue?')) return;
+            try {{ await fetch('/api/pipelines/' + encodeURIComponent(id) + '/remove', {{ method: 'POST' }}); }} catch (_e) {{}}
+            if (_selectedPipelineId === id) {{
+                _selectedPipelineId = null;
+                const logs = document.getElementById('pipelinesViewLogs');
+                if (logs) {{ logs.hidden = false; logs.textContent = 'No pipeline selected.'; }}
+            }}
+            await _refreshPipelines();
         }}
 
         async function _rerunGroup(gid) {{
@@ -4252,6 +5010,27 @@ SPA_HTML = f"""<!DOCTYPE html>
             await _refreshPipelines();
         }}
 
+        async function _removeGroup(gid) {{
+            if (!window.confirm('Remove this group and all its iterations?')) return;
+            try {{
+                const res = await fetch('/api/groups/' + encodeURIComponent(gid) + '/remove', {{ method: 'POST' }});
+                if (!res.ok) {{
+                    const data = await res.json().catch(function() {{ return {{}}; }});
+                    window.alert(data.error || 'Could not remove this group.');
+                    return;
+                }}
+            }} catch (_e) {{}}
+            if (_selectedGroupId === gid) {{
+                _leaveGroupView();
+                _selectedGroupId = null;
+                const gv = document.getElementById('pipelinesViewGroup');
+                if (gv) gv.hidden = true;
+                const logs = document.getElementById('pipelinesViewLogs');
+                if (logs) {{ logs.hidden = false; logs.textContent = 'No pipeline selected.'; }}
+            }}
+            await _refreshPipelines();
+        }}
+
         function _leaveGroupView() {{
             // Switching away from a group view destroys its one-time report
             // password (server-side + DOM), per the "shown once" model.
@@ -4260,6 +5039,7 @@ SPA_HTML = f"""<!DOCTYPE html>
                 try {{ fetch('/api/groups/' + encodeURIComponent(gid) + '/forget-password', {{method: 'POST'}}); }} catch (_e) {{}}
             }}
             _selectedGroupId = null;
+            if (typeof _gvDbxReset === 'function') _gvDbxReset();
             const gv = document.getElementById('pipelinesViewGroup');
             if (gv) {{ gv.hidden = true; gv.innerHTML = ''; }}
             const logs = document.getElementById('pipelinesViewLogs');
@@ -4285,9 +5065,10 @@ SPA_HTML = f"""<!DOCTYPE html>
             document.querySelectorAll('.pipeline-group').forEach(function(e) {{
                 if (e.getAttribute('onclick') && e.getAttribute('onclick').indexOf(gid) >= 0) e.classList.add('active');
             }});
+            // Stop any prior poll (e.g. a pipeline-logs poll); _refreshGroupView's
+            // _gvSyncPoll restarts a 4s group poll only while the report isn't terminal.
+            if (_logsPollTimer) {{ clearInterval(_logsPollTimer); _logsPollTimer = null; }}
             await _refreshGroupView();
-            if (_logsPollTimer) clearInterval(_logsPollTimer);
-            _logsPollTimer = setInterval(_refreshGroupView, 4000);
             if (!opts || !opts.fromPop) {{
                 const target = '/groups/' + gid;
                 if (window.location.pathname !== target) history.pushState({{tab: 'pipelines', gid: gid}}, '', target);
@@ -4335,26 +5116,19 @@ SPA_HTML = f"""<!DOCTYPE html>
                         +   '<button class="gv-btn gv-btn-ghost" onclick="_copyGroupPassword()">Copy</button>'
                         + '</div></div>';
                 }} else {{
-                    pw = '<div class="gv-pw-gone">Password was revealed and destroyed. '
+                    pw = '<div class="gv-pw-gone" id="groupPwGone">Password was revealed and destroyed. '
                         + '<button class="gv-btn gv-btn-ghost" onclick="_groupGenerate(\\'' + _testsEscape(g.id) + '\\')">Regenerate for a new password</button></div>';
                 }}
                 // Open the existing report, OR drop Databricks logs to fold them in
                 // and regenerate (the button flips to "Generate report" once files
                 // are staged). _gvDbxWire() re-attaches handlers after each re-render.
+                const _dbxEnv = (g.config && g.config.env) || 'prod';
                 inner = '<div class="gv-report-meta">' + meta + '</div>'
                       + '<div class="gv-dbx-section">'
-                      +   '<div class="dbx-dropzone" id="gvDbxDropzone" tabindex="0" '
-                      +     'onclick="document.getElementById(\\'gvDbxFileInput\\').click()" '
-                      +     'onkeydown="if(event.key===\\'Enter\\'||event.key===\\' \\'){{event.preventDefault();document.getElementById(\\'gvDbxFileInput\\').click();}}">'
-                      +     '<input type="file" id="gvDbxFileInput" multiple accept=".log,.gz,.txt" style="display:none">'
-                      +     '<input type="file" id="gvDbxFolderInput" multiple webkitdirectory directory style="display:none">'
-                      +     '<div class="dbx-dropzone-cta">Drop files or a folder here, or click to browse</div>'
-                      +     '<div class="dbx-dropzone-hint">'
-                      +       '<a href="#" class="dbx-folder-link" onclick="event.preventDefault();event.stopPropagation();document.getElementById(\\'gvDbxFolderInput\\').click();">Pick a folder instead</a>'
-                      +       '&nbsp;&middot;&nbsp; Accepts <code>log4j-*.log[.gz]</code>, <code>stdout*.txt</code>, <code>stderr*.txt</code>. Other files are ignored.'
-                      +     '</div>'
-                      +   '</div>'
-                      +   '<div class="dbx-file-list" id="gvDbxFileList"></div>'
+                      +   '<div id="gvDbxPanel" class="gv-dbx-panel" '
+                      +     'data-gid="' + _testsEscape(g.id) + '" data-env="' + _testsEscape(_dbxEnv) + '" '
+                      +     'data-start="' + _testsEscape(g.iterations_started_at || '') + '" '
+                      +     'data-end="' + _testsEscape(g.iterations_finished_at || '') + '"></div>'
                       + '</div>'
                       + '<div class="gv-report-actions">'
                       +   '<button id="groupReportBtn" class="gv-btn gv-btn-primary" '
@@ -4366,6 +5140,48 @@ SPA_HTML = f"""<!DOCTYPE html>
                 inner = '<div class="gv-report-wait">Generates automatically once every iteration finishes.</div>';
             }}
             return '<div class="' + cls + '"><div class="gv-card-h">Performance report</div>' + inner + '</div>';
+        }}
+
+        // Format an ISO timestamp in the VIEWER's browser timezone. Full date +
+        // time + tz label (e.g. "Jun 08, 2026, 17:04:19 GMT+2"). Used for the
+        // run-window data we parse pipeline logs against, so it must show seconds
+        // and the local tz unambiguously.
+        function _fmtLocal(iso) {{
+            if (!iso) return '\\u2014';
+            const d = new Date(iso);
+            if (isNaN(d.getTime())) return iso;
+            return d.toLocaleString([], {{ year: 'numeric', month: 'short', day: '2-digit',
+                hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false, timeZoneName: 'short' }});
+        }}
+        function _fmtClock(iso) {{
+            if (!iso) return '\\u2014';
+            const d = new Date(iso);
+            if (isNaN(d.getTime())) return iso;
+            return d.toLocaleTimeString([], {{ hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }});
+        }}
+        // Compact local date+time (24h), e.g. "Jun 08, 17:04:19". Always shows the
+        // date so multi-day/overnight runs can't be misread as same-day.
+        function _fmtDT(iso) {{
+            if (!iso) return '\\u2014';
+            const d = new Date(iso);
+            if (isNaN(d.getTime())) return iso;
+            return d.toLocaleString([], {{ month: 'short', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }});
+        }}
+        // The viewer's local timezone short name (e.g. "GMT+2"), so every time we
+        // show is explicitly labeled as local -- run times come from Databricks as
+        // UTC and are converted here, same as the test-window banner.
+        function _tzLabel() {{
+            try {{
+                const parts = new Intl.DateTimeFormat([], {{ timeZoneName: 'short' }}).formatToParts(new Date());
+                const p = parts.find(function(x) {{ return x.type === 'timeZoneName'; }});
+                return p ? p.value : '';
+            }} catch (_e) {{ return ''; }}
+        }}
+        function _fmtDur(sec) {{
+            sec = Math.max(0, Math.round(sec||0));
+            if (sec < 60) return sec + 's';
+            const h = Math.floor(sec/3600), m = Math.floor((sec%3600)/60), s = sec%60;
+            return (h ? h+'h ' : '') + (m||h ? m+'m ' : '') + s + 's';
         }}
 
         function _groupViewHtml(g) {{
@@ -4393,6 +5209,26 @@ SPA_HTML = f"""<!DOCTYPE html>
                      + 'title="iteration #' + (m.iteration_index || '?') + ' \\u2014 ' + m.status + '" '
                      + 'onclick="_selectPipeline(\\'' + _testsEscape(m.id) + '\\')">' + (m.iteration_index || '') + '</span>';
             }}).join('');
+            // Top-panel configuration summary (shared) + per-iteration Report Portal links.
+            const _cfg = g.config || {{}};
+            const _cfgItems = [
+                ['Environment', _cfg.env],
+                ['Parallel', _cfg.parallel],
+                ['Retries', _cfg.scenario_retry],
+                ['Scenarios', _cfg.scenario_count != null ? (_cfg.scenario_count + ' @perf') : null],
+                ['Max runtime', _cfg.max_runtime_sec ? (Math.round(_cfg.max_runtime_sec / 60) + ' min') : null],
+                ['Est / iter', _cfg.est_runtime_sec ? ('~' + Math.max(1, Math.round(_cfg.est_runtime_sec / 60)) + ' min') : null],
+                ['Tests filter', _cfg.tests]
+            ].filter(function(r) {{ return r[1] != null && r[1] !== ''; }});
+            const _cfgSummary = _cfgItems.map(function(r) {{
+                return '<div class="gv-cfg-row"><span class="gv-cfg-k">' + r[0] + '</span>'
+                     + '<span class="gv-cfg-v">' + _testsEscape(String(r[1])) + '</span></div>';
+            }}).join('');
+            const _rpLinks = _mlist.map(function(m) {{
+                return m.rp_url
+                    ? '<a class="gv-rp-pill" href="' + _testsEscape(m.rp_url) + '" target="_blank" rel="noopener noreferrer" onclick="event.stopPropagation()">#' + (m.iteration_index || '?') + ' Report Portal &rarr;</a>'
+                    : '<span class="gv-rp-pill gv-rp-none">#' + (m.iteration_index || '?') + ' ' + (m.status === 'finished' || m.status === 'failed' ? 'no launch' : 'pending') + '</span>';
+            }}).join('');
             const members = (g.members || []).map(function(m) {{
                 const mp = m.progress || {{}};
                 // Prefer the live/actual progress total (filter-aware) over the estimate.
@@ -4401,35 +5237,84 @@ SPA_HTML = f"""<!DOCTYPE html>
                 const mpct = tot ? Math.min(100, Math.round(mdone / tot * 100)) : (m.status === 'finished' || m.status === 'failed' ? 100 : 0);
                 const color = m.status === 'finished' ? '#3fb950' : (m.status === 'failed' ? '#f85149' : (m.status === 'running' ? '#58a6ff' : '#8b949e'));
                 const rp = m.rp_url
-                    ? '<a class="rp-link" href="' + _testsEscape(m.rp_url) + '" target="_blank" rel="noopener noreferrer" onclick="event.stopPropagation()">RP &rarr;</a>'
-                    : '<span class="gv-iter-norp">no launch</span>';
+                    ? '<a class="rp-link" href="' + _testsEscape(m.rp_url) + '" target="_blank" rel="noopener noreferrer" onclick="event.stopPropagation()">Report Portal &rarr;</a>'
+                    : '<span class="gv-iter-norp">' + (m.status === 'finished' || m.status === 'failed' ? 'no RP launch' : 'pending') + '</span>';
+                // Per-iteration start->end clock (viewer-local tz) + duration line.
+                let dur = '';
+                if (m.started_at && m.finished_at) {{
+                    const s = Math.max(0, Math.round((new Date(m.finished_at) - new Date(m.started_at)) / 1000));
+                    dur = ' &middot; <span class="gv-iter-time">' + _fmtClock(m.started_at) + ' &rarr; ' + _fmtClock(m.finished_at) + '</span>'
+                        + ' &middot; took ' + (s >= 60 ? Math.floor(s / 60) + 'm ' + (s % 60) + 's' : s + 's');
+                }} else if (m.started_at) {{
+                    dur = ' &middot; <span class="gv-iter-time">started ' + _fmtClock(m.started_at) + '</span>';
+                }}
+                const cfgBits = [
+                    m.env ? 'env=' + m.env : '', m.parallel != null ? 'parallel=' + m.parallel : '',
+                    m.scenario_retry != null ? 'retries=' + m.scenario_retry : '',
+                    m.scenario_count != null ? m.scenario_count + ' @perf' : '',
+                    m.max_runtime_sec ? 'max ' + Math.round(m.max_runtime_sec / 60) + 'm' : '',
+                    (m.tests ? 'tests=' + m.tests : '')
+                ].filter(Boolean).join(' &middot; ');
                 return '<div class="gv-iter" onclick="_selectPipeline(\\'' + _testsEscape(m.id) + '\\')">'
-                     +   '<span class="gv-iter-idx">#' + (m.iteration_index || '?') + '</span>'
-                     +   '<span class="gv-iter-status gv-st-' + m.status + '">' + m.status + '</span>'
-                     +   '<span class="gv-iter-bar"><span style="width:' + mpct + '%;background:' + color + '"></span></span>'
-                     +   '<span class="gv-iter-num">' + mdone + '/' + tot + '</span>'
-                     +   rp
+                     +   '<div class="gv-iter-top">'
+                     +     '<span class="gv-iter-idx">#' + (m.iteration_index || '?') + '</span>'
+                     +     '<span class="gv-iter-status gv-st-' + m.status + '">' + m.status + '</span>'
+                     +     '<span class="gv-iter-bar"><span style="width:' + mpct + '%;background:' + color + '"></span></span>'
+                     +     '<span class="gv-iter-num">' + mdone + '/' + tot + '</span>'
+                     +     '<span class="gv-iter-rp">' + rp + '</span>'
+                     +   '</div>'
+                     +   '<div class="gv-iter-cfg">' + cfgBits + dur + '</div>'
                      + '</div>';
             }}).join('');
+            const _hasWin = g.iterations_started_at || g.iterations_finished_at;
+            const _win = _hasWin
+                ? '<div class="gv-window">'
+                +   '<div class="gv-window-h">Pipeline run window</div>'
+                +   '<div class="gv-window-pair">'
+                +     '<div class="gv-window-cell"><span class="gv-window-k">Start</span>'
+                +       '<span class="gv-window-v">' + _testsEscape(_fmtLocal(g.iterations_started_at)) + '</span></div>'
+                +     '<div class="gv-window-arrow">&rarr;</div>'
+                +     '<div class="gv-window-cell"><span class="gv-window-k">End</span>'
+                +       '<span class="gv-window-v">' + _testsEscape(_fmtLocal(g.iterations_finished_at)) + '</span></div>'
+                +   '</div>'
+                + '</div>'
+                : '';
             return '<div class="gv">'
-                 +   '<div class="gv-main">'
-                 +     '<div class="gv-hero">'
-                 +       '<div class="gv-ring" style="background: ' + _pie + '" title="each slice is one iteration, colored by its status">'
-                 +         '<div class="gv-ring-in"><span class="gv-ring-pct">' + pct + '%</span></div>'
-                 +       '</div>'
-                 +       '<div class="gv-hero-meta">'
-                 +         '<div class="gv-hero-h1">' + g.iterations_done + ' / ' + g.iteration_count + ' iterations</div>'
-                 +         '<div class="gv-hero-h2">' + g.scenarios_done + ' / ' + g.scenarios_total + ' scenarios &middot; ETA ' + eta + '</div>'
-                 +         '<div class="gv-hdots">' + _hdots + '</div>'
-                 +         (chips ? '<div class="gv-chips">' + chips + '</div>' : '')
+                 +   _win
+                 +   '<div class="gv-hero">'
+                 +     '<div class="gv-hcard gv-hcard-iters">'
+                 +       '<div class="gv-hcard-label">Iterations</div>'
+                 +       '<div class="gv-iters-body">'
+                 +         '<div class="gv-ring" style="background: ' + _pie + '" title="each slice is one iteration, colored by its status">'
+                 +           '<div class="gv-ring-in"><span class="gv-ring-pct">' + pct + '%</span></div>'
+                 +         '</div>'
+                 +         '<div class="gv-hero-meta">'
+                 +           '<div class="gv-hero-h1">' + g.iterations_done + ' / ' + g.iteration_count + ' iterations</div>'
+                 +           '<div class="gv-hero-h2">' + g.scenarios_done + ' / ' + g.scenarios_total + ' scenarios &middot; ETA ' + eta + '</div>'
+                 +           '<div class="gv-hdots">' + _hdots + '</div>'
+                 +           (chips ? '<div class="gv-chips">' + chips + '</div>' : '')
+                 +         '</div>'
                  +       '</div>'
                  +     '</div>'
-                 +     '<div class="gv-card"><div class="gv-card-h">Configuration <span class="gv-card-sub">shared by all iterations</span></div>'
-                 +       _groupConfigRows(g.config) + '</div>'
-                 +     '<div class="gv-card"><div class="gv-card-h">Iterations</div><div class="gv-iters">' + members + '</div></div>'
+                 +     '<div class="gv-hcard"><div class="gv-hcard-label">Report Portal</div><div class="gv-hero-rps">' + _rpLinks + '</div></div>'
+                 +     '<div class="gv-hcard"><div class="gv-hcard-label">Configuration</div><div class="gv-hero-cfg">' + (_cfgSummary || '<span class="gv-cfg-empty">&mdash;</span>') + '</div></div>'
                  +   '</div>'
                  +   '<div class="gv-side">' + _groupReportHtml(g) + '</div>'
                  + '</div>';
+        }}
+
+        // Keep the 4s group poll running only while there's something to update.
+        // Once the report is terminal (ready/failed) the card is static, so we stop
+        // polling -- that way re-renders never clobber the always-open Databricks
+        // section the user is interacting with.
+        function _gvSyncPoll(status) {{
+            if (!_selectedGroupId) return;
+            const terminal = (status === 'ready' || status === 'failed');
+            if (terminal) {{
+                if (_logsPollTimer) {{ clearInterval(_logsPollTimer); _logsPollTimer = null; }}
+            }} else if (!_logsPollTimer) {{
+                _logsPollTimer = setInterval(_refreshGroupView, 4000);
+            }}
         }}
 
         async function _refreshGroupView() {{
@@ -4448,24 +5333,15 @@ SPA_HTML = f"""<!DOCTYPE html>
                     status.innerHTML = live + '<span class="status-pill">' + label + '</span>';
                 }}
                 if (gv) gv.innerHTML = _groupViewHtml(g);
-                // Re-attach the Databricks dropzone + restore its staged files
-                // after the poll replaced the report card's DOM.
-                _gvDbxWire();
+                _gvDbxRenderPanel();
+                _gvSyncPoll(g.report_status);
             }} catch (_e) {{ /* keep last render */ }}
         }}
 
         async function _groupReportBtnClick() {{
             const btn = document.getElementById('groupReportBtn');
             if (!btn) return;
-            const accepted = _gvDbxAccepted();
-            if (accepted.length) {{
-                btn.disabled = true; btn.textContent = 'Reading files\\u2026';
-                let files = [];
-                try {{ files = await _readDbxFilesAsBase64(null, _gvDbxFiles); }} catch (_e) {{}}
-                _groupGenerate(btn.getAttribute('data-gid'), files);
-            }} else {{
-                window.open(btn.getAttribute('data-link'), '_blank', 'noopener');
-            }}
+            window.open(btn.getAttribute('data-link'), '_blank', 'noopener');
         }}
 
         async function _groupGenerate(gid, dbxFiles) {{
@@ -4475,8 +5351,292 @@ SPA_HTML = f"""<!DOCTYPE html>
                 opts.body = JSON.stringify({{databricks_files: dbxFiles}});
             }}
             try {{ await fetch('/api/groups/' + encodeURIComponent(gid) + '/generate', opts); }} catch (_e) {{}}
-            _gvDbxFiles.length = 0;   // clear staged uploads once generation is kicked off
             _refreshGroupView();
+        }}
+
+        // ===== Databricks job-run logs -> perf report on the job timeline =====
+        // A collapsible section (collapsed by default). When expanded it shows a
+        // graphical Gantt-style picker of the jobs whose run overlaps the test
+        // window; clicking a job selects it. Selecting a job morphs the report
+        // card's button into "Generate report with pipeline logs timeline", which
+        // downloads that run's logs, regenerates the report, then shows the
+        // one-time password in a modal and opens the report.
+        var _gvDbx = {{ expanded:false, gid:null, env:null, start:'', end:'',
+                       auth:null, jobs:[], jobsLoading:false, q:'', selectedJob:'', showAll:false,
+                       windowed:false, busy:false }};
+
+        function _gvDbxBytes(n) {{ n=n||0; return n>=1048576 ? (n/1048576).toFixed(1)+' MB' : (n>=1024?(n/1024).toFixed(0)+' KB':n+' B'); }}
+        function _sleep(ms) {{ return new Promise(function(res) {{ setTimeout(res, ms); }}); }}
+
+        function _gvDbxReset() {{
+            _gvDbx.expanded=false; _gvDbx.gid=null; _gvDbx.auth=null; _gvDbx.jobs=[]; _gvDbx.q='';
+            _gvDbx.selectedJob=''; _gvDbx.showAll=false; _gvDbx.windowed=false; _gvDbx.busy=false;
+        }}
+
+        async function _gvDbxInit() {{
+            await _gvDbxCheckAuth();
+            if (_gvDbx.auth && _gvDbx.auth.authorized) await _gvDbxLoadJobs();
+        }}
+
+        function _gvDbxToggle() {{
+            _gvDbx.expanded = !_gvDbx.expanded;
+            if (_gvDbx.expanded && !_gvDbx.auth) _gvDbxInit();
+            _gvDbxRenderPanel();
+        }}
+
+        async function _gvDbxSetEnv(env) {{
+            _gvDbx.env = env; _gvDbx.jobs=[]; _gvDbx.selectedJob='';
+            _gvDbxRenderPanel();
+            await _gvDbxCheckAuth();
+            if (_gvDbx.auth && _gvDbx.auth.authorized) await _gvDbxLoadJobs();
+        }}
+
+        async function _gvDbxCheckAuth() {{
+            try {{
+                const r = await fetch('/api/databricks/auth?env=' + encodeURIComponent(_gvDbx.env));
+                _gvDbx.auth = await r.json();
+            }} catch(_e) {{ _gvDbx.auth = {{authorized:false, error:'request failed'}}; }}
+            _gvDbxRenderPanel();
+        }}
+
+        async function _gvDbxLoadJobs() {{
+            _gvDbx.jobsLoading = true; _gvDbxRenderPanel();
+            try {{
+                let url = '/api/databricks/jobs?env=' + encodeURIComponent(_gvDbx.env) + '&q=' + encodeURIComponent(_gvDbx.q||'');
+                if (!_gvDbx.showAll && _gvDbx.start && _gvDbx.end) {{
+                    url += '&start=' + encodeURIComponent(_gvDbx.start) + '&end=' + encodeURIComponent(_gvDbx.end);
+                }} else if (_gvDbx.showAll) {{ url += '&all=1'; }}
+                const r = await fetch(url);
+                const d = await r.json();
+                _gvDbx.jobs = d.jobs || [];
+                _gvDbx.windowed = !!d.windowed;
+            }} catch(_e) {{ _gvDbx.jobs = []; _gvDbx.windowed = false; }}
+            _gvDbx.jobsLoading = false; _gvDbxRenderPanel();
+        }}
+
+        function _gvDbxToggleAll() {{ _gvDbx.showAll = !_gvDbx.showAll; _gvDbx.selectedJob=''; _gvDbxLoadJobs(); }}
+        function _gvDbxOnSearch(v) {{ _gvDbx.q = v; }}
+        function _gvDbxSearchGo() {{ _gvDbxLoadJobs(); }}
+
+        function _gvDbxSelectJob(jobId) {{
+            if (_gvDbx.busy) return;
+            _gvDbx.selectedJob = (_gvDbx.selectedJob === jobId) ? '' : jobId;
+            _gvDbxRenderPanel();
+        }}
+
+        // Graphical Gantt picker: one clickable row per job, all on a shared time
+        // axis. The teal band is the test window, the bronze bar is the job run, the
+        // green segment is their intersection. Clicking a row selects that job.
+        function _gvDbxJobChart() {{
+            const jobs = _gvDbx.jobs || [];
+            if (!jobs.length) return '<div class="gv-dbx-note">' + (_gvDbx.showAll ? 'no jobs' : 'no jobs overlap the test window') + '</div>';
+            const ts = new Date(_gvDbx.start).getTime(), te = new Date(_gvDbx.end).getTime();
+            const now = Date.now();
+            let a0 = Math.min(ts, te), a1 = Math.max(ts, te);
+            jobs.forEach(function(j) {{
+                if (j.run_start) {{
+                    a0 = Math.min(a0, new Date(j.run_start).getTime());
+                    a1 = Math.max(a1, j.run_end ? new Date(j.run_end).getTime() : now);
+                }}
+            }});
+            const span = Math.max(1, a1 - a0);
+            function seg(s, e, mn) {{
+                let l = (s - a0) / span * 100, w = Math.max(mn || 0.4, (e - s) / span * 100);
+                if (l < 0) l = 0; if (l + w > 100) w = 100 - l;
+                return 'left:' + l.toFixed(2) + '%;width:' + w.toFixed(2) + '%';
+            }}
+            const rows = jobs.map(function(j) {{
+                const sel = (j.job_id === _gvDbx.selectedJob);
+                const rs = j.run_start ? new Date(j.run_start).getTime() : null;
+                const re = j.run_end ? new Date(j.run_end).getTime() : now;
+                const os = j.overlap_start ? new Date(j.overlap_start).getTime() : null;
+                const oe = j.overlap_end ? new Date(j.overlap_end).getTime() : null;
+                const runBar = (rs != null) ? '<div class="gv-job-run" style="' + seg(rs, re) + '"></div>' : '';
+                const isectBar = (os != null) ? '<div class="gv-job-isect" style="' + seg(os, oe, 0.8) + '" title="intersection"></div>' : '';
+                const runTxt = j.run_start ? (_fmtDT(j.run_start) + ' \\u2192 ' + (j.run_end ? _fmtDT(j.run_end) : 'running')) : '';
+                return '<div class="gv-job' + (sel ? ' sel' : '') + '" role="button" tabindex="0" onclick="_gvDbxSelectJob(\\'' + _testsEscape(j.job_id) + '\\')" onkeydown="if(event.key===\\'Enter\\'||event.key===\\' \\'){{event.preventDefault();_gvDbxSelectJob(\\'' + _testsEscape(j.job_id) + '\\');}}" title="' + runTxt + '">'
+                    + '<div class="gv-job-top">'
+                    +   '<span class="gv-job-radio"></span>'
+                    +   '<div class="gv-job-name">' + _testsEscape(j.name) + '</div>'
+                    +   '<span class="gv-job-dur">\\u2229 ' + _fmtDur(j.overlap_sec || 0) + '</span>'
+                    +   '<span class="gv-job-pick">' + (sel ? 'selected' : 'select') + '</span>'
+                    + '</div>'
+                    + '<div class="gv-job-track"><div class="gv-job-testband" style="' + seg(ts, te, 0.8) + '"></div>' + runBar + isectBar + '</div>'
+                    + '</div>';
+            }}).join('');
+            return '<div class="gv-chart">'
+                + '<div class="gv-chart-hint">Click a job to select its run \\u2014 then use the button below to build the report.</div>'
+                + '<div class="gv-chart-legend"><span class="lg run">job run</span><span class="lg test">test window</span><span class="lg isect">intersection</span></div>'
+                + rows
+                + '<div class="gv-chart-axis"><span>' + _fmtDT(new Date(a0).toISOString()) + '</span><span>' + _fmtDT(new Date(a1).toISOString()) + '</span></div>'
+                + '</div>';
+        }}
+
+        // Detail timeline for the selected job (two aligned tracks: run + test).
+        function _gvDbxDetailTimeline(job) {{
+            if (!job || !job.run_start || !job.overlap_start) return '';
+            const rs = new Date(job.run_start).getTime();
+            const reEff = job.run_end ? new Date(job.run_end).getTime() : Date.now();
+            const ts = new Date(_gvDbx.start).getTime(), te = new Date(_gvDbx.end).getTime();
+            const os = new Date(job.overlap_start).getTime(), oe = new Date(job.overlap_end).getTime();
+            if ([rs, reEff, ts, te, os, oe].some(function(x) {{ return isNaN(x); }})) return '';
+            const a0 = Math.min(rs, ts), a1 = Math.max(reEff, te), span = Math.max(1, a1 - a0);
+            function seg(s, e, mn) {{ let l=(s-a0)/span*100, w=Math.max(mn||0.6,(e-s)/span*100); if(l<0)l=0; if(l+w>100)w=100-l; return 'left:'+l.toFixed(2)+'%;width:'+w.toFixed(2)+'%'; }}
+            return '<div class="gv-tl">'
+                + '<div class="gv-tl-cap">Where the test window falls within this job run:</div>'
+                + '<div class="gv-tl-row"><span class="gv-tl-lbl">job run</span><div class="gv-tl-track">'
+                +   '<div class="gv-tl-bar gv-tl-run" style="' + seg(rs, reEff) + '"></div>'
+                +   '<div class="gv-tl-isect" style="' + seg(os, oe, 1.5) + '"></div></div></div>'
+                + '<div class="gv-tl-row"><span class="gv-tl-lbl">test</span><div class="gv-tl-track">'
+                +   '<div class="gv-tl-bar gv-tl-test" style="' + seg(ts, te, 1.5) + '"></div></div></div>'
+                + '<div class="gv-tl-ends"><span>' + _fmtDT(new Date(a0).toISOString()) + '</span><span>' + _fmtDT(new Date(a1).toISOString()) + '</span></div>'
+                + '</div>';
+        }}
+
+        // Set the report card's primary button: "Open report" (no logs) by default,
+        // or "Generate report with pipeline logs timeline" once a job is selected.
+        function _gvDbxSyncReportBtn() {{
+            const btn = document.getElementById('groupReportBtn');
+            if (!btn || _gvDbx.busy) return;
+            const timelineMode = _gvDbx.expanded && _gvDbx.selectedJob;
+            if (timelineMode) {{
+                btn.innerHTML = '&#9776; Generate report with pipeline logs timeline';
+                btn.disabled = false;
+                btn.onclick = _gvDbxRunTimeline;
+            }} else {{
+                btn.innerHTML = 'Open report &rarr;';
+                btn.disabled = false;
+                btn.onclick = _groupReportBtnClick;
+            }}
+            // The "Regenerate for a new password" fallback is redundant while the
+            // timeline-generate flow is offered -- hide it then.
+            const pwGone = document.getElementById('groupPwGone');
+            if (pwGone) pwGone.style.display = timelineMode ? 'none' : '';
+        }}
+
+        // Download the selected job's run logs, regenerate the report with them,
+        // then show the one-time password in a modal and open the report.
+        async function _gvDbxRunTimeline() {{
+            const job = (_gvDbx.jobs || []).find(function(j) {{ return j.job_id === _gvDbx.selectedJob; }});
+            if (!job || !job.run_id) return;
+            const btn = document.getElementById('groupReportBtn');
+            function setBtn(t, dis) {{ if (btn) {{ btn.innerHTML = t; btn.disabled = !!dis; }} }}
+            _gvDbx.busy = true;
+            // 1) download the run's driver logs
+            setBtn('Downloading logs\\u2026', true);
+            let token;
+            try {{
+                const r = await fetch('/api/databricks/download', {{ method:'POST', headers:{{'Content-Type':'application/json'}},
+                    body: JSON.stringify({{ env:_gvDbx.env, run_id:job.run_id, group_id:_gvDbx.gid }}) }});
+                token = (await r.json()).token;
+            }} catch(_e) {{}}
+            if (!token) {{ _gvDbx.busy=false; setBtn('Download failed \\u2014 click to retry', false); btn.onclick=_gvDbxRunTimeline; return; }}
+            let dl = {{}};
+            for (let i=0; i<450; i++) {{
+                await _sleep(2000);
+                try {{ dl = await (await fetch('/api/databricks/download/' + encodeURIComponent(token))).json(); }} catch(_e) {{ continue; }}
+                if (dl.status === 'running' || dl.status === 'starting') {{
+                    const p = dl.progress || {{}};
+                    setBtn('Downloading logs\\u2026 ' + (p.files_done||0) + '/' + (p.files_total||0) + ' (' + _gvDbxBytes(p.bytes) + ')', true);
+                    continue;
+                }}
+                break;
+            }}
+            if (dl.status === 'empty') {{ _gvDbx.busy=false; setBtn('No driver logs for this run \\u2014 pick another', false); btn.onclick=_gvDbxRunTimeline; return; }}
+            if (dl.status !== 'done') {{ _gvDbx.busy=false; setBtn('Download failed \\u2014 click to retry', false); btn.onclick=_gvDbxRunTimeline; return; }}
+            // 2) regenerate the report with the logs attached
+            setBtn('Generating report\\u2026', true);
+            try {{ await fetch('/api/groups/' + encodeURIComponent(_gvDbx.gid) + '/generate', {{ method:'POST' }}); }} catch(_e) {{}}
+            let g = {{}};
+            for (let i=0; i<200; i++) {{
+                await _sleep(1500);
+                try {{ g = await (await fetch('/api/groups/' + encodeURIComponent(_gvDbx.gid))).json(); }} catch(_e) {{ continue; }}
+                if (g.report_status === 'generating' || g.report_status === 'none') {{ setBtn('Generating report\\u2026', true); continue; }}
+                break;
+            }}
+            _gvDbx.busy = false;
+            if (g.report_status !== 'ready') {{ setBtn('Report failed \\u2014 click to retry', false); btn.onclick=_gvDbxRunTimeline; return; }}
+            // 3) one-time password modal + open the report
+            const share = (g.report && (g.report.share_url || g.report.url)) || '';
+            _gvDbxShowPwModal(g.report_password || '', share);
+            _gvDbxSyncReportBtn();
+        }}
+
+        function _gvDbxShowPwModal(pw, share) {{
+            const modal = document.getElementById('gvPwModal');
+            if (!modal) return;
+            const inp = document.getElementById('gvPwModalInput');
+            if (inp) inp.value = pw || '(password already revealed)';
+            const open = document.getElementById('gvPwOpenBtn');
+            if (open) open.onclick = function() {{ if (share) window.open(PUBLIC_REPORT_ORIGIN + share, '_blank', 'noopener'); }};
+            modal.hidden = false;
+        }}
+        function _gvPwClose() {{ const m = document.getElementById('gvPwModal'); if (m) m.hidden = true; }}
+        function _gvPwCopy() {{
+            const i = document.getElementById('gvPwModalInput'); if (!i) return;
+            i.select(); try {{ document.execCommand('copy'); }} catch(_e) {{}}
+            if (navigator.clipboard) {{ try {{ navigator.clipboard.writeText(i.value); }} catch(_e) {{}} }}
+        }}
+
+        function _gvDbxRenderPanel() {{
+            const el = document.getElementById('gvDbxPanel');
+            if (!el) return;
+            const gid = el.getAttribute('data-gid');
+            if (_gvDbx.gid !== gid) {{
+                _gvDbxReset();
+                _gvDbx.gid = gid;
+                _gvDbx.env = el.getAttribute('data-env') || 'prod';
+                _gvDbx.start = el.getAttribute('data-start') || '';
+                _gvDbx.end = el.getAttribute('data-end') || '';
+            }}
+            const head = '<button class="gv-dbx-toggle' + (_gvDbx.expanded ? ' open' : '') + '" onclick="_gvDbxToggle()">'
+                + '<span class="gv-dbx-tw">' + (_gvDbx.expanded ? '\\u25be' : '\\u25b8') + '</span> Show perf report on Databricks job timeline</button>';
+            if (!_gvDbx.expanded) {{ el.innerHTML = head; _gvDbxSyncReportBtn(); return; }}
+            let h = head + '<div class="gv-dbx-body">';
+            h += '<div class="gv-dbx-row"><span class="gv-dbx-lbl">Workspace</span><span class="gv-dbx-envs">'
+               + ['uat','prod'].map(function(e) {{ return '<button class="gv-dbx-env' + (e===_gvDbx.env?' on':'') + '" onclick="_gvDbxSetEnv(\\''+e+'\\')">'+e+'</button>'; }}).join('')
+               + '</span></div>';
+            if (!_gvDbx.auth) {{ el.innerHTML = h + '<div class="gv-dbx-note">Checking authorization&hellip;</div></div>'; _gvDbxSyncReportBtn(); return; }}
+            if (!_gvDbx.auth.authorized) {{
+                el.innerHTML = h + '<div class="gv-dbx-err">Not authorized for ' + _gvDbx.env + '. Run <code>databricks auth login -p gen-' + _gvDbx.env + '-uw2</code> on the host, then retry.</div>'
+                   + '<button class="gv-btn gv-btn-ghost" onclick="_gvDbxCheckAuth()">Retry</button></div>';
+                _gvDbxSyncReportBtn(); return;
+            }}
+            h += '<div class="gv-dbx-auth">&#10003; ' + _testsEscape(_gvDbx.auth.user||'authorized') + '</div>';
+            h += '<div class="gv-dbx-tznote">All times shown in your local timezone (' + _testsEscape(_tzLabel()) + ') &mdash; same as the test window above.</div>';
+            h += '<div class="gv-dbx-search"><input type="text" id="gvDbxSearch" placeholder="filter jobs by name\\u2026" '
+               +   'value="' + _testsEscape(_gvDbx.q||'') + '" oninput="_gvDbxOnSearch(this.value)" '
+               +   'onkeydown="if(event.key===\\'Enter\\'){{event.preventDefault();_gvDbxSearchGo();}}">'
+               +   '<button class="gv-btn gv-btn-ghost" onclick="_gvDbxSearchGo()">Search</button></div>';
+            if (!_gvDbx.jobsLoading) {{
+                if (_gvDbx.showAll) {{
+                    h += '<div class="gv-dbx-scope">All ' + _gvDbx.jobs.length + ' jobs &middot; <a href="#" onclick="event.preventDefault();_gvDbxToggleAll()">show only jobs active in the test window</a></div>';
+                }} else {{
+                    h += '<div class="gv-dbx-scope">' + _gvDbx.jobs.length + ' job(s) overlapping the test window (run finished 20min+ after test start) &middot; <a href="#" onclick="event.preventDefault();_gvDbxToggleAll()">show all jobs</a></div>';
+                }}
+            }}
+            h += _gvDbx.jobsLoading ? '<div class="gv-dbx-note">Loading jobs&hellip;</div>' : _gvDbxJobChart();
+            const job = (_gvDbx.jobs || []).find(function(j) {{ return j.job_id === _gvDbx.selectedJob; }});
+            if (job) {{
+                h += '<div class="gv-sel">'
+                   + '<div class="gv-sel-h">&#10003; Selected: <b>' + _testsEscape(job.name) + '</b></div>'
+                   + '<div class="gv-sel-body">'
+                   +   '<div class="gv-sel-isect">'
+                   +     '<div class="gv-sel-isect-h">Intersection with test window</div>'
+                   +     '<div class="gv-sel-isect-range">'
+                   +       '<span class="gv-sel-t">' + _fmtLocal(job.overlap_start) + '</span>'
+                   +       '<span class="gv-sel-arrow">&rarr;</span>'
+                   +       '<span class="gv-sel-t">' + _fmtLocal(job.overlap_end) + '</span>'
+                   +     '</div>'
+                   +     '<div class="gv-sel-dur">' + _fmtDur(job.overlap_sec) + ' of the run overlaps the test</div>'
+                   +   '</div>'
+                   +   _gvDbxDetailTimeline(job)
+                   +   '<div class="gv-sel-hint">Now click <b>Generate report with pipeline logs timeline</b> below.</div>'
+                   + '</div></div>';
+            }}
+            h += '</div>';
+            el.innerHTML = h;
+            _gvDbxSyncReportBtn();
         }}
 
         function _copyGroupPassword() {{
@@ -5507,6 +6667,18 @@ class _SpaHandler(http.server.BaseHTTPRequestHandler):
             pid = path[len("/api/pipelines/"):-len("/logs")]
             self._handle_pipeline_logs(pid)
             return
+        if path == "/api/databricks/auth":
+            self._handle_dbx_auth()
+            return
+        if path == "/api/databricks/jobs":
+            self._handle_dbx_jobs()
+            return
+        if path.startswith("/api/databricks/download/") and path.endswith("/zip"):
+            self._handle_dbx_download_zip(path[len("/api/databricks/download/"):-len("/zip")])
+            return
+        if path.startswith("/api/databricks/download/"):
+            self._handle_dbx_download_status(path[len("/api/databricks/download/"):])
+            return
         if path.startswith("/api/groups/"):
             self._handle_group_detail(path[len("/api/groups/"):])
             return
@@ -5648,9 +6820,13 @@ class _SpaHandler(http.server.BaseHTTPRequestHandler):
             pid = path[len("/api/pipelines/"):-len("/rerun")]
             self._handle_pipeline_rerun(pid)
             return
-        if path.startswith("/api/pipelines/") and path.endswith("/kill"):
-            pid = path[len("/api/pipelines/"):-len("/kill")]
-            self._handle_pipeline_kill(pid)
+        if path.startswith("/api/pipelines/") and path.endswith("/cancel"):
+            pid = path[len("/api/pipelines/"):-len("/cancel")]
+            self._handle_pipeline_cancel(pid)
+            return
+        if path.startswith("/api/pipelines/") and path.endswith("/remove"):
+            pid = path[len("/api/pipelines/"):-len("/remove")]
+            self._handle_pipeline_remove(pid)
             return
         if path.startswith("/api/groups/") and path.endswith("/forget-password"):
             self._handle_group_forget_password(path[len("/api/groups/"):-len("/forget-password")])
@@ -5660,6 +6836,15 @@ class _SpaHandler(http.server.BaseHTTPRequestHandler):
             return
         if path.startswith("/api/groups/") and path.endswith("/rerun"):
             self._handle_group_rerun(path[len("/api/groups/"):-len("/rerun")])
+            return
+        if path.startswith("/api/groups/") and path.endswith("/remove"):
+            self._handle_group_remove(path[len("/api/groups/"):-len("/remove")])
+            return
+        if path == "/api/databricks/match-run":
+            self._handle_dbx_match_run()
+            return
+        if path == "/api/databricks/download":
+            self._handle_dbx_download_start()
             return
         self._send(404, "text/plain; charset=utf-8", b"Not found")
 
@@ -5871,16 +7056,26 @@ class _SpaHandler(http.server.BaseHTTPRequestHandler):
                 "iteration_index": m.get("iteration_index"),
                 "status": st, "rp_url": m.get("rp_url"),
                 "scenario_count": m.get("scenario_count"), "progress": prog,
+                # per-iteration config + timing for the iterations panel
+                "env": m.get("env"), "parallel": m.get("parallel"),
+                "scenario_retry": m.get("scenario_retry"),
+                "max_runtime_sec": m.get("max_runtime_sec"),
+                "est_runtime_sec": m.get("est_runtime_sec"),
+                "feature": m.get("feature"), "tests": m.get("tests"),
+                "started_at": m.get("started_at"), "finished_at": m.get("finished_at"),
             })
         total_iters = len(members)
-        done_iters = sum(status_counts.get(s, 0) for s in ("finished", "failed"))
+        done_iters = sum(status_counts.get(s, 0) for s in ("finished", "failed", "cancelled"))
         pct = (round(scen_done / scen_total * 100) if scen_total
                else (round(done_iters / total_iters * 100) if total_iters else 0))
+        win_start, win_end = _iter_run_window(members)
         report = g.get("report") or None
         self._send_json(200, {
             "id": gid, "name": g.get("name"), "config": g.get("config"),
             "iteration_count": total_iters, "iterations_done": done_iters,
             "status_counts": status_counts,
+            "iterations_started_at": win_start, "iterations_finished_at": win_end,
+            "iterations_window": _format_run_window(win_start, win_end),
             "scenarios_done": scen_done, "scenarios_total": scen_total, "pct": pct,
             "eta_sec": (eta_sec if any_eta else None),
             "all_done": total_iters > 0 and done_iters == total_iters,
@@ -5917,21 +7112,24 @@ class _SpaHandler(http.server.BaseHTTPRequestHandler):
             by_id = {p.get("id"): p for p in _load_pipelines()}
             members = [m for m in (by_id.get(mid) for mid in g.get("member_ids", [])) if m]
             if not members or not all(
-                    m.get("status") in ("finished", "failed") for m in members):
+                    m.get("status") in ("finished", "failed", "cancelled") for m in members):
                 self._send_json(409, {"error": "group still has running/queued iterations"})
                 return
         # Optional Databricks logs: uploaded files (preferred) or a server path.
-        dbx_dir, dbx_temp = None, False
+        # ``dbx_specified`` tracks whether THIS request supplied logs -- if not, we
+        # must PRESERVE any report_dbx_dir already attached (e.g. by the auto-download
+        # flow, whose "Generate with these logs" button posts an empty body).
+        dbx_dir, dbx_temp, dbx_specified = None, False, False
         if isinstance(payload, dict):
             files = payload.get("databricks_files")
             if isinstance(files, list) and files:
                 materialized = _materialize_databricks_uploads(files)
                 if materialized:
-                    dbx_dir, dbx_temp = materialized, True
-            if not dbx_dir:
+                    dbx_dir, dbx_temp, dbx_specified = materialized, True, True
+            if not dbx_specified:
                 d = (payload.get("databricks_log_dir") or "").strip()
                 if d and os.path.isdir(d):
-                    dbx_dir = os.path.realpath(d)
+                    dbx_dir, dbx_specified = os.path.realpath(d), True
                 elif d:
                     self._send_json(400, {"error": f"Databricks log dir not found: {d}"})
                     return
@@ -5943,8 +7141,10 @@ class _SpaHandler(http.server.BaseHTTPRequestHandler):
                 return
             g["report_status"] = "none"
             g["report_error"] = None
-            g["report_dbx_dir"] = dbx_dir      # consumed by _run_group_report
-            g["report_dbx_temp"] = dbx_temp     # rmtree'd after generation if True
+            if dbx_specified:
+                g["report_dbx_dir"] = dbx_dir      # consumed by _run_group_report
+                g["report_dbx_temp"] = dbx_temp     # rmtree'd after generation if True
+            # else: keep the existing report_dbx_dir (auto-download attachment).
             _save_groups(groups)
         _group_report_passwords.pop(gid, None)
         _check_group_completions()
@@ -5979,9 +7179,198 @@ class _SpaHandler(http.server.BaseHTTPRequestHandler):
         _dispatch_tick()
         self._send_json(200, {"group_id": new_gid, "count": len(records)})
 
-    def _handle_pipeline_kill(self, pid: str):
-        """Kill a running pipeline's container. The runner's stream loop then
-        sees the container exit and marks the pipeline failed."""
+    def _handle_group_remove(self, gid: str):
+        """Remove a whole group and all its member pipelines from the list. Refused
+        if any member is still running (cancel it first). Drops the group record and
+        forgets any in-memory report password."""
+        gid = (gid or "").strip()
+        with _pipelines_lock():
+            groups = _load_groups()
+            g = groups.get(gid)
+            if not g:
+                self._send_json(404, {"error": "not found"})
+                return
+            pipelines = _load_pipelines()
+            member_ids = set(g.get("member_ids") or
+                             [p.get("id") for p in pipelines if p.get("group_id") == gid])
+            running = [p for p in pipelines
+                       if p.get("id") in member_ids and p.get("status") == "running"]
+            if running:
+                self._send_json(409, {"error": "a pipeline in this group is running -- cancel it first"})
+                return
+            keep = [p for p in pipelines if p.get("id") not in member_ids]
+            _save_pipelines(keep)
+            del groups[gid]
+            _group_report_passwords.pop(gid, None)
+            _save_groups(groups)
+        self._send_json(200, {"ok": True, "removed": len(member_ids)})
+
+    # ------------------------------------------------------------------ #
+    # Databricks job-run log auto-download
+    # ------------------------------------------------------------------ #
+    def _dbx_query_env(self):
+        from urllib.parse import urlparse, parse_qs
+        qs = parse_qs(urlparse(self.path).query)
+        return _dbx_env_ok((qs.get("env") or [""])[0]), qs
+
+    def _handle_dbx_auth(self):
+        env, _ = self._dbx_query_env()
+        if not env:
+            self._send_json(400, {"error": "env must be uat or prod"})
+            return
+        self._send_json(200, {"env": env, **_dbx_check_auth(env)})
+
+    def _handle_dbx_jobs(self):
+        env, qs = self._dbx_query_env()
+        if not env:
+            self._send_json(400, {"error": "env must be uat or prod"})
+            return
+        q = (qs.get("q") or [""])[0]
+        start_ms = _iso_to_epoch_ms((qs.get("start") or [""])[0])
+        end_ms = _iso_to_epoch_ms((qs.get("end") or [""])[0])
+        # ``all=1`` forces the full job list (ignore the test window).
+        force_all = (qs.get("all") or [""])[0] in ("1", "true", "yes")
+        windowed = bool(start_ms and end_ms) and not force_all
+        try:
+            if windowed:
+                jobs = _dbx_jobs_in_window(env, start_ms, end_ms, q)
+            else:
+                jobs = _dbx_list_jobs(env, q)
+        except Exception as exc:
+            self._send_json(502, {"error": f"{type(exc).__name__}: {exc}"})
+            return
+        self._send_json(200, {"env": env, "jobs": jobs, "count": len(jobs),
+                              "windowed": windowed})
+
+    def _handle_dbx_match_run(self):
+        payload, err = self._read_json_body()
+        if err:
+            self._send_json(400, {"error": err})
+            return
+        env = _dbx_env_ok(payload.get("env"))
+        if not env:
+            self._send_json(400, {"error": "env must be uat or prod"})
+            return
+        try:
+            job_id = int(payload.get("job_id"))
+        except Exception:
+            self._send_json(400, {"error": "job_id required"})
+            return
+        start_ms = _iso_to_epoch_ms(payload.get("start"))
+        end_ms = _iso_to_epoch_ms(payload.get("end"))
+        try:
+            runs = _dbx_recent_runs(env, job_id, limit=25)
+        except Exception as exc:
+            self._send_json(502, {"error": f"{type(exc).__name__}: {exc}"})
+            return
+        pick = _dbx_pick_run(runs, start_ms, end_ms)
+        view = [{
+            "run_id": str(r["run_id"]),
+            "start": _epoch_ms_to_iso(r["start_ms"]),
+            "end": _epoch_ms_to_iso(r["end_ms"]),
+            "life": r["life"], "result": r["result"],
+        } for r in runs]
+        self._send_json(200, {
+            "env": env, "job_id": str(job_id),
+            "matched_run_id": (str(pick["run_id"]) if pick.get("run_id") else None),
+            "match_reason": pick.get("reason"), "match_overlap": pick.get("overlap"),
+            "runs": view,
+            "test_window": {"start": _epoch_ms_to_iso(start_ms), "end": _epoch_ms_to_iso(end_ms)},
+        })
+
+    def _handle_dbx_download_start(self):
+        payload, err = self._read_json_body()
+        if err:
+            self._send_json(400, {"error": err})
+            return
+        env = _dbx_env_ok(payload.get("env"))
+        if not env:
+            self._send_json(400, {"error": "env must be uat or prod"})
+            return
+        try:
+            run_id = int(payload.get("run_id"))
+        except Exception:
+            self._send_json(400, {"error": "run_id required"})
+            return
+        group_id = (payload.get("group_id") or None)
+        token = _start_dbx_download(env, run_id, group_id=group_id)
+        self._send_json(200, {"token": token})
+
+    def _handle_dbx_download_status(self, token: str):
+        token = (token or "").strip()
+        with _dbx_dl_lock():
+            rec = _dbx_downloads.get(token)
+            if not rec:
+                self._send_json(404, {"error": "not found"})
+                return
+            # Public view: never leak the local tempdir path.
+            self._send_json(200, {
+                "token": token, "status": rec["status"], "progress": rec["progress"],
+                "files": rec["files"], "total_bytes": rec["total_bytes"],
+                "clusters": len(rec["clusters"]), "dropped": rec["dropped"],
+                "run_id": str(rec["run_id"]), "error": rec["error"],
+                "has_zip": bool(rec.get("dir")),
+            })
+
+    def _handle_dbx_download_zip(self, token: str):
+        token = (token or "").strip()
+        with _dbx_dl_lock():
+            rec = _dbx_downloads.get(token)
+            dl_dir = rec.get("dir") if rec else None
+        if not rec or not dl_dir or not os.path.isdir(dl_dir):
+            self._send(404, "text/plain; charset=utf-8", b"Not found")
+            return
+        import io
+        import zipfile
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for fname in sorted(os.listdir(dl_dir)):
+                fpath = os.path.join(dl_dir, fname)
+                if os.path.isfile(fpath):
+                    zf.write(fpath, arcname=fname)
+        data = buf.getvalue()
+        self._send(200, "application/zip", data, extra_headers=[
+            ("Content-Disposition", f'attachment; filename="dbx-run-{rec["run_id"]}-logs.zip"')])
+
+    def _handle_pipeline_remove(self, pid: str):
+        """Remove a not-yet-running pipeline (queued or scheduled) from the
+        queue entirely. Running jobs must be killed instead; terminal jobs use
+        cleanup. Prunes group membership and drops emptied groups."""
+        pid = (pid or "").strip()
+        if not pid or not all(c.isalnum() or c in "-_" for c in pid):
+            self._send_json(404, {"error": "not found"})
+            return
+        with _pipelines_lock():
+            pipelines = _load_pipelines()
+            target = next((p for p in pipelines if p.get("id") == pid), None)
+            if not target:
+                self._send_json(404, {"error": "not found"})
+                return
+            if target.get("status") == "running":
+                self._send_json(409, {"error": "pipeline is running -- kill it instead"})
+                return
+            keep = [p for p in pipelines if p.get("id") != pid]
+            _save_pipelines(keep)
+            live = {p.get("id") for p in keep}
+            groups = _load_groups()
+            changed = False
+            for gid in list(groups.keys()):
+                mids = [m for m in groups[gid].get("member_ids", []) if m in live]
+                if not mids:
+                    del groups[gid]
+                    _group_report_passwords.pop(gid, None)
+                    changed = True
+                elif len(mids) != len(groups[gid].get("member_ids", [])):
+                    groups[gid]["member_ids"] = mids
+                    changed = True
+            if changed:
+                _save_groups(groups)
+        self._send_json(200, {"ok": True})
+
+    def _handle_pipeline_cancel(self, pid: str):
+        """Cancel a running pipeline: stop its container. The runner sees the
+        container exit and -- because we flag it here -- records it as
+        `cancelled` (not `failed`)."""
         pid = (pid or "").strip()
         if not pid or not all(c.isalnum() or c in "-_" for c in pid):
             self._send_json(404, {"error": "not found"})
@@ -5994,6 +7383,7 @@ class _SpaHandler(http.server.BaseHTTPRequestHandler):
         if p.get("status") != "running":
             self._send_json(409, {"error": "pipeline is not running"})
             return
+        _cancel_requested.add(pid)   # read by the runner's terminal path
         import subprocess
         container = f"dokimos-{pid}"
         try:
@@ -6002,8 +7392,8 @@ class _SpaHandler(http.server.BaseHTTPRequestHandler):
         except Exception:
             pass
         _append_pipeline_log(
-            pid, f"[{_now_iso()}] KILL requested by operator -- stopping container "
-                 f"{container}; the run will be marked failed.")
+            pid, f"[{_now_iso()}] CANCEL requested by operator -- stopping container "
+                 f"{container}; the run will be marked cancelled.")
         self._send_json(200, {"ok": True})
 
     def _handle_generate(self):

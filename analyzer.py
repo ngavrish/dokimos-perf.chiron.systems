@@ -3361,12 +3361,16 @@ def generate_multi_comparison_html(launch_labels: list, logs_list: list, timings
         else '<div class="endpoint-card"><div class="endpoint-header">No timing data found</div></div>'
     )
 
-    if show_tabs:
-        _timeline_tab_btn = (
-            '<button class="tab-btn"        data-tab="4" onclick="switchTab(4)">Timeline</button>'
-            if timeline_data else ''
-        )
-        _timeline_tab_pane = f'''
+    # The Timeline tab (Databricks phases/events + slow-request overlay) is
+    # useful at ANY launch count, so it's decoupled from the >=4-launch
+    # statistical tabs: whenever timeline_data exists we surface it, even for a
+    # 1-2 launch group (where the other comparison tabs aren't shown). Without
+    # this, a small group's downloaded Databricks logs have nowhere to render.
+    _timeline_tab_btn = (
+        '<button class="tab-btn"        data-tab="4" onclick="switchTab(4)">Timeline</button>'
+        if timeline_data else ''
+    )
+    _timeline_tab_pane = f'''
         <div class="tab-pane" data-tab-pane="4">
             <div class="tab-intro">Pipeline timeline: RP launches, Databricks phases, business events, and slow requests (&gt;3s) overlaid on the full job window. Tilde (~) marks timestamps inferred from a nearby anchor; near-collocated events collapse into burst markers.</div>
             <div class="timeline-wrapper">
@@ -3377,6 +3381,8 @@ def generate_multi_comparison_html(launch_labels: list, logs_list: list, timings
             </div>
         </div>
         ''' if timeline_data else ''
+
+    if show_tabs:
         tabs_nav_html = f'''
         <div class="tabs-nav">
             <button class="tab-btn active" data-tab="0" onclick="switchTab(0)">Median vs Slowest</button>
@@ -3401,6 +3407,21 @@ def generate_multi_comparison_html(launch_labels: list, logs_list: list, timings
         </div>
         <div class="tab-pane" data-tab-pane="3">
             <div class="tab-intro">Full comparison across all {n} launches (original layout).</div>
+            {_endpoint_cards_joined}
+        </div>
+        {_timeline_tab_pane}
+        '''
+    elif timeline_data:
+        # Fewer than 4 launches but we have a pipeline timeline: a minimal
+        # two-tab view (default comparison + Timeline).
+        tabs_nav_html = f'''
+        <div class="tabs-nav">
+            <button class="tab-btn active" data-tab="0" onclick="switchTab(0)">Comparison</button>
+            {_timeline_tab_btn}
+        </div>
+        '''
+        tab_panes_html = f'''
+        <div class="tab-pane active" data-tab-pane="0">
             {_endpoint_cards_joined}
         </div>
         {_timeline_tab_pane}
