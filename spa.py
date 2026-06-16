@@ -2626,10 +2626,46 @@ def _dbfs_read_file(w, path: str, max_bytes: int) -> bytes:
     return bytes(buf[:max_bytes])
 
 
+# Default DBFS bases to probe for delivered driver logs when a run/cluster no
+# longer advertises its log config (terminated clusters often report
+# cluster_log_conf=None even though the logs were delivered while they ran).
+_DBX_DEFAULT_LOG_BASES = ("dbfs:/cluster-logs",)
+
+
+def _dbx_log_dest(conf) -> Optional[str]:
+    """Extract a DBFS/Volumes destination from a cluster_log_conf, or None."""
+    if not conf:
+        return None
+    if conf.dbfs and conf.dbfs.destination:
+        return conf.dbfs.destination
+    if conf.volumes and conf.volumes.destination:
+        return conf.volumes.destination
+    return None
+
+
 def _dbx_run_targets(w, run_id: int) -> list:
-    """Distinct (cluster_id, driver_dir) pairs across a run's task-clusters that
-    have DBFS/Volumes log delivery configured."""
+    """Distinct (cluster_id, driver_dir) pairs for a run's task-clusters whose
+    driver logs are retrievable from DBFS/Volumes.
+
+    Historical-log resilient: the log destination is resolved from the RUN's own
+    stored cluster spec (task.new_cluster or its job_cluster) FIRST -- that spec
+    survives cluster termination, unlike clusters.get, which often returns
+    cluster_log_conf=None for old/terminated clusters and made us miss logs that
+    were in fact delivered. We then fall back to the live cluster, and finally
+    PROBE known delivery bases (<base>/<cid>/driver) and keep any that actually
+    contain files -- so delivered logs are found even when no config is reported
+    anywhere."""
     rd = w.jobs.get_run(run_id=run_id)
+
+    # Log destinations declared by the run's job_clusters (by key).
+    jc_dest = {}
+    for jc in (rd.job_clusters or []):
+        if jc.new_cluster:
+            d = _dbx_log_dest(jc.new_cluster.cluster_log_conf)
+            if d:
+                jc_dest[jc.job_cluster_key] = d
+    bases = set(_DBX_DEFAULT_LOG_BASES) | set(jc_dest.values())
+
     seen, targets = set(), []
     for t in (rd.tasks or []):
         ci = t.cluster_instance
@@ -2637,19 +2673,34 @@ def _dbx_run_targets(w, run_id: int) -> list:
         if not cid or cid in seen:
             continue
         seen.add(cid)
-        try:
-            cl = w.clusters.get(cluster_id=cid)
-        except Exception:
-            continue
-        conf = cl.cluster_log_conf
+
+        # 1) the run's own spec (task new_cluster, then its job_cluster)
         dest = None
-        if conf:
-            if conf.dbfs and conf.dbfs.destination:
-                dest = conf.dbfs.destination
-            elif conf.volumes and conf.volumes.destination:
-                dest = conf.volumes.destination
+        if t.new_cluster:
+            dest = _dbx_log_dest(t.new_cluster.cluster_log_conf)
+        if not dest and t.job_cluster_key:
+            dest = jc_dest.get(t.job_cluster_key)
+        # 2) the live cluster record (works for all-purpose / recent clusters)
+        if not dest:
+            try:
+                dest = _dbx_log_dest(w.clusters.get(cluster_id=cid).cluster_log_conf)
+            except Exception:
+                dest = None
+
         if dest:
+            bases.add(dest)
             targets.append((cid, dest.rstrip("/") + f"/{cid}/driver"))
+            continue
+
+        # 3) last resort: probe known bases for actually-delivered logs.
+        for b in bases:
+            ddir = b.rstrip("/") + f"/{cid}/driver"
+            try:
+                if any(not e.is_dir for e in w.dbfs.list(ddir)):
+                    targets.append((cid, ddir))
+                    break
+            except Exception:
+                continue
     return targets
 
 
