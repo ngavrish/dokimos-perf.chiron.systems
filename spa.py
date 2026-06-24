@@ -1626,12 +1626,15 @@ def _discover_environments() -> list:
             if var.endswith("_" + env):
                 found.add(env)
                 break
-    # Preserve canonical order, drop missing, ensure 'prod' is always offered
-    # so the default works even if .envrc is sparse.
-    out = [e for e in canonical_order if e in found]
-    if "prod" not in out:
-        out.insert(0, "prod")
-    return out
+    # 'prod' and 'uat' are ALWAYS offered. The suffix scan only finds envs that
+    # carry `_<env>` creds in .envrc, but the IFP suite supports both natively
+    # without them: uat is in fact the suite's DEFAULT ENV (environment.py) and
+    # reuses base/prod credentials (PROD_KEY_ID/PROD_ACCESS_KEY, prod ODS schema,
+    # MUD ifp_dplus_lineitem_uat) rather than _uat-suffixed vars -- so the scan
+    # never discovers it. .envrc is team-managed and must not be edited, so we
+    # surface uat here. prod stays offered so the default works on a sparse .envrc.
+    found.update({"prod", "uat"})
+    return [e for e in canonical_order if e in found]
 
 
 def _build_tests_tree(root: str) -> dict:
