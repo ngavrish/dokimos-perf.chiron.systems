@@ -435,6 +435,79 @@ def _pipelines_lock():
     return _PIPELINES_LOCK
 
 
+_DOCKER_HOST: Optional[str] = None  # lazily resolved working socket
+
+
+def _docker_host() -> Optional[str]:
+    """Pick a Docker socket that actually exists on this machine.
+
+    Docker Desktop's ``desktop-linux`` context often points at
+    ``~/.docker/desktop/docker.sock`` even when only the system socket is up
+    (typical on Linux servers). Pipeline runs call docker via ``-H`` so they
+    don't inherit a broken context from the SPA process."""
+    global _DOCKER_HOST
+    if _DOCKER_HOST is not None:
+        return _DOCKER_HOST
+    candidates = []
+    desktop = os.path.expanduser("~/.docker/desktop/docker.sock")
+    if os.path.exists(desktop):
+        candidates.append(f"unix://{desktop}")
+    if os.path.exists("/var/run/docker.sock"):
+        candidates.append("unix:///var/run/docker.sock")
+    _DOCKER_HOST = candidates[0] if candidates else None
+    return _DOCKER_HOST
+
+
+def _docker_prefix(*args: str) -> list:
+    host = _docker_host()
+    if host:
+        return ["docker", "-H", host, *args]
+    return ["docker", *args]
+
+
+def _user_named_in_group(group: str) -> bool:
+    """True if the current uid is listed in ``group`` in /etc/group.
+
+    Unlike ``os.getgroups()``, this reflects ``usermod -aG`` even when the
+    SPA was started by systemd before the service was restarted."""
+    import grp
+    import pwd
+    try:
+        entry = grp.getgrnam(group)
+    except KeyError:
+        return False
+    user = pwd.getpwuid(os.geteuid()).pw_name
+    return user in entry.gr_mem
+
+
+def _wrap_docker_argv(docker_argv: list) -> list:
+    """Wrap a **complete** ``docker …`` argv for ``sg docker`` when needed.
+
+    Callers must pass the full command (including ``run``/``build`` args and
+    image name). Never build the argv in pieces around this wrapper — partial
+    wrapping is what caused ``docker run requires at least 1 argument``."""
+    import shlex
+    import shutil
+
+    if shutil.which("sg") and _user_named_in_group("docker"):
+        script = " ".join(shlex.quote(a) for a in docker_argv)
+        return ["sg", "docker", "-c", script]
+    return docker_argv
+
+
+def _docker_run_argv(*subcommand_and_args: str) -> list:
+    """Build a subprocess argv for one docker invocation."""
+    return _wrap_docker_argv(_docker_prefix(*subcommand_and_args))
+
+
+def _docker_subprocess_env(**extra: str) -> dict:
+    env = dict(os.environ, **extra)
+    host = _docker_host()
+    if host:
+        env["DOCKER_HOST"] = host
+    return env
+
+
 def _discover_docker_assets() -> dict:
     """Walk TESTS_DIR for a Dockerfile + an adjacent README. Returns
     {'dockerfile': abs_path | None, 'readme': abs_path | None,
@@ -502,7 +575,7 @@ def _build_docker_command(pipeline: dict, assets: dict) -> tuple:
 
     Returns (argv, envrc_host_path | None)."""
     # Stable container name so the runtime watchdog can `docker kill` it on timeout.
-    argv = ["docker", "run", "--rm", "--name", f"dokimos-{pipeline['id']}"]
+    argv = ["run", "--rm", "--name", f"dokimos-{pipeline['id']}"]
     # Mount the local .envrc so secrets aren't echoed via -e flags.
     envrc_host = None
     if assets.get("rel_root"):
@@ -539,7 +612,7 @@ def _build_docker_command(pipeline: dict, assets: dict) -> tuple:
     # -e env vars. Without this, the CMD defaults silently win and the run always
     # uses uat / 4 regardless of the Tests-panel selection.
     argv += [pipeline["env"], str(pipeline["parallel"])]
-    return argv, envrc_host
+    return _docker_run_argv(*argv), envrc_host
 
 
 # --------------------------------------------------------------------------- #
@@ -746,7 +819,7 @@ def _docker_image_exists(image: str) -> bool:
     import subprocess
     try:
         r = subprocess.run(
-            ["docker", "image", "inspect", image],
+            _docker_run_argv("image", "inspect", image),
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         return r.returncode == 0
@@ -843,14 +916,14 @@ def _ensure_docker_image(pipeline_id: str, assets: dict) -> bool:
         )
         return False
 
-    build_argv = ["docker", "build", "-f", dockerfile, "-t", DOCKER_IMAGE, context]
+    build_argv = _docker_run_argv("build", "-f", dockerfile, "-t", DOCKER_IMAGE, context)
     _append_pipeline_log(
         pipeline_id,
         f"[{_now_iso()}] image {DOCKER_IMAGE} not found locally -- building it once",
         f"[{_now_iso()}] (needs VPN for artifactory.prod.hulu.com + the Base submodule checked out)",
         f"[{_now_iso()}] building: DOCKER_BUILDKIT=1 {' '.join(build_argv)}",
     )
-    build_env = dict(os.environ, DOCKER_BUILDKIT="1")
+    build_env = _docker_subprocess_env(DOCKER_BUILDKIT="1")
     try:
         proc = subprocess.Popen(
             build_argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -1223,7 +1296,7 @@ def _run_pipeline(pipeline_id: str) -> None:
         def _on_timeout():
             timed_out["flag"] = True
             try:
-                subprocess.run(["docker", "kill", container_name],
+                subprocess.run(_docker_run_argv("kill", container_name),
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
             except Exception:
                 pass
@@ -1549,16 +1622,61 @@ def _load_pipelines() -> list:
         with open(PIPELINES_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
         return data if isinstance(data, list) else []
-    except (OSError, ValueError):
+    except (OSError, ValueError) as exc:
+        bak = PIPELINES_FILE + ".bak"
+        corrupt = (
+            f"{PIPELINES_FILE}.corrupt."
+            f"{datetime.now().astimezone().strftime('%Y%m%d-%H%M%S')}.json"
+        )
+        try:
+            os.replace(PIPELINES_FILE, corrupt)
+            print(
+                f"WARN: pipelines.json unreadable ({exc}); moved to {corrupt}",
+                file=sys.stderr,
+            )
+        except OSError:
+            print(f"WARN: pipelines.json unreadable ({exc})", file=sys.stderr)
+        if os.path.isfile(bak):
+            try:
+                with open(bak, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, list):
+                    print(
+                        f"WARN: restored {len(data)} pipeline(s) from {bak}",
+                        file=sys.stderr,
+                    )
+                    return data
+            except (OSError, ValueError):
+                pass
         return []
 
 
 def _save_pipelines(pipelines: list) -> None:
-    """Atomic write so a crash mid-save doesn't truncate the file."""
-    tmp = PIPELINES_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(pipelines, f, indent=2)
-    os.replace(tmp, PIPELINES_FILE)
+    """Atomic write so a crash mid-save doesn't truncate the file.
+
+    Uses a unique temp path (not a fixed ``.tmp`` name) so concurrent writers
+    can't interleave bytes into one partial file -- the corruption mode that
+    produced keys like ``"scenari"est_runtime_sec"``."""
+    import tempfile
+
+    dir_name = os.path.dirname(os.path.abspath(PIPELINES_FILE)) or "."
+    fd, tmp = tempfile.mkstemp(prefix=".pipelines.", suffix=".json.tmp", dir=dir_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(pipelines, f, indent=2)
+        if os.path.isfile(PIPELINES_FILE):
+            try:
+                import shutil
+                shutil.copy2(PIPELINES_FILE, PIPELINES_FILE + ".bak")
+            except OSError:
+                pass
+        os.replace(tmp, PIPELINES_FILE)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def _new_pipeline_id() -> str:
@@ -1766,7 +1884,8 @@ def _now_iso() -> str:
 
 def _create_pipeline(cfg: dict, iteration_index: int = 1, iteration_count: int = 1,
                      group_id: Optional[str] = None,
-                     group_name: Optional[str] = None) -> dict:
+                     group_name: Optional[str] = None,
+                     *, persist: bool = True) -> dict:
     """Build a new pipeline record from the run config posted by the SPA,
     persist it, and return the full record. When part of a multi-iteration
     burst, ``iteration_index`` / ``iteration_count`` drive name suffixing
@@ -1892,9 +2011,11 @@ def _create_pipeline(cfg: dict, iteration_index: int = 1, iteration_count: int =
             f"[{record['created_at']}] state: scheduled for {scheduled_for}"
         )
 
-    pipelines = _load_pipelines()
-    pipelines.append(record)
-    _save_pipelines(pipelines)
+    if persist:
+        with _pipelines_lock():
+            pipelines = _load_pipelines()
+            pipelines.append(record)
+            _save_pipelines(pipelines)
     return record
 
 
@@ -7539,8 +7660,12 @@ class _SpaHandler(http.server.BaseHTTPRequestHandler):
         records = []
         for i in range(iterations):
             rec = _create_pipeline(payload, iteration_index=i + 1, iteration_count=iterations,
-                                   group_id=group_id, group_name=group_name)
+                                   group_id=group_id, group_name=group_name, persist=False)
             records.append(rec)
+        with _pipelines_lock():
+            pipelines = _load_pipelines()
+            pipelines.extend(records)
+            _save_pipelines(pipelines)
         if group_id:
             _create_group_record(group_id, group_name, records)
         # `now` jobs are now `queued`; the single-slot dispatcher starts the next
@@ -8002,7 +8127,7 @@ class _SpaHandler(http.server.BaseHTTPRequestHandler):
         import subprocess
         container = f"dokimos-{pid}"
         try:
-            subprocess.run(["docker", "kill", container],
+            subprocess.run(_docker_run_argv("kill", container),
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
         except Exception:
             pass

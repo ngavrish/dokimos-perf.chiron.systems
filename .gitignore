@@ -37,3 +37,4 @@ pipelines.json
 groups.json
 # Report Portal log caches written by the analyzer at generation time
 logs/
+*.bak
