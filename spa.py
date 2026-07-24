@@ -61,6 +61,10 @@ except ImportError:
         generate_report_for_urls,
     )
 
+# Allow a second instance (e.g. the regression surface) to bind its own port
+# without touching analyzer's default.
+PORT = int(os.environ.get("DOKIMOS_PORT", str(PORT)))
+
 # --------------------------------------------------------------------------- #
 # Sprint window
 # --------------------------------------------------------------------------- #
@@ -96,15 +100,52 @@ def _sprint_label(start: date, end: date) -> str:
 # Storage paths
 # --------------------------------------------------------------------------- #
 PACKAGE_DIR    = os.path.dirname(os.path.abspath(__file__))
-REPORTS_DIR    = os.path.join(PACKAGE_DIR, "reports")
+# Surface profile: "perf" (default) or "regression". It selects the run-config
+# presets, the run-command builder, and whether report generation is offered.
+# A second process (the Functional-regression surface) runs this same file with
+# DOKIMOS_PROFILE=regression on its own port/base-path/state-dir.
+PROFILE = os.environ.get("DOKIMOS_PROFILE", "perf").strip().lower()
+# Regression-like surfaces run host `behavex` against preconfigured suites (no
+# perf Docker image, no comparison reports): the Functional-regression surface
+# (DOKIMOS_PROFILE=regression) and the Data-validation surface
+# (DOKIMOS_PROFILE=data_validation, which offers only the full-catalog data
+# validators). They share the run-command builder, the preset selector UI, and
+# the reports-off shell; only their preset set + branding differ.
+REGRESSION_LIKE = PROFILE in ("regression", "data_validation")
+# Reports are on for perf, off for the regression-like surfaces by default.
+REPORTS_ENABLED = os.environ.get(
+    "DOKIMOS_REPORTS_ENABLED",
+    "false" if REGRESSION_LIKE else "true",
+).strip().lower() in ("1", "true", "yes", "on")
+# Where the on-disk queue/reports live. Overridable so two surfaces on one
+# checkout keep separate pipelines/groups/reports instead of racing.
+STATE_DIR      = os.environ.get("DOKIMOS_STATE_DIR", "").strip() or PACKAGE_DIR
+REPORTS_DIR    = os.path.join(STATE_DIR, "reports")
 ASSETS_DIR     = os.path.join(PACKAGE_DIR, "assets")
-PIPELINES_FILE = os.path.join(PACKAGE_DIR, "pipelines.json")
+PIPELINES_FILE = os.path.join(STATE_DIR, "pipelines.json")
 # Iteration groups: an N-iteration burst is one "report package". Group records
 # live here; the per-iteration pipelines stay in pipelines.json linked by group_id.
-GROUPS_FILE    = os.path.join(PACKAGE_DIR, "groups.json")
+GROUPS_FILE    = os.path.join(STATE_DIR, "groups.json")
 # The report generator (generate_report_for_urls) compares up to this many
 # launches; a group with more iterations than this caps its report inputs.
 GROUP_REPORT_MAX_LAUNCHES = int(os.environ.get("DOKIMOS_GROUP_REPORT_MAX_LAUNCHES", "20"))
+# URL prefix when the SPA is served under a sub-path behind a reverse proxy
+# (e.g. dokimos.chiron.systems/perf). Empty by default -> served at root,
+# behaviour unchanged. When set (DOKIMOS_BASE_PATH=/perf) the handler strips the
+# prefix from incoming requests, and the SPA HTML/JS + server-built report links
+# prefix every asset/API/report URL and the client router with it.
+BASE_PATH = os.environ.get("DOKIMOS_BASE_PATH", "").rstrip("/")
+
+
+def _strip_base(path: str) -> str:
+    """Remove the reverse-proxy BASE_PATH prefix from a request path so all the
+    existing route matching (which is written for root-mounted paths) keeps
+    working. No-op when BASE_PATH is empty."""
+    if BASE_PATH and (path == BASE_PATH or path.startswith(BASE_PATH + "/")):
+        return path[len(BASE_PATH):] or "/"
+    return path
+
+
 # group_id -> one-time report password. IN MEMORY ONLY, never written to disk:
 # revealed once in the group view and dropped when the user leaves it (or on
 # process restart), matching the "shown once, never recoverable" report model.
@@ -199,6 +240,110 @@ _PIPELINE_STATUSES = ("scheduled", "running", "finished", "failed")
 # documents this exact tag as the canonical local build target.
 DOCKER_IMAGE = os.environ.get("DOKIMOS_DOCKER_IMAGE", "ifp-fcap-perf:latest")
 
+# --------------------------------------------------------------------------- #
+# Regression profile: preconfigured suites
+# --------------------------------------------------------------------------- #
+# The functional-regression surface runs host `behavex` (not the perf Docker
+# image) against one of four preconfigured suites. Paths are relative to the
+# IFP component root (TESTS_DIR). Standard quarantine tags are always excluded.
+_IFP_SUB = os.path.join("tests")  # under TESTS_DIR
+# The four portal-BFF API feature files (hit ads-ifp-portal-services), split out
+# from the forecast-engine API suite.
+_API_PORTAL_FEATURES = [
+    "PresetLabelsAPI.feature",
+    "Operative1ProfileAge.feature",
+    "Operative1MissingDimensionCoverage.feature",
+    "O1PresetsOMIntegration.feature",
+]
+_REGRESSION_EXCLUDE = ["rollout_pending", "tdd", "known_bug", "perf"]
+
+# preset id -> label, suite paths (relative to TESTS_DIR), default env, default
+# parallel. "paths" are directories or explicit feature files.
+REGRESSION_PRESETS = {
+    "ui_portal": {
+        "label": "UI — IFP Portal",
+        "paths": [os.path.join("tests", "ui_tests")],
+        "env": "local",
+        "parallel": 3,
+        "exclude": ["wip"] + _REGRESSION_EXCLUDE,
+    },
+    "api_portal": {
+        "label": "API — IFP Portal",
+        "paths": [os.path.join("tests", "api_tests", f) for f in _API_PORTAL_FEATURES],
+        "env": "local",
+        "parallel": 3,
+        "exclude": _REGRESSION_EXCLUDE,
+    },
+    "api_service": {
+        "label": "API — IFP service (ifp, o1, …)",
+        "paths": [os.path.join("tests", "api_tests")],
+        "env": "uat",
+        "parallel": 3,
+        "exclude": _REGRESSION_EXCLUDE,
+    },
+    "data": {
+        "label": "Data tests",
+        "paths": [os.path.join("tests", "data_tests")],
+        "env": "uat",
+        "parallel": 3,
+        "exclude": _REGRESSION_EXCLUDE,
+    },
+}
+DEFAULT_REGRESSION_PRESET = "api_service"
+
+# --------------------------------------------------------------------------- #
+# Data-validation profile: preconfigured full-catalog validators
+# --------------------------------------------------------------------------- #
+# The data-validation surface (DOKIMOS_PROFILE=data_validation) exposes ONLY the
+# full-catalog data validators — the runtime-expanded end-to-end targeting
+# fidelity sweeps (one scenario per O1 product / per line item). Same behavex
+# machinery as regression; only these suites are runnable here.
+DATA_VALIDATION_PRESETS = {
+    "all_lineitems": {
+        "label": "All line items — targeting fidelity",
+        "paths": [os.path.join(
+            "tests", "ui_tests", "lineitem_end_to_end_targeting",
+            "lineitem_end_to_end_targeting.feature",
+        )],
+        "env": "local",
+        "parallel": 3,
+        "exclude": _REGRESSION_EXCLUDE,
+        # A validation FAIL is a real defect, not flake — run once, no retry.
+        "scenario_retry": 1,
+    },
+    "all_o1_products": {
+        "label": "All O1 products — targeting fidelity",
+        "paths": [os.path.join(
+            "tests", "ui_tests", "all_o1_products_targeting_tests",
+            "o1_end_to_end_targeting.feature",
+        )],
+        "env": "local",
+        "parallel": 3,
+        "exclude": _REGRESSION_EXCLUDE,
+        # A validation FAIL is a real defect, not flake — run once, no retry.
+        "scenario_retry": 1,
+    },
+}
+DEFAULT_DATA_VALIDATION_PRESET = "all_lineitems"
+
+# Point the shared machinery (_build_regression_command, the preset selector,
+# defaults) at the active surface's preset set. The data-validation surface
+# reuses every regression code path verbatim — only the catalog differs.
+if PROFILE == "data_validation":
+    REGRESSION_PRESETS = DATA_VALIDATION_PRESETS
+    DEFAULT_REGRESSION_PRESET = DEFAULT_DATA_VALIDATION_PRESET
+
+# Repo root that contains NAS_components/ — where host behavex is invoked from.
+# TESTS_DIR is <root>/NAS_components/InventoryForecasting, so the root is two up.
+def _repo_root() -> str:
+    env = os.environ.get("DOKIMOS_REPO_ROOT", "").strip()
+    if env:
+        return env
+    return os.path.dirname(os.path.dirname(TESTS_DIR))
+
+# Path to a venv activate script to source before behavex (optional).
+DOKIMOS_VENV = os.environ.get("DOKIMOS_VENV", "").strip()
+
 # Hard ceiling on a single pipeline run. A hung container (e.g. behavex
 # deadlock, stuck Report-Portal upload) would otherwise block the single-slot
 # queue forever, so the runner watchdog kills it and marks the pipeline failed.
@@ -214,6 +359,14 @@ MAX_RUNTIME_CEILING_MIN = int(os.environ.get("DOKIMOS_MAX_RUNTIME_CEILING_MIN", 
 # mirrors the suite default; the Tests-panel field can dial it in [1, ceiling].
 SCENARIO_RETRY_DEFAULT = int(os.environ.get("DOKIMOS_SCENARIO_RETRY_DEFAULT", "3"))
 SCENARIO_RETRY_CEILING = int(os.environ.get("DOKIMOS_SCENARIO_RETRY_CEILING", "5"))
+
+# Data-validation runs are full-catalog correctness checks: a FAIL is a real
+# product-data defect (e.g. targeting dropped from the payload), not flake.
+# Retrying it just re-catches the same defect and multiplies nightly runtime,
+# so the data-validation surface defaults to a single attempt per scenario.
+# The operator can still dial retries up in the Tests panel if needed.
+if PROFILE == "data_validation":
+    SCENARIO_RETRY_DEFAULT = int(os.environ.get("DOKIMOS_SCENARIO_RETRY_DEFAULT", "1"))
 
 # Rough per-scenario wall time (seconds) for the *pre-run* duration estimate on
 # the job-config panel. Calibrated from observed @perf runs (~15s/scenario for
@@ -387,6 +540,125 @@ def _build_docker_command(pipeline: dict, assets: dict) -> tuple:
     # uses uat / 4 regardless of the Tests-panel selection.
     argv += [pipeline["env"], str(pipeline["parallel"])]
     return argv, envrc_host
+
+
+# --------------------------------------------------------------------------- #
+# Regression profile: host behavex command builder
+# --------------------------------------------------------------------------- #
+
+def _ifp_rel(rel_under_ifp: str) -> str:
+    """Path of something under the IFP component, expressed relative to the repo
+    root where behavex is invoked (e.g. NAS_components/InventoryForecasting/...)."""
+    abs_path = os.path.join(TESTS_DIR, rel_under_ifp)
+    return os.path.relpath(abs_path, _repo_root())
+
+
+def _iter_feature_files(rel_paths: list) -> list:
+    """Expand preset paths (dirs or .feature files, relative to TESTS_DIR) into a
+    concrete list of existing .feature files (absolute)."""
+    out = []
+    for rel in rel_paths:
+        ap = os.path.join(TESTS_DIR, rel)
+        if os.path.isfile(ap) and ap.endswith(".feature"):
+            out.append(ap)
+        elif os.path.isdir(ap):
+            for root, _dirs, files in os.walk(ap):
+                if "rollout_pending" in root or "WIP" in root:
+                    continue
+                for f in files:
+                    if f.endswith(".feature"):
+                        out.append(os.path.join(root, f))
+    return sorted(out)
+
+
+def _select_random_20(rel_paths: list, seed: int) -> tuple:
+    """Pick ~20% of scenarios per feature file (ceil, min 1) with a recorded
+    seed. Returns (include_paths, log_lines). include_paths are `repo-relative
+    file:line` targets for behavex --include-paths."""
+    import math
+    import random as _random
+    rnd = _random.Random(seed)
+    includes, log = [], []
+    for ap in _iter_feature_files(rel_paths):
+        try:
+            with open(ap, "r", encoding="utf-8", errors="replace") as fh:
+                lines = fh.readlines()
+        except OSError:
+            continue
+        # Scenario start lines (Scenario: / Scenario Outline:). Line numbers 1-based.
+        starts = [i + 1 for i, ln in enumerate(lines)
+                  if ln.lstrip().startswith(("Scenario:", "Scenario Outline:"))]
+        if not starts:
+            continue
+        k = max(1, math.ceil(len(starts) * 0.20))
+        chosen = sorted(rnd.sample(starts, min(k, len(starts))))
+        rel = os.path.relpath(ap, _repo_root())
+        for ln in chosen:
+            includes.append(f"{rel}:{ln}")
+        log.append(f"  {rel}: {len(chosen)}/{len(starts)} scenarios")
+    return includes, log
+
+
+def _build_regression_command(pipeline: dict) -> tuple:
+    """Build a host `bash -lc` behavex invocation for a regression preset.
+    Returns (argv, script_preview)."""
+    preset_id = pipeline.get("preset") or DEFAULT_REGRESSION_PRESET
+    preset = REGRESSION_PRESETS.get(preset_id) or REGRESSION_PRESETS[DEFAULT_REGRESSION_PRESET]
+    root = _repo_root()
+    env = pipeline.get("env") or preset["env"]
+    parallel = pipeline.get("parallel") or preset["parallel"]
+    retry = pipeline.get("scenario_retry") or SCENARIO_RETRY_DEFAULT
+
+    # Suite paths (repo-relative) or, for a 20% random run, explicit include lines.
+    suite_rel = [_ifp_rel(p) for p in preset["paths"]]
+    include_paths, sel_log = [], []
+    if pipeline.get("random20"):
+        seed = int(pipeline.get("random_seed") or 0) or (abs(hash(pipeline["id"])) % 100000)
+        pipeline["random_seed"] = seed
+        include_paths, sel_log = _select_random_20(preset["paths"], seed)
+
+    excludes = " ".join(f"--tags=~@{t}" for t in preset["exclude"])
+    envrc_rel = _ifp_rel(os.path.join("tests", ".envrc"))
+
+    parts = ["set -o pipefail", f"cd {shlex_quote(root)}"]
+    if DOKIMOS_VENV:
+        parts.append(f"source {shlex_quote(DOKIMOS_VENV)}")
+    parts.append(f"[ -f {shlex_quote(envrc_rel)} ] && source {shlex_quote(envrc_rel)} || true")
+    behavex = [
+        f"IFP_SCENARIO_RETRY={retry}",
+        "PYTHONPATH=$PWD",
+        "behavex",
+    ]
+    behavex += [shlex_quote(p) for p in suite_rel]
+    behavex += [f"-D ENV={shlex_quote(env)}",
+                f"--parallel-processes {int(parallel)}",
+                "--parallel-scheme=feature"]
+    if excludes:
+        behavex.append(excludes)
+    if include_paths:
+        behavex.append("--include-paths " + " ".join(shlex_quote(p) for p in include_paths))
+    extras = (pipeline.get("tests") or "").strip()
+    if extras:
+        behavex.append(extras)
+    parts.append(" ".join(behavex))
+    script = "\n".join(parts)
+
+    # Stash a human-readable selection summary for the run log.
+    pipeline["_regression_preview"] = {
+        "preset": preset["label"],
+        "env": env,
+        "parallel": parallel,
+        "random20": bool(pipeline.get("random20")),
+        "selection": sel_log,
+        "seed": pipeline.get("random_seed"),
+        "script": script,
+    }
+    return ["bash", "-lc", script], script
+
+
+def shlex_quote(s: str) -> str:
+    import shlex
+    return shlex.quote(str(s))
 
 
 # Regex for spotting a Report Portal launch URL in behavex output. The IFP
@@ -853,47 +1125,72 @@ def _run_pipeline(pipeline_id: str) -> None:
         if rec is None:
             return
 
-        # Surface, at the top of the run log, how many scenarios were discovered
-        # and how many will actually execute (@perf) -- before the container starts.
-        _log_scenario_discovery(pipeline_id)
+        if REGRESSION_LIKE:
+            # Host behavex run against a preconfigured suite (no Docker image).
+            # Both the regression and data-validation surfaces take this path.
+            argv, _script = _build_regression_command(rec)
+            prev = rec.get("_regression_preview") or {}
+            log_lines = [
+                f"[{_now_iso()}] regression preset: {prev.get('preset', '?')} "
+                f"(env={prev.get('env')}, parallel={prev.get('parallel')}"
+                + (", 20% random" if prev.get("random20") else "") + ")",
+            ]
+            if not os.path.isdir(TESTS_DIR):
+                log_lines.append(
+                    f"[{_now_iso()}] WARNING: IFP tests dir not found on host "
+                    f"({TESTS_DIR}); set DOKIMOS_TESTS_DIR. The run will likely fail.")
+            if prev.get("random20"):
+                log_lines.append(f"[{_now_iso()}] random seed: {prev.get('seed')}")
+                for s in (prev.get("selection") or []):
+                    log_lines.append(f"[{_now_iso()}] selected {s}")
+            log_lines.append(f"[{_now_iso()}] running: {' '.join(argv)}")
+            _append_pipeline_log(
+                pipeline_id, *log_lines,
+                status="running",
+                started_at=rec.get("started_at") or _now_iso(),
+            )
+        else:
+            # Surface, at the top of the run log, how many scenarios were discovered
+            # and how many will actually execute (@perf) -- before the container starts.
+            _log_scenario_discovery(pipeline_id)
 
-        assets = _discover_docker_assets()
-        if not assets["dockerfile"]:
+            assets = _discover_docker_assets()
+            if not assets["dockerfile"]:
+                _append_pipeline_log(
+                    pipeline_id,
+                    f"[{_now_iso()}] ERROR: no Dockerfile found under {TESTS_DIR}",
+                    f"[{_now_iso()}] expected one of: {TESTS_DIR}/perf/Dockerfile",
+                    status="failed", finished_at=_now_iso(),
+                )
+                final_status = "failed"
+                return
+
+            if shutil.which("docker") is None:
+                _append_pipeline_log(
+                    pipeline_id,
+                    f"[{_now_iso()}] ERROR: `docker` not found on PATH.",
+                    f"[{_now_iso()}] install Docker Desktop (or colima) and retry.",
+                    status="failed", finished_at=_now_iso(),
+                )
+                final_status = "failed"
+                return
+
+            # Reuse the image if it's already built; otherwise build it once now.
+            if not _ensure_docker_image(pipeline_id, assets):
+                final_status = "failed"
+                return
+
+            argv, envrc = _build_docker_command(rec, assets)
             _append_pipeline_log(
                 pipeline_id,
-                f"[{_now_iso()}] ERROR: no Dockerfile found under {TESTS_DIR}",
-                f"[{_now_iso()}] expected one of: {TESTS_DIR}/perf/Dockerfile",
-                status="failed", finished_at=_now_iso(),
+                f"[{_now_iso()}] discovered Dockerfile: {assets['dockerfile']}",
+                f"[{_now_iso()}] readme: {assets['readme'] or '(none)'}",
+                f"[{_now_iso()}] build context: {assets['rel_root'] or '(unknown)'}",
+                f"[{_now_iso()}] mounted secrets: {envrc or '(none, expect missing-env failures)'}",
+                f"[{_now_iso()}] running: {' '.join(argv)}",
+                status="running",
+                started_at=rec.get("started_at") or _now_iso(),
             )
-            final_status = "failed"
-            return
-
-        if shutil.which("docker") is None:
-            _append_pipeline_log(
-                pipeline_id,
-                f"[{_now_iso()}] ERROR: `docker` not found on PATH.",
-                f"[{_now_iso()}] install Docker Desktop (or colima) and retry.",
-                status="failed", finished_at=_now_iso(),
-            )
-            final_status = "failed"
-            return
-
-        # Reuse the image if it's already built; otherwise build it once now.
-        if not _ensure_docker_image(pipeline_id, assets):
-            final_status = "failed"
-            return
-
-        argv, envrc = _build_docker_command(rec, assets)
-        _append_pipeline_log(
-            pipeline_id,
-            f"[{_now_iso()}] discovered Dockerfile: {assets['dockerfile']}",
-            f"[{_now_iso()}] readme: {assets['readme'] or '(none)'}",
-            f"[{_now_iso()}] build context: {assets['rel_root'] or '(unknown)'}",
-            f"[{_now_iso()}] mounted secrets: {envrc or '(none, expect missing-env failures)'}",
-            f"[{_now_iso()}] running: {' '.join(argv)}",
-            status="running",
-            started_at=rec.get("started_at") or _now_iso(),
-        )
 
         try:
             proc = subprocess.Popen(
@@ -1318,6 +1615,9 @@ def _check_group_completions() -> None:
     """Detect iteration groups whose every member reached a terminal state and
     auto-generate the aggregated perf report exactly once. Called by the
     dispatcher loop; the expensive generation runs in a worker thread."""
+    # The regression surface doesn't produce comparison reports.
+    if not REPORTS_ENABLED:
+        return
     to_generate = []
     with _pipelines_lock():
         groups = _load_groups()
@@ -1513,6 +1813,10 @@ def _create_pipeline(cfg: dict, iteration_index: int = 1, iteration_count: int =
         "parallel":      max(1, min(6, int(cfg.get("parallel") or 2))),
         "feature":       (cfg.get("feature") or "").strip(),
         "tests":         (cfg.get("tests") or "").strip(),
+        # Regression-only: which preconfigured suite to run, and whether to run
+        # just a seeded 20% random subset. Ignored by the perf profile.
+        "preset":        (cfg.get("preset") or "").strip(),
+        "random20":      bool(cfg.get("random20")),
         "max_runtime_sec": _clamp_max_runtime_sec(cfg.get("max_runtime_min")),
         "scenario_retry": _clamp_scenario_retry(cfg.get("scenario_retry")),
         "group_id":      group_id,
@@ -1666,6 +1970,7 @@ def _build_tests_tree(root: str) -> dict:
 
 
 def _ensure_reports_dir() -> None:
+    os.makedirs(STATE_DIR, exist_ok=True)
     os.makedirs(REPORTS_DIR, exist_ok=True)
 
 
@@ -2063,11 +2368,11 @@ def _list_reports() -> dict:
                 "id":           report_dirname,
                 "sprint":       sprint_dirname,
                 "share_hash":   share_hash,
-                "share_url":    f"/r/{share_hash}",
+                "share_url":    f"{BASE_PATH}/r/{share_hash}",
                 "title":        meta.get("title", report_dirname),
                 "generated_at": meta.get("generated_at"),
                 "num_launches": meta.get("num_launches"),
-                "url":          f"/reports/{sprint_dirname}/{report_dirname}/index.html",
+                "url":          f"{BASE_PATH}/reports/{sprint_dirname}/{report_dirname}/index.html",
             })
 
     out_sprints = []
@@ -2233,14 +2538,14 @@ def _save_report(html: str, urls: list, analyzer_meta: dict, report_password: st
         "id":             report_id,
         "sprint":         sprint_dirname,
         "share_hash":     share_hash,
-        "share_url":      f"/r/{share_hash}",
+        "share_url":      f"{BASE_PATH}/r/{share_hash}",
         "title":          title,
         "generated_at":   metadata["generated_at"],
         "num_launches":   num_launches,
         "run_started_at":  rw_start,
         "run_finished_at": rw_end,
         "run_window":      rw_label,
-        "url":            f"/reports/{sprint_dirname}/{report_id}/index.html",
+        "url":            f"{BASE_PATH}/reports/{sprint_dirname}/{report_id}/index.html",
         # Returned to the caller (and ultimately the browser) ONCE on
         # generation. The server forgets it the moment this response is
         # written.
@@ -2928,11 +3233,13 @@ html, body {
     position: sticky;
     top: 0;
     z-index: 50;
-    margin-bottom: 24px;
+    /* No gap: the product nav (.pnav) sits flush under the header, matching the
+       V-Model dashboard. Spacing before the tab row is on .tabs instead. */
+    margin-bottom: 0;
 }
-.app-header > .brand-link { justify-self: start; }
-.app-header > .brand      { justify-self: center; text-align: center; }
-.app-header > .brand-sub  { justify-self: end; }
+.app-header > .brand-link   { justify-self: start; }
+.app-header > .brand-center { justify-self: center; display: flex; align-items: center; gap: 12px; }
+.app-header > .brand-sub    { justify-self: end; min-width: 0; }
 
 /* Wrapper link around the horizontal Chiron logo. Opens the marketing
    site (dokimos.chiron.systems) in a new tab. */
@@ -3016,42 +3323,39 @@ html, body {
     letter-spacing: 0.08em;
     text-transform: uppercase;
     text-align: right;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
 }
 
-/* ----- Tabs ----- */
-.tabs {
+/* ----- Section tabs: their own sub-level row directly below the product nav.
+   A slightly darker strip so the hierarchy reads top-level nav -> section
+   tabs (not tabs floated to the right of the top nav). ----- */
+.pnav-tabs {
     display: flex;
-    gap: 4px;
-    margin-bottom: 22px;
-    /* Match the inner padding the header uses so tabs line up with the
-       Chiron logo / brand block above them. */
-    padding: 0 28px;
+    align-items: stretch;
+    gap: 2px;
+    padding: 0 24px;
+    background: rgba(0, 15, 30, 0.85);
+    border-bottom: 1px solid var(--divider);
 }
 .tab-btn {
+    /* Match the .pnav links exactly so the whole bar reads as one menu. */
     background: transparent;
-    border: 1px solid var(--divider);
-    border-bottom: none;
+    border: none;
     color: var(--gray);
-    padding: 8px 22px 9px;
+    padding: 12px 18px;
     cursor: pointer;
-    font-family: var(--font-mono);
-    font-size: 12px;
+    font-family: var(--font-brand);
+    font-size: 13px;
     font-weight: 700;
-    letter-spacing: 0.06em;
-    text-transform: uppercase;
-    border-radius: 0;
-    transition: color .15s, background .15s, border-color .15s;
+    letter-spacing: 0.02em;
+    text-transform: none;
+    border-top: 2px solid transparent;   /* overline marker (see .active) */
+    transition: color .2s, border-color .2s;
 }
-.tab-btn:hover    { color: var(--white-soft); background: var(--bg-card); }
-.tab-btn.active   {
-    color: var(--bronze);
-    background: var(--bg-card);
-    border-color: var(--divider);
-    border-bottom: 1px solid var(--bg-card);
-    position: relative;
-    top: 1px;
-}
-.tab-btn .num     { color: var(--bronze); margin-right: 6px; }
+.tab-btn:hover    { color: var(--white-soft); }
+.tab-btn.active   { color: var(--bronze); border-top-color: var(--bronze); }
 
 /* ----- Tests tab: file tree + code viewer ----- */
 .tests-layout {
@@ -3146,24 +3450,79 @@ html, body {
 
 /* Tests tab toolbar */
 .tests-toolbar {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 12px 14px;
-    align-items: flex-end;
-    margin-bottom: 12px;
-    padding: 12px 14px;
+    /* Uniform responsive grid so every field lines up in tidy columns instead
+       of a ragged flex-wrap row. Compact controls take one cell; the wide text
+       inputs (name / feature / tests) span two. Header, action buttons and the
+       parallel warning each span the full width. */
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+    gap: 20px 22px;
+    align-items: end;
+    /* Equal breathing room above (to the nav bar) and below (to the content). */
+    margin-top: 18px;
+    margin-bottom: 18px;
+    padding: 24px 26px 26px;
     background: var(--bg-card);
     border: 1px solid var(--divider);
-    border-radius: 6px;
+    border-radius: 10px;
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.28);
 }
-.tests-control { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
-.tests-control-grow { flex: 1 1 200px; }
+/* Full-width titled header for the run form. */
+.tests-toolbar-head {
+    grid-column: 1 / -1;
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+    padding-bottom: 14px;
+    border-bottom: 1px solid var(--divider);
+}
+.tests-toolbar-head .tt-title {
+    font-family: var(--font-brand);
+    font-weight: 800;
+    font-size: 15px;
+    letter-spacing: 0.01em;
+    color: var(--white);
+}
+.tests-toolbar-head .tt-hint {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--gray);
+}
+.tests-control { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.tests-control-grow { grid-column: span 2; }
 .tests-control label {
     font-family: var(--font-mono);
-    font-size: 10px;
-    letter-spacing: 1.1px;
+    font-size: 10.5px;
+    font-weight: 600;
+    letter-spacing: 1.2px;
     text-transform: uppercase;
-    color: rgba(255,255,255,0.5);
+    color: var(--gray);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    margin-bottom: 1px;
+}
+/* Scope / 20%-random cell: keep the checkbox row the same height as the inputs
+   next to it so it lines up on the grid baseline instead of floating. */
+.tests-control label.tests-random {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    height: 46px;
+    padding: 0 2px;
+    font-family: var(--font-mono);
+    font-size: 13px;
+    letter-spacing: 0.02em;
+    text-transform: none;
+    color: var(--white-soft);
+    cursor: pointer;
+    white-space: nowrap;
+}
+.tests-random input[type="checkbox"] {
+    width: 15px;
+    height: 15px;
+    accent-color: var(--bronze);
+    cursor: pointer;
 }
 .tests-control label .opt {
     color: rgba(255,255,255,0.30);
@@ -3172,30 +3531,71 @@ html, body {
     margin-left: 2px;
 }
 .tests-control select,
-.tests-control input[type="text"] {
-    background: var(--bg-dark);
+.tests-control input[type="text"],
+.tests-control input[type="number"] {
+    box-sizing: border-box;
+    width: 100%;
+    height: 46px;               /* uniform height across selects + inputs */
     color: var(--white-soft);
     border: 1px solid var(--divider);
-    border-radius: 4px;
-    padding: 7px 10px;
+    border-radius: 9px;
+    padding: 0 14px;
     font-family: var(--font-mono);
-    font-size: 12px;
-    min-width: 110px;
+    font-size: 13px;
+    line-height: 44px;
+    min-width: 0;
     outline: none;
-    transition: border-color 120ms ease;
+    /* Subtle top-lit gradient over the dark field + a soft inner shadow so the
+       controls read as recessed, tactile inputs rather than flat rectangles. */
+    background:
+        linear-gradient(180deg, rgba(255,255,255,0.04), rgba(0,0,0,0.14)),
+        var(--bg-dark);
+    box-shadow: inset 0 1px 2px rgba(0,0,0,0.35);
+    transition: border-color .15s ease, box-shadow .15s ease, background .15s ease;
 }
-.tests-control input[type="text"] { width: 100%; }
+.tests-control input::placeholder { color: rgba(255,255,255,0.28); }
+/* Custom chevron for selects (native arrow is inconsistent + plain). */
+.tests-control select {
+    -webkit-appearance: none;
+    appearance: none;
+    padding-right: 36px;
+    background:
+        url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%23A0AEC0' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'><polyline points='6 9 12 15 18 9'/></svg>") no-repeat right 14px center,
+        linear-gradient(180deg, rgba(255,255,255,0.04), rgba(0,0,0,0.14)),
+        var(--bg-dark);
+    cursor: pointer;
+}
+.tests-control select:hover,
+.tests-control input[type="text"]:hover,
+.tests-control input[type="number"]:hover {
+    border-color: var(--gray-dark);
+    background:
+        linear-gradient(180deg, rgba(255,255,255,0.06), rgba(0,0,0,0.12)),
+        var(--bg-dark);
+}
+.tests-control select:hover {
+    border-color: var(--gray-dark);
+    background:
+        url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%23E2E8F0' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'><polyline points='6 9 12 15 18 9'/></svg>") no-repeat right 14px center,
+        linear-gradient(180deg, rgba(255,255,255,0.06), rgba(0,0,0,0.12)),
+        var(--bg-dark);
+}
 .tests-control select:focus,
-.tests-control input[type="text"]:focus { border-color: var(--bronze); }
-.tests-toolbar-actions { display: flex; gap: 8px; align-self: flex-end; }
+.tests-control input[type="text"]:focus,
+.tests-control input[type="number"]:focus {
+    border-color: var(--bronze);
+    box-shadow: inset 0 1px 2px rgba(0,0,0,0.35), 0 0 0 3px rgba(205, 127, 50, 0.22);
+}
+.tests-toolbar-actions { grid-column: 1 / -1; display: flex; gap: 10px; justify-content: flex-end; padding-top: 4px; }
 .tests-toolbar-actions .btn-primary,
 .tests-toolbar-actions .btn-secondary {
-    padding: 8px 16px;
-    font-size: 11px;
+    height: 46px;
+    padding: 0 24px;
+    font-size: 12px;
     white-space: nowrap;
 }
 .tests-parallel-warning {
-    flex-basis: 100%;
+    grid-column: 1 / -1;
     padding: 8px 12px;
     background: rgba(245,158,11,0.10);
     border-left: 2px solid rgba(245,158,11,0.7);
@@ -4367,43 +4767,165 @@ body.busy .busy-overlay { display: flex; }
 # --------------------------------------------------------------------------- #
 # SPA shell HTML (served after a valid session is presented)
 # --------------------------------------------------------------------------- #
+# Profile-conditional shell bits. The regression surface reuses the same shell
+# but renames itself, drops the report-only tabs, and adds a "Regression type"
+# preset selector + a 20%-random toggle to the run configuration.
+APP_TITLE = {
+    "regression": "Regression Runner",
+    "data_validation": "Data Validation Runner",
+}.get(PROFILE, "Performance Runner")
+APP_BRAND = APP_TITLE
+_REPORTS_JS = "true" if REPORTS_ENABLED else "false"
+
+# Header sub-line + a colour-coded surface badge so each surface reads
+# intentionally instead of all three sharing the perf "Encrypted reports" tag.
+BRAND_SUB = {
+    "regression": "Host behavex suites",
+    "data_validation": "O1 products &amp; line items",
+}.get(PROFILE, "Prototype &middot; Encrypted reports")
+_BADGE_LABEL = {
+    "perf": "PERFORMANCE",
+    "regression": "REGRESSION",
+    "data_validation": "DATA VALIDATION",
+}.get(PROFILE, PROFILE.upper())
+SURFACE_BADGE_HTML = f'<span class="surface-badge surface-badge--{PROFILE}">{_BADGE_LABEL}</span>'
+
+def _pnav_on(p: str) -> str:
+    return ' class="on"' if PROFILE == p else ''
+
+# Mirror the V-Model gateway's top nav verbatim (labels, links, order) so the
+# menu is identical across every surface. Only the "Data validation" entry is
+# new; the gateway build still needs the same entry added to match fully.
+PNAV_HTML = (
+    '<a href="/disney/board">Board</a>\n'
+    '            <a href="/disney">Functional</a>\n'
+    f'            <a href="/perf"{_pnav_on("perf")}>Performance</a>\n'
+    f'            <a href="/regression"{_pnav_on("regression")}>Functional regression</a>\n'
+    f'            <a href="/data-validation"{_pnav_on("data_validation")}>Data validation</a>\n'
+    '            <a href="/about" class="nav-right">About</a>'
+)
+
+if REPORTS_ENABLED:
+    TAB_BUTTONS = (
+        '<button class="tab-btn active" data-tab="new"       onclick="showTab(\'new\')">New</button>\n'
+        '                <button class="tab-btn"        data-tab="pipelines" onclick="showTab(\'pipelines\')">Pipelines</button>\n'
+        '                <button class="tab-btn"        data-tab="reports"   onclick="showTab(\'reports\')">Reports</button>'
+    )
+    NEW_ACTIVE, PIPE_ACTIVE = " active", ""
+else:
+    TAB_BUTTONS = '<button class="tab-btn active" data-tab="pipelines" onclick="showTab(\'pipelines\')">Pipelines</button>'
+    NEW_ACTIVE, PIPE_ACTIVE = "", " active"
+
+import html as _html
+# Preset <option>s + their env/parallel defaults are generated from the active
+# surface's preset set (regression -> the 4 suites; data_validation -> the two
+# full-catalog validators) so both surfaces stay in lockstep with the backend.
+_PRESET_OPTIONS_HTML = "\n".join(
+    '                        <option value="{pid}"{sel}>{label}</option>'.format(
+        pid=_html.escape(pid),
+        sel=(" selected" if pid == DEFAULT_REGRESSION_PRESET else ""),
+        label=_html.escape(cfg["label"]),
+    )
+    for pid, cfg in REGRESSION_PRESETS.items()
+)
+PRESET_DEFAULTS_JSON = json.dumps(
+    {pid: {"env": cfg["env"], "parallel": cfg["parallel"],
+           "scenario_retry": cfg.get("scenario_retry", SCENARIO_RETRY_DEFAULT)}
+     for pid, cfg in REGRESSION_PRESETS.items()}
+)
+
+if REGRESSION_LIKE:
+    _is_dv = PROFILE == "data_validation"
+    _type_label = "Validation type" if _is_dv else "Regression type"
+    _random_html = (
+        ""
+        if _is_dv
+        else '                <div class="tests-control">\n'
+        '                    <label>Scope</label>\n'
+        '                    <label class="tests-random"><input type="checkbox" id="testsRandom20"> 20% random</label>\n'
+        '                </div>'
+    )
+    REGRESSION_TYPE_HTML = (
+        '<div class="tests-control tests-control-grow">\n'
+        f'                    <label>{_type_label}</label>\n'
+        '                    <select id="testsPreset" onchange="_applyPresetDefaults()">\n'
+        f'{_PRESET_OPTIONS_HTML}\n'
+        '                    </select>\n'
+        '                </div>\n'
+        f'{_random_html}'
+    )
+    RUN_CONFIG_HINT = (
+        "Pick a full-catalog validator, then run it and watch it below."
+        if _is_dv
+        else "Pick a regression type, then run it and watch it below."
+    )
+else:
+    REGRESSION_TYPE_HTML = ""
+    PRESET_DEFAULTS_JSON = "{}"
+    RUN_CONFIG_HINT = "Enqueue a performance pipeline and watch it below."
+
 SPA_HTML = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Perf Runner</title>
+    <title>{APP_TITLE}</title>
     <link rel="icon" href="data:,">
     <!-- highlight.js for the Tests tab code viewer. Atom One Dark matches
          the existing dokimos dark palette closely enough to look native. -->
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.10.0/build/styles/atom-one-dark.min.css">
     <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.10.0/build/highlight.min.js"></script>
     <style>{DOKIMOS_CSS}</style>
+    <style>
+    /* Product-level nav linking the dokimos surfaces (V-Model at /, Perf here,
+       marketing at /about). Bronze overline marks the active surface. */
+    .pnav{{display:flex;gap:2px;padding:0 24px;background:#001F3F;border-bottom:1px solid #2D3748;}}
+    .pnav a{{font-family:'Plus Jakarta Sans','Segoe UI',sans-serif;font-weight:700;font-size:13px;letter-spacing:.02em;color:#A0AEC0;text-decoration:none;padding:12px 18px;border-top:2px solid transparent;transition:color .2s,border-color .2s;}}
+    .pnav a:hover{{color:#E2E8F0;}}
+    .pnav a.on{{color:#CD7F32;border-top-color:#CD7F32;}}
+    .pnav a.nav-right{{margin-left:auto;}}
+
+    /* Surface badge: a small colour-coded pill next to the brand so each
+       dokimos surface (Performance / Regression / Data Validation) is instantly
+       identifiable. Each surface owns an accent colour that also tints its
+       active nav underline via the more-specific rules below. */
+    .surface-badge{{display:inline-flex;align-items:center;margin-left:12px;padding:3px 10px;
+        border-radius:999px;font-family:'Plus Jakarta Sans','Segoe UI',sans-serif;
+        font-size:10px;font-weight:800;letter-spacing:.12em;line-height:1;
+        border:1px solid transparent;text-transform:uppercase;}}
+    .surface-badge--perf{{color:#CD7F32;background:rgba(205,127,50,.12);border-color:rgba(205,127,50,.45);}}
+    .surface-badge--regression{{color:#4FD1C5;background:rgba(79,209,197,.12);border-color:rgba(79,209,197,.45);}}
+    .surface-badge--data_validation{{color:#68D391;background:rgba(104,211,145,.12);border-color:rgba(104,211,145,.45);}}
+
+    </style>
 </head>
-<body>
+<body class="surface-{PROFILE}">
     <div class="app">
         <header class="app-header">
             <a class="brand-link" href="https://dokimos.chiron.systems" target="_blank" rel="noopener noreferrer" title="Open dokimos.chiron.systems">
                 <span class="chiron-logo">
-                    <img class="chiron-icon" src="/assets/chiron-icon-light.svg" alt="" aria-hidden="true">
+                    <img class="chiron-icon" src="{BASE_PATH}/assets/chiron-icon-light.svg" alt="" aria-hidden="true">
                     <span class="chiron-text">
                         <span class="chiron-word">CHIRON</span>
                         <span class="chiron-tag">SYSTEMS</span>
                     </span>
                 </span>
             </a>
-            <span class="brand">Perf Runner</span>
-            <span class="brand-sub">Prototype &middot; Encrypted reports</span>
+            <span class="brand-center">
+                <span class="brand">{APP_BRAND}</span>
+                {SURFACE_BADGE_HTML}
+            </span>
+            <span class="brand-sub">{BRAND_SUB}</span>
         </header>
 
-        <nav class="tabs">
-            <button class="tab-btn active" data-tab="new"       onclick="showTab('new')"><span class="num">01.</span>New</button>
-            <button class="tab-btn"        data-tab="tests"     onclick="showTab('tests')"><span class="num">02.</span>Tests</button>
-            <button class="tab-btn"        data-tab="pipelines" onclick="showTab('pipelines')"><span class="num">03.</span>Pipelines</button>
-            <button class="tab-btn"        data-tab="reports"   onclick="showTab('reports')"><span class="num">04.</span>Reports</button>
+        <nav id="chiron-nav"></nav>
+        <script src="/shared/nav.js" defer></script>
+
+        <nav class="pnav-tabs">
+            {TAB_BUTTONS}
         </nav>
 
-        <section class="tab-panel active" data-panel="new">
+        <section class="tab-panel{NEW_ACTIVE}" data-panel="new">
             <div class="card">
                 <h2>Generate a comparison report</h2>
                 <p class="subtle">Paste Report Portal launch URLs &mdash; one per inbox, or many in one inbox separated by commas. Use <strong style="color:var(--bronze)">+</strong> to add inboxes (up to 20). At <strong style="color:var(--bronze)">4+</strong> launches the report renders as four comparison tabs.</p>
@@ -4460,11 +4982,16 @@ SPA_HTML = f"""<!DOCTYPE html>
             </div>
         </section>
 
-        <section class="tab-panel" data-panel="tests">
+        <section class="tab-panel{PIPE_ACTIVE}" data-panel="pipelines">
             <div class="tests-toolbar">
+                <div class="tests-toolbar-head">
+                    <span class="tt-title">Run configuration</span>
+                    <span class="tt-hint">{RUN_CONFIG_HINT}</span>
+                </div>
+                {REGRESSION_TYPE_HTML}
                 <div class="tests-control">
                     <label>Environment</label>
-                    <select id="testsEnv"><option value="prod" selected>prod</option></select>
+                    <select id="testsEnv"><option value="uat" selected>uat</option></select>
                 </div>
                 <div class="tests-control">
                     <label>Parallel</label>
@@ -4513,21 +5040,6 @@ SPA_HTML = f"""<!DOCTYPE html>
                     Parallel &gt; 3 exceeds the local hard cap — expect "session not created" Chrome contention.
                 </div>
             </div>
-            <div class="tests-layout">
-                <aside class="tests-tree" id="testsTreePanel">
-                    <div class="tests-tree-loading">Loading tree&hellip;</div>
-                </aside>
-                <main class="tests-view">
-                    <div class="tests-view-header">
-                        <span class="tests-view-path" id="testsViewPath">Select a file from the tree</span>
-                        <span class="tests-view-size" id="testsViewSize"></span>
-                    </div>
-                    <pre class="tests-view-body"><code id="testsViewCode" class="hljs">// Pick a file on the left to view its contents.</code></pre>
-                </main>
-            </div>
-        </section>
-
-        <section class="tab-panel" data-panel="pipelines">
             <div class="pipelines-layout">
                 <aside class="pipelines-list" id="pipelinesListPanel">
                     <div class="pipelines-list-loading">Loading pipelines&hellip;</div>
@@ -4566,7 +5078,7 @@ SPA_HTML = f"""<!DOCTYPE html>
         </section>
 
         <footer class="app-footer">
-            <span>DOKIMOS &middot; PERFORMANCE</span>
+            <span>DOKIMOS &middot; {_BADGE_LABEL}</span>
             <span>&copy; {datetime.now().year} &middot; DOKIMOS.<span class="bronze">CHIRON</span>.SYSTEMS &middot; ALL RIGHTS RESERVED</span>
         </footer>
     </div>
@@ -4615,6 +5127,12 @@ SPA_HTML = f"""<!DOCTYPE html>
     </div>
 
     <script>
+        // Base URL prefix when served under a reverse-proxy sub-path (e.g.
+        // "/perf"). Empty => root; all fetches, the client router and pushState
+        // targets are prefixed with it so the SPA works either way.
+        const BP = "{BASE_PATH}";
+        const PROFILE = "{PROFILE}";
+        const REPORTS_ENABLED = {_REPORTS_JS};
         const MAX_INBOXES = 20;
         // Single user-facing error string -- never leak HTTP status codes,
         // server stack traces, or fetch-thrown messages. Client-side
@@ -4630,6 +5148,8 @@ SPA_HTML = f"""<!DOCTYPE html>
         let _pendingReport = null;
 
         function showTab(name, opts) {{
+            // Report-only tabs don't exist in the regression surface.
+            if (!REPORTS_ENABLED && (name === 'new' || name === 'reports')) name = 'pipelines';
             document.querySelectorAll('.tab-btn').forEach(function(b) {{
                 b.classList.toggle('active', b.getAttribute('data-tab') === name);
             }});
@@ -4638,8 +5158,7 @@ SPA_HTML = f"""<!DOCTYPE html>
             }});
             if (name !== 'pipelines') _leaveGroupView();
             if (name === 'reports') refreshReports();
-            if (name === 'tests') {{ _loadTestsTree(); _loadTestsEnvs(); }}
-            if (name === 'pipelines') {{ _enterPipelinesTab(); }}
+            if (name === 'pipelines') {{ _loadTestsEnvs(); _enterPipelinesTab(); }}
             else _stopPipelinesPolling();
             // Keep the URL in sync with the active tab (but don't push a
             // history entry when we're just *reading* a URL on load).
@@ -4648,9 +5167,35 @@ SPA_HTML = f"""<!DOCTYPE html>
                 if (name === 'new') target = '/';
                 else if (name === 'pipelines' && _selectedPipelineId) target = '/pipelines/' + _selectedPipelineId;
                 else target = '/' + name;
-                if (target !== window.location.pathname) {{
-                    history.pushState({{tab: name, pid: _selectedPipelineId}}, '', target);
+                if (BP + target !== window.location.pathname) {{
+                    history.pushState({{tab: name, pid: _selectedPipelineId}}, '', BP + target);
                 }}
+            }}
+        }}
+
+        // Regression presets carry their own default environment + parallelism.
+        // Selecting one seeds the run form so the operator gets the documented
+        // defaults (UI/portal-API => local; forecast-API + data => uat).
+        const _PRESET_DEFAULTS = {PRESET_DEFAULTS_JSON};
+        function _applyPresetDefaults() {{
+            const ps = document.getElementById('testsPreset');
+            if (!ps) return;
+            const d = _PRESET_DEFAULTS[ps.value];
+            if (!d) return;
+            const env = document.getElementById('testsEnv');
+            if (env) {{
+                if (![...env.options].some(o => o.value === d.env)) {{
+                    env.add(new Option(d.env, d.env));
+                }}
+                env.value = d.env;
+            }}
+            const par = document.getElementById('testsParallel');
+            if (par && [...par.options].some(o => o.value === String(d.parallel))) {{
+                par.value = String(d.parallel);
+            }}
+            const ret = document.getElementById('testsRetries');
+            if (ret && d.scenario_retry != null) {{
+                ret.value = String(d.scenario_retry);
             }}
         }}
 
@@ -4663,15 +5208,17 @@ SPA_HTML = f"""<!DOCTYPE html>
                 const data = await res.json();
                 const envs = (data.environments || []);
                 if (!envs.length) return;
-                const prior = sel.value || 'prod';
+                const prior = sel.value || 'uat';
                 sel.innerHTML = envs.map(function(e) {{
-                    return '<option value="' + e + '"' + (e === 'prod' ? ' selected' : '') + '>' + e + '</option>';
+                    return '<option value="' + e + '"' + (e === 'uat' ? ' selected' : '') + '>' + e + '</option>';
                 }}).join('');
-                // Preserve previous selection if still present, else default to prod.
+                // Preserve previous selection if still present, else default to uat.
                 if (envs.indexOf(prior) >= 0) sel.value = prior;
-                else if (envs.indexOf('prod') >= 0) sel.value = 'prod';
+                else if (envs.indexOf('uat') >= 0) sel.value = 'uat';
                 sel.dataset.loaded = '1';
-            }} catch (e) {{ /* leave default 'prod' */ }}
+            }} catch (e) {{ /* leave default 'uat' */ }}
+            // In the regression surface, seed env/parallel from the selected preset.
+            _applyPresetDefaults();
         }}
 
         function _testsParallelCheck() {{
@@ -4700,6 +5247,8 @@ SPA_HTML = f"""<!DOCTYPE html>
                 max_runtime_min: maxrt,
                 scenario_retry: retries,
                 iterations:     iters,
+                preset:         (document.getElementById('testsPreset') || {{}}).value || '',
+                random20:       !!((document.getElementById('testsRandom20') || {{}}).checked),
             }};
         }}
 
@@ -5125,7 +5674,7 @@ SPA_HTML = f"""<!DOCTYPE html>
             await _refreshGroupView();
             if (!opts || !opts.fromPop) {{
                 const target = '/groups/' + gid;
-                if (window.location.pathname !== target) history.pushState({{tab: 'pipelines', gid: gid}}, '', target);
+                if (window.location.pathname !== BP + target) history.pushState({{tab: 'pipelines', gid: gid}}, '', BP + target);
             }}
         }}
 
@@ -5720,8 +6269,8 @@ SPA_HTML = f"""<!DOCTYPE html>
             // link opens the same view next time.
             if (!opts || !opts.fromPop) {{
                 const target = '/pipelines/' + id;
-                if (window.location.pathname !== target) {{
-                    history.pushState({{tab: 'pipelines', pid: id}}, '', target);
+                if (window.location.pathname !== BP + target) {{
+                    history.pushState({{tab: 'pipelines', pid: id}}, '', BP + target);
                 }}
             }}
         }}
@@ -6630,19 +7179,29 @@ SPA_HTML = f"""<!DOCTYPE html>
                 showTab('pipelines', {{fromPop: fromPop}});
                 return;
             }}
-            if (path === '/tests'   || path === '/tests/')   {{ showTab('tests',   {{fromPop: fromPop}}); return; }}
+            // /tests merged into pipelines — keep old links working.
+            if (path === '/tests'   || path === '/tests/')   {{ showTab('pipelines', {{fromPop: fromPop}}); return; }}
             if (path === '/reports' || path === '/reports/') {{ showTab('reports', {{fromPop: fromPop}}); return; }}
-            // default
-            showTab('new', {{fromPop: fromPop}});
+            // default: the New tab in perf; the regression surface has no New
+            // tab, so it lands on the run configuration (Pipelines) instead.
+            showTab(REPORTS_ENABLED ? 'new' : 'pipelines', {{fromPop: fromPop}});
         }}
         window.addEventListener('popstate', function() {{
-            _routeFromPath(window.location.pathname, true);
+            _routeFromPath(window.location.pathname.slice(BP.length) || '/', true);
         }});
-        _routeFromPath(window.location.pathname, false);
+        _routeFromPath(window.location.pathname.slice(BP.length) || '/', false);
     </script>
 </body>
 </html>
 """
+
+
+# When mounted under a reverse-proxy sub-path, prefix every client-side fetch
+# with BP (the JS const injected into the page above). All fetches use the
+# `fetch('/...` form so a single pass covers them; with BASE_PATH empty we skip
+# it and the emitted HTML is unchanged.
+if BASE_PATH:
+    SPA_HTML = SPA_HTML.replace("fetch('/", "fetch(BP+'/")
 
 
 # --------------------------------------------------------------------------- #
@@ -6682,6 +7241,7 @@ class _SpaHandler(http.server.BaseHTTPRequestHandler):
     # ---- GET ----
     def do_GET(self):  # noqa: N802
         path = self.path.split("?", 1)[0]
+        path = _strip_base(path)
 
         # Public routes:
         if path in ("/favicon.ico",):
@@ -6861,6 +7421,7 @@ class _SpaHandler(http.server.BaseHTTPRequestHandler):
     # ---- POST ----
     def do_POST(self):  # noqa: N802
         path = self.path.split("?", 1)[0]
+        path = _strip_base(path)
         if path == "/api/generate":
             self._handle_generate()
             return
