@@ -2548,6 +2548,7 @@ def generate_multi_comparison_html(launch_labels: list, logs_list: list, timings
         # Query Datadog SEPARATELY for each launch's time range
         resources_found = set()
         services_found = set()
+        resource_by_launch = {}
         all_endpoints = set().union(*[set(t.keys()) for t in timings_list])
         
         for launch_idx, (range_start, range_end) in sorted(launch_time_ranges.items()):
@@ -2562,6 +2563,43 @@ def generate_multi_comparison_html(launch_labels: list, logs_list: list, timings
             print(f"  Querying Datadog for Launch {launch_idx+1}...")
             dd_traces = fetch_dd_traces_with_cache(launch_id_for_cache, from_ts, to_ts, limit=_DD_TRACE_FETCH_LIMIT, min_duration_s=3.0)
             print(f"    Found {len(dd_traces)} traces for Launch {launch_idx+1}")
+
+            # Resource series for the same window. Timings say how long an endpoint
+            # took; these say what the JVM looked like while it took that long, so a
+            # run slowed by a ballooning worker pool stops looking like a slow query.
+            # Failure here must not cost the launch its traces - the report is still
+            # useful without the lanes.
+            try:
+                # The directory is named dokimos-perf.chiron.systems on disk while the
+                # package answers to rp_perf_report, so neither import form works
+                # everywhere: prefer the relative one, fall back to the package name,
+                # and finally load the sibling file by path.
+                try:
+                    from .resource_metrics import collect as _collect_resources
+                except ImportError:
+                    try:
+                        from rp_perf_report.resource_metrics import collect as _collect_resources
+                    except ImportError:
+                        import importlib.util as _ilu
+                        _spec = _ilu.spec_from_file_location(
+                            "_resource_metrics",
+                            os.path.join(os.path.dirname(os.path.abspath(__file__)), "resource_metrics.py"),
+                        )
+                        _mod = _ilu.module_from_spec(_spec)
+                        _spec.loader.exec_module(_mod)
+                        _collect_resources = _mod.collect
+                resource_by_launch[launch_idx] = _collect_resources(
+                    from_ts=from_ts // 1000, to_ts=to_ts // 1000
+                )
+                _lanes = sum(
+                    1
+                    for svc in resource_by_launch[launch_idx].get("services", {}).values()
+                    for label, pts in svc.items()
+                    if not label.startswith("_") and pts
+                )
+                print(f"    Collected {_lanes} resource lane(s) for Launch {launch_idx+1}")
+            except Exception as _exc:
+                print(f"    Resource metrics unavailable for Launch {launch_idx+1}: {_exc}")
             
             for trace in dd_traces:
                 attrs = trace.get('attributes', {})
@@ -3195,6 +3233,42 @@ def generate_multi_comparison_html(launch_labels: list, logs_list: list, timings
                 </div>
             </div>
         ''')
+
+    # Resource lanes become charts of the same shape as the timing trends, so the
+    # existing Chart.js bootstrap renders them without a second code path. One
+    # canvas per service per lane, x = sample time, y = the measured value.
+    resource_chart_blocks = []
+    for _launch_idx, _payload in sorted((locals().get('resource_by_launch') or {}).items()):
+        for _svc, _lanes in (_payload.get('services') or {}).items():
+            for _label, _points in _lanes.items():
+                if _label.startswith('_') or not _points:
+                    continue
+                _canvas = f"res_{_launch_idx}_{_svc}_{_label}".replace('-', '_').replace('.', '_')
+                _scale = 1 / (1024 * 1024) if _label.endswith('_bytes') else 1
+                _unit = 'MB' if _label.endswith('_bytes') else ''
+                trend_chart_data[_canvas] = {
+                    'labels': [
+                        datetime.fromtimestamp(pt[0] / 1000, tz=timezone.utc)
+                        .astimezone(ZoneInfo("America/Los_Angeles")).strftime('%H:%M')
+                        for pt in _points
+                    ],
+                    'max': [round(pt[1] * _scale, 2) for pt in _points],
+                    'p95': [round(pt[1] * _scale, 2) for pt in _points],
+                    'overall_max': round(max(pt[1] for pt in _points) * _scale, 2),
+                }
+                resource_chart_blocks.append(f"""
+            <div class="endpoint-card">
+                <div class="endpoint-header">
+                    <span class="endpoint-url">{_svc} &middot; {_label}{(' (' + _unit + ')') if _unit else ''} &middot; launch {_launch_idx + 1}</span>
+                </div>
+                <div class="trend-chart-wrapper">
+                    <canvas id="{_canvas}" height="120"></canvas>
+                </div>
+            </div>
+        """)
+    if resource_chart_blocks:
+        trend_chart_blocks.extend(resource_chart_blocks)
+        print(f"  Added {len(resource_chart_blocks)} resource chart(s) to the report")
 
     trend_chart_data_json = json.dumps(trend_chart_data)
 
